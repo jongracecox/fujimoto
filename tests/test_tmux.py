@@ -137,14 +137,18 @@ class TestCreateSession:
             create_session("proj/test", tmp_path)
 
             calls = mock_run.call_args_list
-            # First call: new-session
+            # First call: new-session with claude as the session command
             assert calls[0] == call(
-                ["tmux", "new-session", "-d", "-s", "proj/test", "-c", str(tmp_path)],
-                check=True,
-            )
-            # Last call: send-keys claude
-            assert calls[-1] == call(
-                ["tmux", "send-keys", "-t", "proj/test", "claude", "Enter"],
+                [
+                    "tmux",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "proj/test",
+                    "-c",
+                    str(tmp_path),
+                    "claude",
+                ],
                 check=True,
             )
 
@@ -166,11 +170,8 @@ class TestCreateSessionWithCommand:
                     "proj/pr-test",
                     "-c",
                     str(tmp_path),
+                    "echo hello",
                 ],
-                check=True,
-            )
-            assert calls[-1] == call(
-                ["tmux", "send-keys", "-t", "proj/pr-test", "echo hello", "Enter"],
                 check=True,
             )
 

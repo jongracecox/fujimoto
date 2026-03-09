@@ -89,27 +89,37 @@ def _configure_session(name: str) -> None:
 
 def create_session(name: str, working_dir: Path) -> None:
     subprocess.run(
-        ["tmux", "new-session", "-d", "-s", name, "-c", str(working_dir)],
+        [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            name,
+            "-c",
+            str(working_dir),
+            "claude",
+        ],
         check=True,
     )
     _configure_session(name)
-    subprocess.run(
-        ["tmux", "send-keys", "-t", name, "claude", "Enter"],
-        check=True,
-    )
 
 
 def create_session_with_command(name: str, working_dir: Path, command: str) -> None:
     """Create a tmux session and run an arbitrary command instead of claude."""
     subprocess.run(
-        ["tmux", "new-session", "-d", "-s", name, "-c", str(working_dir)],
+        [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            name,
+            "-c",
+            str(working_dir),
+            command,
+        ],
         check=True,
     )
     _configure_session(name)
-    subprocess.run(
-        ["tmux", "send-keys", "-t", name, command, "Enter"],
-        check=True,
-    )
 
 
 def attach_session(name: str) -> None:
