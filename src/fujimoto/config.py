@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 from datetime import date
@@ -11,8 +12,8 @@ class ConfigError(Exception):
 
 
 def get_git_projects_root() -> Path | None:
-    """Read CLAUDE_WORKTREE_MANAGER_GIT_ROOT env var. Returns None if unset."""
-    raw = os.environ.get("CLAUDE_WORKTREE_MANAGER_GIT_ROOT")
+    """Read FUJIMOTO_GIT_ROOT env var. Returns None if unset."""
+    raw = os.environ.get("FUJIMOTO_GIT_ROOT")
     if not raw:
         return None
     return Path(raw).expanduser().resolve()
@@ -34,12 +35,12 @@ def list_projects() -> list[Path]:
 
 
 def get_worktree_root() -> Path:
-    raw = os.environ.get("CLAUDE_WORKTREE_MANAGER_WORKTREE_ROOT")
+    raw = os.environ.get("FUJIMOTO_WORKTREE_ROOT")
     if not raw:
         raise ConfigError(
-            "CLAUDE_WORKTREE_MANAGER_WORKTREE_ROOT is not set.\n"
+            "FUJIMOTO_WORKTREE_ROOT is not set.\n"
             "Set it to the directory where worktrees should be created, e.g.:\n"
-            "  export CLAUDE_WORKTREE_MANAGER_WORKTREE_ROOT=~/git/worktrees/"
+            "  export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/"
         )
     root = Path(raw).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -78,3 +79,33 @@ def build_worktree_path(project_name: str, title: str) -> Path:
 
 def get_project_worktrees_dir(project_name: str) -> Path:
     return get_worktree_root() / project_name
+
+
+META_FILENAME = ".fujimoto-meta.json"
+
+
+def store_session_meta(worktree_path: Path, base_branch: str) -> None:
+    """Write session metadata to a JSON file in the worktree directory."""
+    meta = {"base_branch": base_branch}
+    meta_path = worktree_path / META_FILENAME
+    meta_path.write_text(json.dumps(meta))
+
+
+def read_session_meta(worktree_path: Path) -> dict[str, str]:
+    """Read session metadata from the worktree directory."""
+    meta_path = worktree_path / META_FILENAME
+    if not meta_path.exists():
+        return {}
+    try:
+        return json.loads(meta_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def get_next_direct_session_name(project_name: str, active_sessions: set[str]) -> str:
+    """Compute the next direct-N session name for a project."""
+    prefix = f"{project_name}/direct-"
+    n = 1
+    while f"{prefix}{n}" in active_sessions:
+        n += 1
+    return f"{prefix}{n}"

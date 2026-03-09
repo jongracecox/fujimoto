@@ -54,11 +54,18 @@ def session_exists(name: str) -> bool:
     return result.returncode == 0
 
 
-def create_session(name: str, working_dir: Path) -> None:
-    subprocess.run(
-        ["tmux", "new-session", "-d", "-s", name, "-c", str(working_dir)],
-        check=True,
+def kill_session(name: str) -> None:
+    """Kill a tmux session by name."""
+    result = subprocess.run(
+        ["tmux", "kill-session", "-t", name],
+        capture_output=True,
     )
+    if result.returncode != 0:
+        raise TmuxError(f"Failed to kill session: {name}")
+
+
+def _configure_session(name: str) -> None:
+    """Apply standard tmux configuration to a session."""
     options = {
         "prefix": "C-a",
         "status-right": '"Detach: ^A D | Scroll: ^A [ | Kill: ^A X"',
@@ -78,8 +85,29 @@ def create_session(name: str, working_dir: Path) -> None:
         ["tmux", "bind-key", "-t", name, "C-a", "send-prefix"],
         capture_output=True,
     )
+
+
+def create_session(name: str, working_dir: Path) -> None:
+    subprocess.run(
+        ["tmux", "new-session", "-d", "-s", name, "-c", str(working_dir)],
+        check=True,
+    )
+    _configure_session(name)
     subprocess.run(
         ["tmux", "send-keys", "-t", name, "claude", "Enter"],
+        check=True,
+    )
+
+
+def create_session_with_command(name: str, working_dir: Path, command: str) -> None:
+    """Create a tmux session and run an arbitrary command instead of claude."""
+    subprocess.run(
+        ["tmux", "new-session", "-d", "-s", name, "-c", str(working_dir)],
+        check=True,
+    )
+    _configure_session(name)
+    subprocess.run(
+        ["tmux", "send-keys", "-t", name, command, "Enter"],
         check=True,
     )
 
@@ -97,10 +125,12 @@ def attach_session(name: str) -> None:
     subprocess.run(["tmux", "attach-session", "-t", name])
 
 
-def launch_claude_in_tmux(project_name: str, worktree_path: Path) -> None:
-    name = session_name(project_name, worktree_path.name)
+def launch_claude_in_tmux(
+    project_name: str, working_dir: Path, tmux_name: str | None = None
+) -> None:
+    name = tmux_name or session_name(project_name, working_dir.name)
     if session_exists(name):
         attach_session(name)
     else:
-        create_session(name, worktree_path)
+        create_session(name, working_dir)
         attach_session(name)

@@ -1,7 +1,7 @@
 [project]
-name = "claude-worktree-manager"
+name = "fujimoto"
 version = "0.1.0"
-description = "CLI for creating git worktrees and launching Claude Code in tmux sessions"
+description = "CLI for managing Claude Code sessions in git worktrees and repositories"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -13,10 +13,10 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project.scripts]
-worktree = "claude_worktree.cli:main"
+fujimoto = "fujimoto.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/claude_worktree"]
+packages = ["src/fujimoto"]
 
 [dependency-groups]
 dev = [
@@ -27,14 +27,14 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "src"]
-addopts = ["--doctest-modules", "--strict-markers", "-v", "--cov=claude_worktree", "--cov-report=term-missing"]
+addopts = ["--doctest-modules", "--strict-markers", "-v", "--cov=fujimoto", "--cov-report=term-missing"]
 pythonpath = ["src"]
 
 [tool.pytest-asyncio]
 mode = "auto"
 
 [tool.coverage.run]
-source = ["src/claude_worktree"]
+source = ["src/fujimoto"]
 
 [tool.coverage.report]
 show_missing = true
