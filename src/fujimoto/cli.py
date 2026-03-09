@@ -1207,6 +1207,7 @@ def _check_prerequisites() -> list[str]:
     return issues
 
 
+
 def _build_system_prompt(session_type: str, project: str, working_dir: Path) -> str:
     if session_type == "worktree":
         meta = read_session_meta(working_dir)
