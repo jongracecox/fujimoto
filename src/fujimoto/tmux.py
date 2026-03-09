@@ -54,6 +54,16 @@ def session_exists(name: str) -> bool:
     return result.returncode == 0
 
 
+def rename_session(old_name: str, new_name: str) -> None:
+    """Rename a tmux session."""
+    result = subprocess.run(
+        ["tmux", "rename-session", "-t", old_name, new_name],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise TmuxError(f"Failed to rename session: {old_name}")
+
+
 def kill_session(name: str) -> None:
     """Kill a tmux session by name."""
     result = subprocess.run(

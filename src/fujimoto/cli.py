@@ -26,6 +26,7 @@ from fujimoto.config import (
     get_worktree_root,
     list_projects,
     read_session_meta,
+    slugify,
     store_session_meta,
 )
 from fujimoto.git import (
@@ -51,8 +52,11 @@ from fujimoto.tmux import (
     kill_session,
     launch_claude_in_tmux,
     list_project_sessions,
+    rename_session,
     session_name,
 )
+
+BRANCH_ICON = "\ue0a0"
 
 CSS = """\
 Screen {
@@ -418,7 +422,7 @@ class SessionApp(App):
                 )
                 label_text = (
                     f"\U0001f7e2 {display_name}"
-                    f"  [dim](direct @ {self._current_branch})[/]"
+                    f"  [dim]({self._project_name} {BRANCH_ICON} {self._current_branch})[/]"
                 )
                 items.append(ListItem(Label(label_text, markup=True), id=item_id))
 
@@ -435,7 +439,7 @@ class SessionApp(App):
                     is_active=True,
                     branch=branch,
                 )
-                label_text = f"\U0001f7e2 {wt.name}  [dim](worktree)[/]"
+                label_text = f"\U0001f7e2 {wt.name}  [dim]({BRANCH_ICON} {branch})[/]"
                 items.append(ListItem(Label(label_text, markup=True), id=item_id))
 
         # Inactive worktrees section
@@ -468,7 +472,7 @@ class SessionApp(App):
                     is_active=False,
                     branch=branch,
                 )
-                label_text = f"\u26ab {wt.name}  [dim](worktree)[/]"
+                label_text = f"\u26ab {wt.name}  [dim]({BRANCH_ICON} {branch})[/]"
                 items.append(ListItem(Label(label_text, markup=True), id=item_id))
 
         if self._available_projects:
@@ -519,14 +523,16 @@ class SessionApp(App):
         else:
             items.append(ListItem(Label("Launch"), id="sa-launch"))
 
+        items.append(ListItem(Label("Rename"), id="sa-rename"))
+
         if session.session_type == "worktree":
             items.append(ListItem(Label("Finish (cleanup/merge)"), id="sa-finish"))
 
         items.append(ListItem(Label("[dim]Cancel[/]", markup=True), id="sa-cancel"))
 
-        type_label = session.session_type
+        type_label = session.project if session.session_type == "direct" else "worktree"
         status_label = "active" if session.is_active else "inactive"
-        info_text = f"{type_label} | {status_label} | {session.branch}"
+        info_text = f"{type_label} | {status_label} | {BRANCH_ICON} {session.branch}"
 
         await main.mount(
             Container(
@@ -537,6 +543,33 @@ class SessionApp(App):
             )
         )
         self.query_one("#session-actions").focus()
+
+    # -- Rename flow --
+
+    async def _show_rename(self, session: SessionInfo) -> None:
+        self._selected_session = session
+        await self._clear_main()
+        main = self.query_one("#main")
+
+        current_suffix = (
+            session.tmux_session.split("/", 1)[1]
+            if "/" in session.tmux_session
+            else session.tmux_session
+        )
+
+        await main.mount(
+            Container(
+                Label(f"Rename: {session.name}", classes="form-label"),
+                Static(""),
+                Label("New name:"),
+                Input(value=current_suffix, id="rename-input"),
+                Static("[dim]Press Enter to rename[/]", markup=True, classes="hint"),
+                id="create-panel",
+            )
+        )
+        rename_input = self.query_one("#rename-input", Input)
+        rename_input.focus()
+        rename_input.cursor_position = len(rename_input.value)
 
     # -- Finish flow --
 
@@ -879,12 +912,30 @@ class SessionApp(App):
             await self._show_session_actions(self._session_map[item_id])
 
     async def _launch_direct_session(self) -> None:
-        tmux_name = get_next_direct_session_name(
+        await self._show_direct_title_form()
+
+    async def _show_direct_title_form(self) -> None:
+        await self._clear_main()
+        main = self.query_one("#main")
+        default_name = get_next_direct_session_name(
             self._project_name, self._active_sessions
+        ).split("/", 1)[1]
+        await main.mount(
+            Container(
+                Label(
+                    f"New Session in {self._project_name}",
+                    classes="form-label",
+                ),
+                Static(""),
+                Label("Session name:"),
+                Input(value=default_name, id="direct-title-input"),
+                Static("[dim]Press Enter to launch[/]", markup=True, classes="hint"),
+                id="create-panel",
+            )
         )
-        project_path = self._project_cwd or Path(".")
-        self._launch_target = (self._project_name, project_path, tmux_name)
-        self.exit()
+        title_input = self.query_one("#direct-title-input", Input)
+        title_input.focus()
+        title_input.cursor_position = len(title_input.value)
 
     @on(ListView.Selected, "#session-actions")
     async def on_session_action_selected(self, event: ListView.Selected) -> None:
@@ -915,6 +966,8 @@ class SessionApp(App):
                 await self._show_home()
             except (TmuxError, ConfigError, GitError) as e:
                 await self._show_error(str(e))
+        elif action == "sa-rename":
+            await self._show_rename(session)
         elif action == "sa-finish":
             await self._show_finish(session)
         elif action == "sa-cancel":
@@ -1046,6 +1099,38 @@ class SessionApp(App):
                 await self._show_error(str(e))
         else:
             self.exit()
+
+    @on(Input.Submitted, "#direct-title-input")
+    async def on_direct_title_submitted(self, event: Input.Submitted) -> None:
+        value = event.value.strip()
+        if not value:
+            return
+        tmux_name = f"{self._project_name}/{slugify(value)}"
+        project_path = self._project_cwd or Path(".")
+        self._launch_target = (self._project_name, project_path, tmux_name)
+        self.exit()
+
+    @on(Input.Submitted, "#rename-input")
+    async def on_rename_submitted(self, event: Input.Submitted) -> None:
+        value = event.value.strip()
+        session = self._selected_session
+        if not value or session is None:
+            return
+        new_tmux_name = f"{session.project}/{slugify(value)}"
+        if new_tmux_name == session.tmux_session:
+            try:
+                await self._show_home()
+            except (ConfigError, GitError) as e:  # pragma: no cover
+                await self._show_error(str(e))
+            return
+        try:
+            rename_session(session.tmux_session, new_tmux_name)
+            self._init_git_info()
+            await self._show_home()
+        except TmuxError as e:
+            await self._show_error(str(e))
+        except (ConfigError, GitError) as e:  # pragma: no cover
+            await self._show_error(str(e))
 
     @on(Input.Submitted, "#title-input")
     async def on_title_submitted(self, event: Input.Submitted) -> None:

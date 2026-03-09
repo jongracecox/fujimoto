@@ -15,6 +15,7 @@ from fujimoto.tmux import (
     kill_session,
     launch_claude_in_tmux,
     list_project_sessions,
+    rename_session,
     session_exists,
     session_name,
 )
@@ -127,6 +128,25 @@ class TestKillSession:
         with patch("fujimoto.tmux.subprocess.run", return_value=mock_result):
             with pytest.raises(TmuxError, match="Failed to kill"):
                 kill_session("my-proj/test")
+
+
+class TestRenameSession:
+    def test_renames_session(self) -> None:
+        mock_result = MagicMock(returncode=0)
+        with patch(
+            "fujimoto.tmux.subprocess.run", return_value=mock_result
+        ) as mock_run:
+            rename_session("proj/old-name", "proj/new-name")
+            mock_run.assert_called_once_with(
+                ["tmux", "rename-session", "-t", "proj/old-name", "proj/new-name"],
+                capture_output=True,
+            )
+
+    def test_raises_on_failure(self) -> None:
+        mock_result = MagicMock(returncode=1)
+        with patch("fujimoto.tmux.subprocess.run", return_value=mock_result):
+            with pytest.raises(TmuxError, match="Failed to rename"):
+                rename_session("proj/old", "proj/new")
 
 
 class TestCreateSession:
