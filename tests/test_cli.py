@@ -5,6 +5,8 @@ from unittest.mock import patch
 
 import pytest
 
+from textual.widgets import Input, ListView
+
 from claude_worktree.cli import WorktreeApp, main
 from claude_worktree.config import ConfigError
 from claude_worktree.git import GitError
@@ -20,6 +22,7 @@ def _patch_git_info(
     default: str = "main",
     sessions: list[str] | None = None,
     worktrees: list[Path] | None = None,
+    projects: list[Path] | None = None,
 ):
     """Return a context manager that patches git/tmux info for TUI tests."""
     import contextlib
@@ -52,6 +55,10 @@ def _patch_git_info(
             ),
             patch(
                 "claude_worktree.cli.session_name", side_effect=lambda p, d: f"{p}/{d}"
+            ),
+            patch(
+                "claude_worktree.cli.list_projects",
+                return_value=projects or [],
             ),
         ):
             yield
@@ -99,13 +106,18 @@ class TestMain:
             main()
         assert exc_info.value.code == 130
 
-    def test_launches_tmux_when_target_set(self) -> None:
-        mock_app = WorktreeApp.__new__(WorktreeApp)
-        mock_app._launch_target = ("proj", Path("/tmp/test"))
+    def test_launches_tmux_then_loops_back(self) -> None:
+        # First iteration: launch target set -> attach tmux
+        # Second iteration: no target -> exit loop
+        app1 = WorktreeApp.__new__(WorktreeApp)
+        app1._launch_target = ("proj", Path("/tmp/test"))
+        app2 = WorktreeApp.__new__(WorktreeApp)
+        app2._launch_target = None
 
         with (
-            patch("claude_worktree.cli.WorktreeApp", return_value=mock_app),
-            patch.object(mock_app, "run"),
+            patch("claude_worktree.cli.WorktreeApp", side_effect=[app1, app2]),
+            patch.object(app1, "run"),
+            patch.object(app2, "run"),
             patch("claude_worktree.cli.launch_claude_in_tmux") as mock_launch,
         ):
             main()
@@ -492,3 +504,294 @@ class TestWorktreeAppTmuxInstall:
             async with app.run_test() as pilot:
                 await pilot.press("enter")  # Select "Install with brew"
                 await pilot.pause()
+
+
+class TestWorktreeAppProjectSwitch:
+    @pytest.mark.asyncio
+    async def test_switch_project_shown_when_projects_available(
+        self, tmp_path: Path
+    ) -> None:
+        proj = tmp_path / "other-repo"
+        proj.mkdir()
+        with _patch_git_info(projects=[proj]):
+            app = WorktreeApp()
+            async with app.run_test():
+                assert len(app.query("#action-switch-project")) > 0
+
+    @pytest.mark.asyncio
+    async def test_switch_project_hidden_when_no_projects(self) -> None:
+        with _patch_git_info(projects=[]):
+            app = WorktreeApp()
+            async with app.run_test():
+                assert len(app.query("#action-switch-project")) == 0
+
+    @pytest.mark.asyncio
+    async def test_navigate_to_project_select(self, tmp_path: Path) -> None:
+        proj = tmp_path / "other-repo"
+        proj.mkdir()
+        with _patch_git_info(projects=[proj]):
+            app = WorktreeApp()
+            async with app.run_test() as pilot:
+                # Navigate to switch project (last item)
+                for _ in range(10):
+                    await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#project-list")) > 0
+                assert len(app.query("#project-filter")) > 0
+
+    @pytest.mark.asyncio
+    async def test_filter_narrows_project_list(self, tmp_path: Path) -> None:
+        proj_a = tmp_path / "alpha"
+        proj_a.mkdir()
+        proj_b = tmp_path / "bravo"
+        proj_b.mkdir()
+        proj_c = tmp_path / "charlie"
+        proj_c.mkdir()
+        with _patch_git_info(projects=[proj_a, proj_b, proj_c]):
+            app = WorktreeApp()
+            async with app.run_test() as pilot:
+                # Navigate to switch project
+                for _ in range(10):
+                    await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                # All three projects visible
+                project_list = app.query_one("#project-list", ListView)
+                assert len(project_list) == 3
+                # Type to filter
+                await pilot.press(*"bra")
+                await pilot.pause()
+                assert len(project_list) == 1
+
+    @pytest.mark.asyncio
+    async def test_filter_then_enter_selects(self, tmp_path: Path) -> None:
+        proj_a = tmp_path / "alpha"
+        proj_a.mkdir()
+        proj_b = tmp_path / "bravo"
+        proj_b.mkdir()
+        with (
+            _patch_git_info(projects=[proj_a, proj_b]),
+            patch(
+                "claude_worktree.cli.get_project_worktrees_dir",
+                return_value=Path("/nonexistent"),
+            ),
+        ):
+            app = WorktreeApp()
+            async with app.run_test() as pilot:
+                # Navigate to switch project
+                for _ in range(10):
+                    await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                # Filter to "bravo"
+                await pilot.press(*"bravo")
+                await pilot.pause()
+                # Enter selects directly from the filter input
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._project_cwd == proj_b
+
+    @pytest.mark.asyncio
+    async def test_arrow_down_moves_list_highlight(self, tmp_path: Path) -> None:
+        proj_a = tmp_path / "alpha"
+        proj_a.mkdir()
+        proj_b = tmp_path / "bravo"
+        proj_b.mkdir()
+        proj_c = tmp_path / "charlie"
+        proj_c.mkdir()
+        with _patch_git_info(projects=[proj_a, proj_b, proj_c]):
+            app = WorktreeApp()
+            async with app.run_test() as pilot:
+                for _ in range(10):
+                    await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                project_list = app.query_one("#project-list", ListView)
+                assert project_list.index == 0
+                # Arrow down moves highlight while focus stays on filter
+                await pilot.press("down")
+                await pilot.pause()
+                assert project_list.index == 1
+                assert app.focused.id == "project-filter"
+                await pilot.press("down")
+                await pilot.pause()
+                assert project_list.index == 2
+
+    @pytest.mark.asyncio
+    async def test_arrow_up_moves_list_highlight(self, tmp_path: Path) -> None:
+        proj_a = tmp_path / "alpha"
+        proj_a.mkdir()
+        proj_b = tmp_path / "bravo"
+        proj_b.mkdir()
+        with _patch_git_info(projects=[proj_a, proj_b]):
+            app = WorktreeApp()
+            async with app.run_test() as pilot:
+                for _ in range(10):
+                    await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                project_list = app.query_one("#project-list", ListView)
+                # Move down then back up
+                await pilot.press("down")
+                await pilot.pause()
+                assert project_list.index == 1
+                await pilot.press("up")
+                await pilot.pause()
+                assert project_list.index == 0
+
+    @pytest.mark.asyncio
+    async def test_ghost_text_shown_for_startswith_match(self, tmp_path: Path) -> None:
+        proj = tmp_path / "bravo"
+        proj.mkdir()
+        with _patch_git_info(projects=[proj]):
+            app = WorktreeApp()
+            async with app.run_test() as pilot:
+                for _ in range(10):
+                    await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press(*"bra")
+                await pilot.pause()
+                filter_input = app.query_one("#project-filter", Input)
+                assert filter_input._suggestion == "bravo"
+
+    @pytest.mark.asyncio
+    async def test_tab_autocompletes_suggestion(self, tmp_path: Path) -> None:
+        proj = tmp_path / "bravo"
+        proj.mkdir()
+        with _patch_git_info(projects=[proj]):
+            app = WorktreeApp()
+            async with app.run_test() as pilot:
+                for _ in range(10):
+                    await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press(*"bra")
+                await pilot.pause()
+                await pilot.press("tab")
+                await pilot.pause()
+                filter_input = app.query_one("#project-filter", Input)
+                assert filter_input.value == "bravo"
+
+    @pytest.mark.asyncio
+    async def test_arrow_then_enter_selects(self, tmp_path: Path) -> None:
+        proj_a = tmp_path / "alpha"
+        proj_a.mkdir()
+        proj_b = tmp_path / "bravo"
+        proj_b.mkdir()
+        with (
+            _patch_git_info(projects=[proj_a, proj_b]),
+            patch(
+                "claude_worktree.cli.get_project_worktrees_dir",
+                return_value=Path("/nonexistent"),
+            ),
+        ):
+            app = WorktreeApp()
+            async with app.run_test() as pilot:
+                for _ in range(10):
+                    await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                # Arrow down to bravo, then enter
+                await pilot.press("down")
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._project_cwd == proj_b
+
+    @pytest.mark.asyncio
+    async def test_select_project_reinitializes(self, tmp_path: Path) -> None:
+        proj1 = tmp_path / "repo-a"
+        proj1.mkdir()
+        proj2 = tmp_path / "repo-b"
+        proj2.mkdir()
+        with (
+            _patch_git_info(projects=[proj1, proj2]),
+            patch(
+                "claude_worktree.cli.get_project_worktrees_dir",
+                return_value=Path("/nonexistent"),
+            ),
+        ):
+            app = WorktreeApp()
+            async with app.run_test() as pilot:
+                # Navigate to switch project
+                for _ in range(10):
+                    await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                # Enter selects the first (highlighted) project
+                await pilot.press("enter")
+                await pilot.pause()
+                # Should reinitialize and show home
+                assert app._project_cwd == proj1
+
+    @pytest.mark.asyncio
+    async def test_project_select_error_shows_error(self, tmp_path: Path) -> None:
+        proj = tmp_path / "bad-repo"
+        proj.mkdir()
+        with _patch_git_info(projects=[proj]):
+            app = WorktreeApp()
+            async with app.run_test() as pilot:
+                # Navigate to switch project
+                for _ in range(10):
+                    await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                # Mock git failure for next init, then Enter selects
+                with patch(
+                    "claude_worktree.cli.get_project_name",
+                    side_effect=GitError("not a repo"),
+                ):
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    # Should not crash
+
+
+class TestWorktreeAppConflictSuffix:
+    @pytest.mark.asyncio
+    async def test_suffix_increments_past_existing(self, tmp_path: Path) -> None:
+        existing = tmp_path / "existing-wt"
+        existing.mkdir()
+        # Also create -2 so it needs to go to -3
+        (tmp_path / "existing-wt-2").mkdir()
+        with (
+            _patch_git_info(current="main", default="main"),
+            patch("claude_worktree.cli.build_worktree_path", return_value=existing),
+            patch("claude_worktree.cli.create_worktree") as mock_create,
+        ):
+            app = WorktreeApp()
+            async with app.run_test() as pilot:
+                await pilot.press("enter")  # Create new
+                await pilot.pause()
+                await pilot.press(*"title")
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("down")  # Move to "Create new with suffix"
+                await pilot.press("enter")
+                await pilot.pause()
+                mock_create.assert_called_once()
+                called_path = mock_create.call_args[0][0]
+                assert called_path.name == "existing-wt-3"
+
+
+class TestWorktreeAppEscapeFromNested:
+    @pytest.mark.asyncio
+    async def test_escape_from_project_select_returns_home(
+        self, tmp_path: Path
+    ) -> None:
+        proj = tmp_path / "repo"
+        proj.mkdir()
+        with _patch_git_info(projects=[proj]):
+            app = WorktreeApp()
+            async with app.run_test() as pilot:
+                # Navigate to project select
+                for _ in range(10):
+                    await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#project-list")) > 0
+                # Escape back
+                await pilot.press("escape")
+                await pilot.pause()
+                assert len(app.query("#home-list")) > 0

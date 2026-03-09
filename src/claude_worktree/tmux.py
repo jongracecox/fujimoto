@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -95,7 +94,7 @@ def attach_session(name: str) -> None:
     print("│  Ctrl+A X  — Kill pane                      │")
     print("╰─────────────────────────────────────────────╯")
     print()
-    os.execvp("tmux", ["tmux", "attach-session", "-t", name])
+    subprocess.run(["tmux", "attach-session", "-t", name])
 
 
 def launch_claude_in_tmux(project_name: str, worktree_path: Path) -> None:

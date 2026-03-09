@@ -8,8 +8,10 @@ import pytest
 from claude_worktree.config import (
     ConfigError,
     build_worktree_path,
+    get_git_projects_root,
     get_project_worktrees_dir,
     get_worktree_root,
+    list_projects,
     slugify,
 )
 
@@ -108,6 +110,76 @@ class TestBuildWorktreePath:
             result = build_worktree_path("qsic-data", "test")
             assert result.parent.name == "qsic-data"
             assert result.name == "20260101-test"
+
+
+class TestGetGitProjectsRoot:
+    def test_returns_none_when_unset(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            assert get_git_projects_root() is None
+
+    def test_returns_none_when_empty(self) -> None:
+        with patch.dict("os.environ", {"CLAUDE_WORKTREE_MANAGER_GIT_ROOT": ""}):
+            assert get_git_projects_root() is None
+
+    def test_returns_resolved_path(self, tmp_path: Path) -> None:
+        with patch.dict(
+            "os.environ", {"CLAUDE_WORKTREE_MANAGER_GIT_ROOT": str(tmp_path)}
+        ):
+            result = get_git_projects_root()
+            assert result == tmp_path
+            assert result.is_absolute()
+
+    def test_expands_tilde(self) -> None:
+        with patch.dict("os.environ", {"CLAUDE_WORKTREE_MANAGER_GIT_ROOT": "~/git"}):
+            result = get_git_projects_root()
+            assert result is not None
+            assert "~" not in str(result)
+
+
+class TestListProjects:
+    def test_returns_empty_when_env_unset(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            assert list_projects() == []
+
+    def test_returns_empty_when_dir_missing(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"CLAUDE_WORKTREE_MANAGER_GIT_ROOT": "/nonexistent/path"},
+        ):
+            assert list_projects() == []
+
+    def test_returns_git_repos_only(self, tmp_path: Path) -> None:
+        # Create a git repo
+        repo = tmp_path / "my-repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        # Create a non-repo dir
+        plain = tmp_path / "plain-dir"
+        plain.mkdir()
+        # Create a file (not a dir)
+        (tmp_path / "file.txt").touch()
+
+        with patch.dict(
+            "os.environ",
+            {"CLAUDE_WORKTREE_MANAGER_GIT_ROOT": str(tmp_path)},
+        ):
+            result = list_projects()
+            assert len(result) == 1
+            assert result[0].name == "my-repo"
+
+    def test_returns_sorted_by_name(self, tmp_path: Path) -> None:
+        for name in ["charlie", "alpha", "bravo"]:
+            d = tmp_path / name
+            d.mkdir()
+            (d / ".git").mkdir()
+
+        with patch.dict(
+            "os.environ",
+            {"CLAUDE_WORKTREE_MANAGER_GIT_ROOT": str(tmp_path)},
+        ):
+            result = list_projects()
+            names = [p.name for p in result]
+            assert names == ["alpha", "bravo", "charlie"]
 
 
 class TestGetProjectWorktreesDir:
