@@ -1,0 +1,15 @@
+[project]
+name = "claude-worktree-manager"
+version = "0.1.0"
+description = "CLI for creating git worktrees and launching Claude Code in tmux sessions"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "questionary>=2.0.0",
+]
+
+[project.scripts]
+worktree = "src.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
