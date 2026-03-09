@@ -270,8 +270,36 @@ class TestSessionAppDirectSession:
                 await pilot.press("down")  # Move to "New session in..."
                 await pilot.press("enter")
                 await pilot.pause()
+                # Now shows a title form with default name
+                assert len(app.query("#direct-title-input")) > 0
+                # Submit with default value to launch
+                await pilot.press("enter")
+                await pilot.pause()
                 assert app._launch_target is not None
                 assert app._launch_target[2] == "test-proj/direct-1"
+
+    @pytest.mark.asyncio
+    async def test_launch_direct_session_custom_name(self) -> None:
+        with (
+            _patch_git_info(),
+            patch(
+                "fujimoto.cli.get_next_direct_session_name",
+                return_value="test-proj/direct-1",
+            ),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                # Clear default and type custom name
+                title_input = app.query_one("#direct-title-input", Input)
+                title_input.value = ""
+                await pilot.press(*"my task")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+                assert app._launch_target[2] == "test-proj/my-task"
 
 
 class TestSessionAppSessionActions:
@@ -391,6 +419,93 @@ class TestSessionAppSessionActions:
                 assert "sa-finish" not in action_ids
                 assert "sa-connect" in action_ids
                 assert "sa-terminate" in action_ids
+
+
+class TestSessionAppRename:
+    @pytest.mark.asyncio
+    async def test_rename_shows_input(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # Navigate to Rename option
+                actions = app.query_one("#session-actions", ListView)
+                for i, item in enumerate(actions.children):
+                    if item.id == "sa-rename":
+                        actions.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#rename-input")) > 0
+
+    @pytest.mark.asyncio
+    async def test_rename_calls_tmux_rename(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with (
+            _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]),
+            patch("fujimoto.cli.rename_session") as mock_rename,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                actions = app.query_one("#session-actions", ListView)
+                for i, item in enumerate(actions.children):
+                    if item.id == "sa-rename":
+                        actions.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # Clear and type new name
+                rename_input = app.query_one("#rename-input", Input)
+                rename_input.value = "new-name"
+                await pilot.press("enter")
+                await pilot.pause()
+                mock_rename.assert_called_once_with(
+                    "test-proj/20260309-test", "test-proj/new-name"
+                )
+                assert len(app.query("#home-list")) > 0
+
+    @pytest.mark.asyncio
+    async def test_rename_same_name_returns_home(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with (
+            _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]),
+            patch("fujimoto.cli.rename_session") as mock_rename,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                actions = app.query_one("#session-actions", ListView)
+                for i, item in enumerate(actions.children):
+                    if item.id == "sa-rename":
+                        actions.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # Submit with same name (default value)
+                await pilot.press("enter")
+                await pilot.pause()
+                mock_rename.assert_not_called()
+                assert len(app.query("#home-list")) > 0
 
 
 class TestSessionAppFinishFlow:
