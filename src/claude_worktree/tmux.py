@@ -10,9 +10,32 @@ class TmuxError(Exception):
     pass
 
 
-def check_tmux_installed() -> None:
+def is_tmux_installed() -> bool:
+    return shutil.which("tmux") is not None
+
+
+def install_tmux() -> None:
+    """Install tmux via brew. Raises TmuxError on failure."""
+    if not shutil.which("brew"):
+        raise TmuxError("brew is not installed. Install tmux manually.")
+    result = subprocess.run(["brew", "install", "tmux"])
+    if result.returncode != 0:
+        raise TmuxError("Failed to install tmux via brew")
     if not shutil.which("tmux"):
-        raise TmuxError("tmux is not installed. Install it with: brew install tmux")
+        raise TmuxError("tmux was installed but not found on PATH")
+
+
+def list_project_sessions(project_name: str) -> list[str]:
+    """Return tmux session names that belong to the given project."""
+    result = subprocess.run(
+        ["tmux", "list-sessions", "-F", "#{session_name}"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return []
+    prefix = f"{project_name}/"
+    return [s for s in result.stdout.strip().splitlines() if s.startswith(prefix)]
 
 
 def session_name(project_name: str, worktree_dir_name: str) -> str:
@@ -71,7 +94,6 @@ def attach_session(name: str) -> None:
 
 
 def launch_claude_in_tmux(project_name: str, worktree_path: Path) -> None:
-    check_tmux_installed()
     name = session_name(project_name, worktree_path.name)
     if session_exists(name):
         attach_session(name)

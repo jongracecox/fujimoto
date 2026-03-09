@@ -5,7 +5,7 @@ description = "CLI for creating git worktrees and launching Claude Code in tmux 
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "questionary>=2.0.0",
+    "textual>=8.0.2",
 ]
 
 [build-system]

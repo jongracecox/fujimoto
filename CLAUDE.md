@@ -2,10 +2,18 @@
 
 CLI for creating git worktrees and launching Claude Code in tmux sessions.
 
+## Install (global CLI)
+
+```sh
+uv tool install --force --reinstall /Users/jongrace-cox/git/worktree
+```
+
+Re-run after code changes to pick up updates.
+
 ## Run
 
 ```sh
-uv run worktree
+worktree
 ```
 
 Must be run from inside a git repository.
