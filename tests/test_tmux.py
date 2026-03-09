@@ -1,0 +1,164 @@
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import MagicMock, call, patch
+
+import pytest
+
+from claude_worktree.tmux import (
+    TmuxError,
+    attach_session,
+    create_session,
+    install_tmux,
+    is_tmux_installed,
+    launch_claude_in_tmux,
+    list_project_sessions,
+    session_exists,
+    session_name,
+)
+
+
+class TestSessionName:
+    def test_format(self) -> None:
+        assert session_name("my-project", "20260309-fix") == "my-project/20260309-fix"
+
+    def test_with_special_chars(self) -> None:
+        assert session_name("proj", "a-b-c") == "proj/a-b-c"
+
+
+class TestIsTmuxInstalled:
+    def test_returns_true_when_found(self) -> None:
+        with patch("claude_worktree.tmux.shutil.which", return_value="/usr/bin/tmux"):
+            assert is_tmux_installed() is True
+
+    def test_returns_false_when_missing(self) -> None:
+        with patch("claude_worktree.tmux.shutil.which", return_value=None):
+            assert is_tmux_installed() is False
+
+
+class TestInstallTmux:
+    def test_raises_when_brew_missing(self) -> None:
+        with patch("claude_worktree.tmux.shutil.which", return_value=None):
+            with pytest.raises(TmuxError, match="brew is not installed"):
+                install_tmux()
+
+    def test_raises_on_brew_failure(self) -> None:
+        def which_side_effect(cmd: str) -> str | None:
+            if cmd == "brew":
+                return "/opt/homebrew/bin/brew"
+            return None
+
+        with (
+            patch("claude_worktree.tmux.shutil.which", side_effect=which_side_effect),
+            patch(
+                "claude_worktree.tmux.subprocess.run",
+                return_value=MagicMock(returncode=1),
+            ),
+        ):
+            with pytest.raises(TmuxError, match="Failed to install"):
+                install_tmux()
+
+    def test_raises_when_not_on_path_after_install(self) -> None:
+        call_count = 0
+
+        def which_side_effect(cmd: str) -> str | None:
+            nonlocal call_count
+            if cmd == "brew":
+                return "/opt/homebrew/bin/brew"
+            call_count += 1
+            if call_count <= 1:
+                return None  # Before install
+            return None  # Still not found after install
+
+        with (
+            patch("claude_worktree.tmux.shutil.which", side_effect=which_side_effect),
+            patch(
+                "claude_worktree.tmux.subprocess.run",
+                return_value=MagicMock(returncode=0),
+            ),
+        ):
+            with pytest.raises(TmuxError, match="not found on PATH"):
+                install_tmux()
+
+
+class TestListProjectSessions:
+    def test_filters_by_project(self) -> None:
+        mock_result = MagicMock(
+            returncode=0,
+            stdout="my-proj/20260309-fix\nother/thing\nmy-proj/20260308-test\n",
+        )
+        with patch("claude_worktree.tmux.subprocess.run", return_value=mock_result):
+            result = list_project_sessions("my-proj")
+            assert result == ["my-proj/20260309-fix", "my-proj/20260308-test"]
+
+    def test_returns_empty_on_failure(self) -> None:
+        mock_result = MagicMock(returncode=1)
+        with patch("claude_worktree.tmux.subprocess.run", return_value=mock_result):
+            assert list_project_sessions("proj") == []
+
+    def test_returns_empty_when_no_matches(self) -> None:
+        mock_result = MagicMock(returncode=0, stdout="other/session\n")
+        with patch("claude_worktree.tmux.subprocess.run", return_value=mock_result):
+            assert list_project_sessions("my-proj") == []
+
+
+class TestSessionExists:
+    def test_returns_true_on_success(self) -> None:
+        mock_result = MagicMock(returncode=0)
+        with patch("claude_worktree.tmux.subprocess.run", return_value=mock_result):
+            assert session_exists("my-proj/test") is True
+
+    def test_returns_false_on_failure(self) -> None:
+        mock_result = MagicMock(returncode=1)
+        with patch("claude_worktree.tmux.subprocess.run", return_value=mock_result):
+            assert session_exists("my-proj/test") is False
+
+
+class TestCreateSession:
+    def test_creates_session_and_configures(self, tmp_path: Path) -> None:
+        with patch(
+            "claude_worktree.tmux.subprocess.run", return_value=MagicMock(returncode=0)
+        ) as mock_run:
+            create_session("proj/test", tmp_path)
+
+            calls = mock_run.call_args_list
+            # First call: new-session
+            assert calls[0] == call(
+                ["tmux", "new-session", "-d", "-s", "proj/test", "-c", str(tmp_path)],
+                check=True,
+            )
+            # Last call: send-keys claude
+            assert calls[-1] == call(
+                ["tmux", "send-keys", "-t", "proj/test", "claude", "Enter"],
+                check=True,
+            )
+
+
+class TestAttachSession:
+    def test_calls_execvp(self) -> None:
+        with patch("claude_worktree.tmux.os.execvp") as mock_execvp:
+            attach_session("proj/test")
+            mock_execvp.assert_called_once_with(
+                "tmux", ["tmux", "attach-session", "-t", "proj/test"]
+            )
+
+
+class TestLaunchClaudeInTmux:
+    def test_attaches_when_session_exists(self, tmp_path: Path) -> None:
+        with (
+            patch("claude_worktree.tmux.session_exists", return_value=True),
+            patch("claude_worktree.tmux.attach_session") as mock_attach,
+        ):
+            launch_claude_in_tmux("proj", tmp_path / "20260309-test")
+            mock_attach.assert_called_once_with("proj/20260309-test")
+
+    def test_creates_and_attaches_when_no_session(self, tmp_path: Path) -> None:
+        with (
+            patch("claude_worktree.tmux.session_exists", return_value=False),
+            patch("claude_worktree.tmux.create_session") as mock_create,
+            patch("claude_worktree.tmux.attach_session") as mock_attach,
+        ):
+            wt_path = tmp_path / "20260309-test"
+            launch_claude_in_tmux("proj", wt_path)
+            mock_create.assert_called_once_with("proj/20260309-test", wt_path)
+            mock_attach.assert_called_once_with("proj/20260309-test")

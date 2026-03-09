@@ -17,3 +17,28 @@ worktree = "claude_worktree.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/claude_worktree"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "src"]
+addopts = ["--doctest-modules", "--strict-markers", "-v", "--cov=claude_worktree", "--cov-report=term-missing"]
+pythonpath = ["src"]
+
+[tool.pytest-asyncio]
+mode = "auto"
+
+[tool.coverage.run]
+source = ["src/claude_worktree"]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "if __name__ == .__main__.",
+    "pragma: no cover",
+]

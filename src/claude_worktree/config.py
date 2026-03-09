@@ -24,6 +24,21 @@ def get_worktree_root() -> Path:
 
 
 def slugify(title: str) -> str:
+    """Lowercase and replace non-alphanumeric characters with hyphens.
+
+    >>> slugify("Fix Unit Tests")
+    'fix-unit-tests'
+    >>> slugify("  Hello World!! 123  ")
+    'hello-world-123'
+    >>> slugify("already-slugged")
+    'already-slugged'
+    >>> slugify("UPPER")
+    'upper'
+    >>> slugify("a---b")
+    'a-b'
+    >>> slugify("---leading-and-trailing---")
+    'leading-and-trailing'
+    """
     slug = title.lower()
     slug = re.sub(r"[^a-z0-9]+", "-", slug)
     slug = slug.strip("-")
