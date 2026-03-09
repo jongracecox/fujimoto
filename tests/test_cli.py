@@ -7,10 +7,10 @@ import pytest
 
 from textual.widgets import Input, ListView
 
-from claude_worktree.cli import WorktreeApp, main
-from claude_worktree.config import ConfigError
-from claude_worktree.git import GitError
-from claude_worktree.tmux import TmuxError
+from fujimoto.cli import SessionApp, main
+from fujimoto.config import ConfigError
+from fujimoto.git import GitError
+from fujimoto.tmux import TmuxError
 
 
 # -- Helpers --
@@ -41,23 +41,21 @@ def _patch_git_info(
                 (worktree_root / wt.name).mkdir(exist_ok=True)
 
         with (
-            patch("claude_worktree.cli.is_tmux_installed", return_value=True),
-            patch("claude_worktree.cli.get_project_name", return_value=project),
-            patch("claude_worktree.cli.get_current_branch", return_value=current),
-            patch("claude_worktree.cli.get_default_branch", return_value=default),
+            patch("fujimoto.cli.is_tmux_installed", return_value=True),
+            patch("fujimoto.cli.get_project_name", return_value=project),
+            patch("fujimoto.cli.get_current_branch", return_value=current),
+            patch("fujimoto.cli.get_default_branch", return_value=default),
             patch(
-                "claude_worktree.cli.list_project_sessions",
+                "fujimoto.cli.list_project_sessions",
                 return_value=sessions or [],
             ),
             patch(
-                "claude_worktree.cli.get_project_worktrees_dir",
+                "fujimoto.cli.get_project_worktrees_dir",
                 return_value=worktree_root or Path("/nonexistent"),
             ),
+            patch("fujimoto.cli.session_name", side_effect=lambda p, d: f"{p}/{d}"),
             patch(
-                "claude_worktree.cli.session_name", side_effect=lambda p, d: f"{p}/{d}"
-            ),
-            patch(
-                "claude_worktree.cli.list_projects",
+                "fujimoto.cli.list_projects",
                 return_value=projects or [],
             ),
         ):
@@ -72,7 +70,7 @@ def _patch_git_info(
 class TestMain:
     def test_exits_on_config_error(self) -> None:
         with (
-            patch("claude_worktree.cli.WorktreeApp") as mock_app_cls,
+            patch("fujimoto.cli.SessionApp") as mock_app_cls,
             pytest.raises(SystemExit) as exc_info,
         ):
             mock_app_cls.side_effect = ConfigError("test error")
@@ -81,7 +79,7 @@ class TestMain:
 
     def test_exits_on_git_error(self) -> None:
         with (
-            patch("claude_worktree.cli.WorktreeApp") as mock_app_cls,
+            patch("fujimoto.cli.SessionApp") as mock_app_cls,
             pytest.raises(SystemExit) as exc_info,
         ):
             mock_app_cls.side_effect = GitError("not a git repo")
@@ -90,7 +88,7 @@ class TestMain:
 
     def test_exits_on_tmux_error(self) -> None:
         with (
-            patch("claude_worktree.cli.WorktreeApp") as mock_app_cls,
+            patch("fujimoto.cli.SessionApp") as mock_app_cls,
             pytest.raises(SystemExit) as exc_info,
         ):
             mock_app_cls.side_effect = TmuxError("tmux missing")
@@ -99,7 +97,7 @@ class TestMain:
 
     def test_exits_on_keyboard_interrupt(self) -> None:
         with (
-            patch("claude_worktree.cli.WorktreeApp") as mock_app_cls,
+            patch("fujimoto.cli.SessionApp") as mock_app_cls,
             pytest.raises(SystemExit) as exc_info,
         ):
             mock_app_cls.side_effect = KeyboardInterrupt
@@ -109,43 +107,61 @@ class TestMain:
     def test_launches_tmux_then_loops_back(self) -> None:
         # First iteration: launch target set -> attach tmux
         # Second iteration: no target -> exit loop
-        app1 = WorktreeApp.__new__(WorktreeApp)
-        app1._launch_target = ("proj", Path("/tmp/test"))
-        app2 = WorktreeApp.__new__(WorktreeApp)
+        app1 = SessionApp.__new__(SessionApp)
+        app1._launch_target = ("proj", Path("/tmp/test"), None)
+        app2 = SessionApp.__new__(SessionApp)
         app2._launch_target = None
 
         with (
-            patch("claude_worktree.cli.WorktreeApp", side_effect=[app1, app2]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]),
             patch.object(app1, "run"),
             patch.object(app2, "run"),
-            patch("claude_worktree.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
         ):
             main()
-            mock_launch.assert_called_once_with("proj", Path("/tmp/test"))
+            mock_launch.assert_called_once_with("proj", Path("/tmp/test"), None)
 
     def test_no_launch_when_target_not_set(self) -> None:
-        mock_app = WorktreeApp.__new__(WorktreeApp)
+        mock_app = SessionApp.__new__(SessionApp)
         mock_app._launch_target = None
 
         with (
-            patch("claude_worktree.cli.WorktreeApp", return_value=mock_app),
+            patch("fujimoto.cli.SessionApp", return_value=mock_app),
             patch.object(mock_app, "run"),
-            patch("claude_worktree.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
         ):
             main()
             mock_launch.assert_not_called()
+
+    def test_launches_with_tmux_name(self) -> None:
+        app1 = SessionApp.__new__(SessionApp)
+        app1._launch_target = ("proj", Path("/tmp/repo"), "proj/direct-1")
+        app2 = SessionApp.__new__(SessionApp)
+        app2._launch_target = None
+
+        with (
+            patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]),
+            patch.object(app1, "run"),
+            patch.object(app2, "run"),
+            patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+        ):
+            main()
+            mock_launch.assert_called_once_with(
+                "proj", Path("/tmp/repo"), "proj/direct-1"
+            )
 
 
 # -- TUI tests --
 
 
-class TestWorktreeAppHome:
+class TestSessionAppHome:
     @pytest.mark.asyncio
     async def test_home_shows_create_option(self) -> None:
         with _patch_git_info():
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test():
                 assert app.query_one("#action-create")
+                assert app.query_one("#action-direct")
                 assert app.query_one("#home-list")
 
     @pytest.mark.asyncio
@@ -153,9 +169,9 @@ class TestWorktreeAppHome:
         wt1 = tmp_path / "20260309-fix-tests"
         wt2 = tmp_path / "20260308-add-logging"
         with _patch_git_info(worktrees=[wt1, wt2]):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test():
-                assert len(app._worktree_paths) == 2
+                assert len(app._session_map) == 2
 
     @pytest.mark.asyncio
     async def test_home_shows_active_indicator(self, tmp_path: Path) -> None:
@@ -164,28 +180,37 @@ class TestWorktreeAppHome:
             sessions=["test-proj/20260309-fix-tests"],
             worktrees=[wt1],
         ):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test():
                 assert "test-proj/20260309-fix-tests" in app._active_sessions
 
     @pytest.mark.asyncio
+    async def test_home_shows_inactive_with_black_circle(self, tmp_path: Path) -> None:
+        wt1 = tmp_path / "20260309-fix-tests"
+        with _patch_git_info(worktrees=[wt1]):
+            app = SessionApp()
+            async with app.run_test():
+                session = app._session_map["wt-20260309-fix-tests"]
+                assert not session.is_active
+
+    @pytest.mark.asyncio
     async def test_home_no_worktrees(self) -> None:
         with _patch_git_info():
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test():
-                assert len(app._worktree_paths) == 0
+                assert len(app._session_map) == 0
 
     @pytest.mark.asyncio
     async def test_subtitle_shows_project(self) -> None:
         with _patch_git_info(project="my-project"):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test():
                 assert app.sub_title == "my-project"
 
     @pytest.mark.asyncio
     async def test_quit_binding(self) -> None:
         with _patch_git_info():
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.press("q")
                 assert app._launch_target is None
@@ -193,17 +218,461 @@ class TestWorktreeAppHome:
     @pytest.mark.asyncio
     async def test_escape_on_home_exits(self) -> None:
         with _patch_git_info():
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.press("escape")
                 assert app._launch_target is None
 
+    @pytest.mark.asyncio
+    async def test_direct_sessions_shown_in_active(self, tmp_path: Path) -> None:
+        """Direct sessions (tmux sessions without matching worktrees) appear."""
+        with _patch_git_info(sessions=["test-proj/direct-1"]):
+            app = SessionApp()
+            async with app.run_test():
+                assert "ds-test-proj--direct-1" in app._session_map
+                session = app._session_map["ds-test-proj--direct-1"]
+                assert session.session_type == "direct"
+                assert session.is_active
 
-class TestWorktreeAppCreateFlow:
+
+class TestSessionAppDirectSession:
+    @pytest.mark.asyncio
+    async def test_launch_direct_session(self) -> None:
+        with (
+            _patch_git_info(),
+            patch(
+                "fujimoto.cli.get_next_direct_session_name",
+                return_value="test-proj/direct-1",
+            ),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("down")  # Move to "New session in..."
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+                assert app._launch_target[2] == "test-proj/direct-1"
+
+
+class TestSessionAppSessionActions:
+    @pytest.mark.asyncio
+    async def test_shows_submenu_for_active_worktree(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                # Navigate past create options and separator to active worktree
+                for _ in range(10):
+                    await pilot.press("down")
+                # Find the worktree item and select it
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#session-actions")) > 0
+
+    @pytest.mark.asyncio
+    async def test_connect_exits_with_target(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # "Connect" is the first option
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+
+    @pytest.mark.asyncio
+    async def test_terminate_kills_session(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with (
+            _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]),
+            patch("fujimoto.cli.kill_session") as mock_kill,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # "Terminate" is the second option
+                await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                mock_kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_inactive_worktree_shows_launch(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#session-actions")) > 0
+                # First option for inactive is "Launch"
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+
+    @pytest.mark.asyncio
+    async def test_cancel_returns_home(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # Navigate to cancel (last item)
+                for _ in range(10):
+                    await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#home-list")) > 0
+
+    @pytest.mark.asyncio
+    async def test_direct_session_has_no_finish(self) -> None:
+        with _patch_git_info(sessions=["test-proj/direct-1"]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "ds-test-proj--direct-1":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # Should show session-actions but no "Finish" option
+                actions = app.query_one("#session-actions", ListView)
+                action_ids = [child.id for child in actions.children]
+                assert "sa-finish" not in action_ids
+                assert "sa-connect" in action_ids
+                assert "sa-terminate" in action_ids
+
+
+class TestSessionAppFinishFlow:
+    @pytest.mark.asyncio
+    async def test_finish_shows_options_for_unmerged(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with (
+            _patch_git_info(worktrees=[wt]),
+            patch("fujimoto.cli.get_unpushed_commits", return_value=["abc fix"]),
+            patch("fujimoto.cli.is_branch_merged", return_value=False),
+            patch("fujimoto.cli.has_remote_branch", return_value=False),
+            patch("fujimoto.cli.read_session_meta", return_value={}),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # Navigate to "Finish"
+                actions = app.query_one("#session-actions", ListView)
+                for i, item in enumerate(actions.children):
+                    if item.id == "sa-finish":
+                        actions.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#finish-list")) > 0
+                finish_list = app.query_one("#finish-list", ListView)
+                action_ids = [child.id for child in finish_list.children]
+                assert "finish-pr" in action_ids
+                assert "finish-cherry-pick" in action_ids
+                assert "finish-discard" in action_ids
+
+    @pytest.mark.asyncio
+    async def test_finish_shows_delete_for_merged(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with (
+            _patch_git_info(worktrees=[wt]),
+            patch("fujimoto.cli.get_unpushed_commits", return_value=[]),
+            patch("fujimoto.cli.is_branch_merged", return_value=True),
+            patch("fujimoto.cli.has_remote_branch", return_value=True),
+            patch("fujimoto.cli.read_session_meta", return_value={}),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                actions = app.query_one("#session-actions", ListView)
+                for i, item in enumerate(actions.children):
+                    if item.id == "sa-finish":
+                        actions.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                finish_list = app.query_one("#finish-list", ListView)
+                action_ids = [child.id for child in finish_list.children]
+                assert "finish-delete" in action_ids
+                assert "finish-delete-remote" in action_ids
+
+    @pytest.mark.asyncio
+    async def test_discard_shows_confirmation(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with (
+            _patch_git_info(worktrees=[wt]),
+            patch("fujimoto.cli.get_unpushed_commits", return_value=["abc fix"]),
+            patch("fujimoto.cli.is_branch_merged", return_value=False),
+            patch("fujimoto.cli.has_remote_branch", return_value=False),
+            patch("fujimoto.cli.read_session_meta", return_value={}),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                actions = app.query_one("#session-actions", ListView)
+                for i, item in enumerate(actions.children):
+                    if item.id == "sa-finish":
+                        actions.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # Select "Discard & Delete"
+                finish_list = app.query_one("#finish-list", ListView)
+                for i, item in enumerate(finish_list.children):
+                    if item.id == "finish-discard":
+                        finish_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#confirm-list")) > 0
+
+    @pytest.mark.asyncio
+    async def test_confirm_delete_removes_worktree(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with (
+            _patch_git_info(worktrees=[wt]),
+            patch("fujimoto.cli.get_unpushed_commits", return_value=[]),
+            patch("fujimoto.cli.is_branch_merged", return_value=False),
+            patch("fujimoto.cli.has_remote_branch", return_value=False),
+            patch("fujimoto.cli.read_session_meta", return_value={}),
+            patch("fujimoto.cli.remove_worktree") as mock_remove,
+            patch("fujimoto.cli.delete_branch"),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                actions = app.query_one("#session-actions", ListView)
+                for i, item in enumerate(actions.children):
+                    if item.id == "sa-finish":
+                        actions.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                finish_list = app.query_one("#finish-list", ListView)
+                for i, item in enumerate(finish_list.children):
+                    if item.id == "finish-discard":
+                        finish_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # Confirm delete
+                await pilot.press("enter")
+                await pilot.pause()
+                mock_remove.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_confirm_cancel_returns_home(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with (
+            _patch_git_info(worktrees=[wt]),
+            patch("fujimoto.cli.get_unpushed_commits", return_value=[]),
+            patch("fujimoto.cli.is_branch_merged", return_value=False),
+            patch("fujimoto.cli.has_remote_branch", return_value=False),
+            patch("fujimoto.cli.read_session_meta", return_value={}),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                actions = app.query_one("#session-actions", ListView)
+                for i, item in enumerate(actions.children):
+                    if item.id == "sa-finish":
+                        actions.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                finish_list = app.query_one("#finish-list", ListView)
+                for i, item in enumerate(finish_list.children):
+                    if item.id == "finish-discard":
+                        finish_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # Cancel
+                await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#home-list")) > 0
+
+    @pytest.mark.asyncio
+    async def test_push_and_pr(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with (
+            _patch_git_info(worktrees=[wt]),
+            patch("fujimoto.cli.get_unpushed_commits", return_value=["abc fix"]),
+            patch("fujimoto.cli.is_branch_merged", return_value=False),
+            patch("fujimoto.cli.has_remote_branch", return_value=False),
+            patch("fujimoto.cli.read_session_meta", return_value={}),
+            patch("fujimoto.cli.push_branch") as mock_push,
+            patch("fujimoto.cli.create_session_with_command") as mock_pr_session,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                actions = app.query_one("#session-actions", ListView)
+                for i, item in enumerate(actions.children):
+                    if item.id == "sa-finish":
+                        actions.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # Select "Push & Create PR"
+                await pilot.press("enter")
+                await pilot.pause()
+                mock_push.assert_called_once()
+                mock_pr_session.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cherry_pick_and_delete(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with (
+            _patch_git_info(worktrees=[wt]),
+            patch("fujimoto.cli.get_unpushed_commits", return_value=["abc fix"]),
+            patch("fujimoto.cli.is_branch_merged", return_value=False),
+            patch("fujimoto.cli.has_remote_branch", return_value=False),
+            patch(
+                "fujimoto.cli.read_session_meta",
+                return_value={"base_branch": "main"},
+            ),
+            patch("fujimoto.cli.cherry_pick_branch") as mock_cherry,
+            patch("fujimoto.cli.remove_worktree") as mock_remove,
+            patch("fujimoto.cli.delete_branch"),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                actions = app.query_one("#session-actions", ListView)
+                for i, item in enumerate(actions.children):
+                    if item.id == "sa-finish":
+                        actions.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # Select "Cherry-pick to main"
+                finish_list = app.query_one("#finish-list", ListView)
+                for i, item in enumerate(finish_list.children):
+                    if item.id == "finish-cherry-pick":
+                        finish_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                mock_cherry.assert_called_once()
+                mock_remove.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_finish_cancel_returns_home(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with (
+            _patch_git_info(worktrees=[wt]),
+            patch("fujimoto.cli.get_unpushed_commits", return_value=[]),
+            patch("fujimoto.cli.is_branch_merged", return_value=False),
+            patch("fujimoto.cli.has_remote_branch", return_value=False),
+            patch("fujimoto.cli.read_session_meta", return_value={}),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                actions = app.query_one("#session-actions", ListView)
+                for i, item in enumerate(actions.children):
+                    if item.id == "sa-finish":
+                        actions.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # Navigate to Cancel
+                finish_list = app.query_one("#finish-list", ListView)
+                for i, item in enumerate(finish_list.children):
+                    if item.id == "finish-cancel":
+                        finish_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#home-list")) > 0
+
+
+class TestSessionAppCreateFlow:
     @pytest.mark.asyncio
     async def test_navigate_to_create_form(self) -> None:
         with _patch_git_info():
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.press("enter")  # Select "Create new"
                 await pilot.pause()
@@ -212,7 +681,7 @@ class TestWorktreeAppCreateFlow:
     @pytest.mark.asyncio
     async def test_create_form_empty_title_stays(self) -> None:
         with _patch_git_info():
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.press("enter")  # Select "Create new"
                 await pilot.pause()
@@ -224,7 +693,7 @@ class TestWorktreeAppCreateFlow:
     @pytest.mark.asyncio
     async def test_escape_from_create_returns_home(self) -> None:
         with _patch_git_info():
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.press("enter")  # Select "Create new"
                 await pilot.pause()
@@ -235,7 +704,7 @@ class TestWorktreeAppCreateFlow:
     @pytest.mark.asyncio
     async def test_create_shows_branch_select_when_different(self) -> None:
         with _patch_git_info(current="feat/test", default="main"):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.press("enter")  # Select "Create new"
                 await pilot.pause()
@@ -250,19 +719,19 @@ class TestWorktreeAppCreateFlow:
         with (
             _patch_git_info(current="main", default="main"),
             patch(
-                "claude_worktree.cli.build_worktree_path",
+                "fujimoto.cli.build_worktree_path",
                 return_value=tmp_path / "new-wt",
             ),
-            patch("claude_worktree.cli.create_worktree") as mock_create,
+            patch("fujimoto.cli.create_worktree") as mock_create,
+            patch("fujimoto.cli.store_session_meta"),
         ):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.press("enter")  # Select "Create new"
                 await pilot.pause()
                 await pilot.press(*"my-title")
                 await pilot.press("enter")
                 await pilot.pause()
-                # Should have exited with launch target (skipped branch select)
                 mock_create.assert_called_once()
 
     @pytest.mark.asyncio
@@ -270,12 +739,13 @@ class TestWorktreeAppCreateFlow:
         with (
             _patch_git_info(current="feat/test", default="main"),
             patch(
-                "claude_worktree.cli.build_worktree_path",
+                "fujimoto.cli.build_worktree_path",
                 return_value=tmp_path / "new-wt",
             ),
-            patch("claude_worktree.cli.create_worktree") as mock_create,
+            patch("fujimoto.cli.create_worktree") as mock_create,
+            patch("fujimoto.cli.store_session_meta"),
         ):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.press("enter")  # Create new
                 await pilot.pause()
@@ -292,12 +762,13 @@ class TestWorktreeAppCreateFlow:
         with (
             _patch_git_info(current="feat/test", default="main"),
             patch(
-                "claude_worktree.cli.build_worktree_path",
+                "fujimoto.cli.build_worktree_path",
                 return_value=tmp_path / "new-wt",
             ),
-            patch("claude_worktree.cli.create_worktree"),
+            patch("fujimoto.cli.create_worktree"),
+            patch("fujimoto.cli.store_session_meta"),
         ):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.press("enter")  # Create new
                 await pilot.pause()
@@ -309,17 +780,37 @@ class TestWorktreeAppCreateFlow:
                 await pilot.pause()
                 assert app._base_branch == "main"
 
+    @pytest.mark.asyncio
+    async def test_create_stores_session_meta(self, tmp_path: Path) -> None:
+        with (
+            _patch_git_info(current="main", default="main"),
+            patch(
+                "fujimoto.cli.build_worktree_path",
+                return_value=tmp_path / "new-wt",
+            ),
+            patch("fujimoto.cli.create_worktree"),
+            patch("fujimoto.cli.store_session_meta") as mock_meta,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press(*"title")
+                await pilot.press("enter")
+                await pilot.pause()
+                mock_meta.assert_called_once_with(tmp_path / "new-wt", "main")
 
-class TestWorktreeAppConflict:
+
+class TestSessionAppConflict:
     @pytest.mark.asyncio
     async def test_shows_conflict_when_path_exists(self, tmp_path: Path) -> None:
         existing = tmp_path / "existing-wt"
         existing.mkdir()
         with (
             _patch_git_info(current="main", default="main"),
-            patch("claude_worktree.cli.build_worktree_path", return_value=existing),
+            patch("fujimoto.cli.build_worktree_path", return_value=existing),
         ):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.press("enter")  # Create new
                 await pilot.pause()
@@ -334,9 +825,9 @@ class TestWorktreeAppConflict:
         existing.mkdir()
         with (
             _patch_git_info(current="main", default="main"),
-            patch("claude_worktree.cli.build_worktree_path", return_value=existing),
+            patch("fujimoto.cli.build_worktree_path", return_value=existing),
         ):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.press("enter")  # Create new
                 await pilot.pause()
@@ -354,10 +845,11 @@ class TestWorktreeAppConflict:
         existing.mkdir()
         with (
             _patch_git_info(current="main", default="main"),
-            patch("claude_worktree.cli.build_worktree_path", return_value=existing),
-            patch("claude_worktree.cli.create_worktree") as mock_create,
+            patch("fujimoto.cli.build_worktree_path", return_value=existing),
+            patch("fujimoto.cli.create_worktree") as mock_create,
+            patch("fujimoto.cli.store_session_meta"),
         ):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.press("enter")  # Create new
                 await pilot.pause()
@@ -372,32 +864,17 @@ class TestWorktreeAppConflict:
                 assert called_path.name == "existing-wt-2"
 
 
-class TestWorktreeAppExistingSelect:
-    @pytest.mark.asyncio
-    async def test_select_existing_worktree(self, tmp_path: Path) -> None:
-        wt = tmp_path / "20260309-test"
-        with _patch_git_info(worktrees=[wt]):
-            app = WorktreeApp()
-            async with app.run_test() as pilot:
-                await pilot.press("down")  # Skip separator
-                await pilot.press("down")  # Move to worktree
-                await pilot.press("enter")
-                await pilot.pause()
-                assert app._launch_target is not None
-                assert app._launch_target[1].name == "20260309-test"
-
-
-class TestWorktreeAppErrors:
+class TestSessionAppErrors:
     @pytest.mark.asyncio
     async def test_shows_error_on_git_failure(self) -> None:
         with (
-            patch("claude_worktree.cli.is_tmux_installed", return_value=True),
+            patch("fujimoto.cli.is_tmux_installed", return_value=True),
             patch(
-                "claude_worktree.cli.get_project_name",
+                "fujimoto.cli.get_project_name",
                 side_effect=GitError("not a repo"),
             ),
         ):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.pause()
                 app.query_one("#main").render()
@@ -405,13 +882,13 @@ class TestWorktreeAppErrors:
     @pytest.mark.asyncio
     async def test_shows_error_on_config_error(self) -> None:
         with (
-            patch("claude_worktree.cli.is_tmux_installed", return_value=True),
+            patch("fujimoto.cli.is_tmux_installed", return_value=True),
             patch(
-                "claude_worktree.cli.get_project_name",
+                "fujimoto.cli.get_project_name",
                 side_effect=ConfigError("env not set"),
             ),
         ):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.pause()
 
@@ -420,15 +897,15 @@ class TestWorktreeAppErrors:
         with (
             _patch_git_info(current="main", default="main"),
             patch(
-                "claude_worktree.cli.build_worktree_path",
+                "fujimoto.cli.build_worktree_path",
                 return_value=tmp_path / "new-wt",
             ),
             patch(
-                "claude_worktree.cli.create_worktree",
+                "fujimoto.cli.create_worktree",
                 side_effect=GitError("branch already exists"),
             ),
         ):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.press("enter")
                 await pilot.pause()
@@ -439,19 +916,19 @@ class TestWorktreeAppErrors:
                 assert app._launch_target is None
 
 
-class TestWorktreeAppTmuxInstall:
+class TestSessionAppTmuxInstall:
     @pytest.mark.asyncio
     async def test_shows_install_prompt_when_missing(self) -> None:
-        with patch("claude_worktree.cli.is_tmux_installed", return_value=False):
-            app = WorktreeApp()
+        with patch("fujimoto.cli.is_tmux_installed", return_value=False):
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.pause()
                 assert len(app.query("#tmux-install-list")) > 0
 
     @pytest.mark.asyncio
     async def test_quit_from_install_prompt(self) -> None:
-        with patch("claude_worktree.cli.is_tmux_installed", return_value=False):
-            app = WorktreeApp()
+        with patch("fujimoto.cli.is_tmux_installed", return_value=False):
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.press("down")  # Move to "Quit"
                 await pilot.press("enter")
@@ -465,20 +942,18 @@ class TestWorktreeAppTmuxInstall:
             return installed
 
         with (
+            patch("fujimoto.cli.is_tmux_installed", side_effect=fake_is_installed),
+            patch("fujimoto.cli.install_tmux") as mock_install,
+            patch("fujimoto.cli.get_project_name", return_value="proj"),
+            patch("fujimoto.cli.get_current_branch", return_value="main"),
+            patch("fujimoto.cli.get_default_branch", return_value="main"),
+            patch("fujimoto.cli.list_project_sessions", return_value=[]),
             patch(
-                "claude_worktree.cli.is_tmux_installed", side_effect=fake_is_installed
-            ),
-            patch("claude_worktree.cli.install_tmux") as mock_install,
-            patch("claude_worktree.cli.get_project_name", return_value="proj"),
-            patch("claude_worktree.cli.get_current_branch", return_value="main"),
-            patch("claude_worktree.cli.get_default_branch", return_value="main"),
-            patch("claude_worktree.cli.list_project_sessions", return_value=[]),
-            patch(
-                "claude_worktree.cli.get_project_worktrees_dir",
+                "fujimoto.cli.get_project_worktrees_dir",
                 return_value=Path("/nonexistent"),
             ),
         ):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.pause()
 
@@ -494,19 +969,19 @@ class TestWorktreeAppTmuxInstall:
     @pytest.mark.asyncio
     async def test_install_failure_shows_error(self) -> None:
         with (
-            patch("claude_worktree.cli.is_tmux_installed", return_value=False),
+            patch("fujimoto.cli.is_tmux_installed", return_value=False),
             patch(
-                "claude_worktree.cli.install_tmux",
+                "fujimoto.cli.install_tmux",
                 side_effect=TmuxError("brew failed"),
             ),
         ):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.press("enter")  # Select "Install with brew"
                 await pilot.pause()
 
 
-class TestWorktreeAppProjectSwitch:
+class TestSessionAppProjectSwitch:
     @pytest.mark.asyncio
     async def test_switch_project_shown_when_projects_available(
         self, tmp_path: Path
@@ -514,14 +989,14 @@ class TestWorktreeAppProjectSwitch:
         proj = tmp_path / "other-repo"
         proj.mkdir()
         with _patch_git_info(projects=[proj]):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test():
                 assert len(app.query("#action-switch-project")) > 0
 
     @pytest.mark.asyncio
     async def test_switch_project_hidden_when_no_projects(self) -> None:
         with _patch_git_info(projects=[]):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test():
                 assert len(app.query("#action-switch-project")) == 0
 
@@ -530,7 +1005,7 @@ class TestWorktreeAppProjectSwitch:
         proj = tmp_path / "other-repo"
         proj.mkdir()
         with _patch_git_info(projects=[proj]):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 # Navigate to switch project (last item)
                 for _ in range(10):
@@ -549,7 +1024,7 @@ class TestWorktreeAppProjectSwitch:
         proj_c = tmp_path / "charlie"
         proj_c.mkdir()
         with _patch_git_info(projects=[proj_a, proj_b, proj_c]):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 # Navigate to switch project
                 for _ in range(10):
@@ -573,11 +1048,11 @@ class TestWorktreeAppProjectSwitch:
         with (
             _patch_git_info(projects=[proj_a, proj_b]),
             patch(
-                "claude_worktree.cli.get_project_worktrees_dir",
+                "fujimoto.cli.get_project_worktrees_dir",
                 return_value=Path("/nonexistent"),
             ),
         ):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 # Navigate to switch project
                 for _ in range(10):
@@ -601,7 +1076,7 @@ class TestWorktreeAppProjectSwitch:
         proj_c = tmp_path / "charlie"
         proj_c.mkdir()
         with _patch_git_info(projects=[proj_a, proj_b, proj_c]):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 for _ in range(10):
                     await pilot.press("down")
@@ -625,7 +1100,7 @@ class TestWorktreeAppProjectSwitch:
         proj_b = tmp_path / "bravo"
         proj_b.mkdir()
         with _patch_git_info(projects=[proj_a, proj_b]):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 for _ in range(10):
                     await pilot.press("down")
@@ -645,7 +1120,7 @@ class TestWorktreeAppProjectSwitch:
         proj = tmp_path / "bravo"
         proj.mkdir()
         with _patch_git_info(projects=[proj]):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 for _ in range(10):
                     await pilot.press("down")
@@ -661,7 +1136,7 @@ class TestWorktreeAppProjectSwitch:
         proj = tmp_path / "bravo"
         proj.mkdir()
         with _patch_git_info(projects=[proj]):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 for _ in range(10):
                     await pilot.press("down")
@@ -683,11 +1158,11 @@ class TestWorktreeAppProjectSwitch:
         with (
             _patch_git_info(projects=[proj_a, proj_b]),
             patch(
-                "claude_worktree.cli.get_project_worktrees_dir",
+                "fujimoto.cli.get_project_worktrees_dir",
                 return_value=Path("/nonexistent"),
             ),
         ):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 for _ in range(10):
                     await pilot.press("down")
@@ -709,11 +1184,11 @@ class TestWorktreeAppProjectSwitch:
         with (
             _patch_git_info(projects=[proj1, proj2]),
             patch(
-                "claude_worktree.cli.get_project_worktrees_dir",
+                "fujimoto.cli.get_project_worktrees_dir",
                 return_value=Path("/nonexistent"),
             ),
         ):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 # Navigate to switch project
                 for _ in range(10):
@@ -731,7 +1206,7 @@ class TestWorktreeAppProjectSwitch:
         proj = tmp_path / "bad-repo"
         proj.mkdir()
         with _patch_git_info(projects=[proj]):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 # Navigate to switch project
                 for _ in range(10):
@@ -740,7 +1215,7 @@ class TestWorktreeAppProjectSwitch:
                 await pilot.pause()
                 # Mock git failure for next init, then Enter selects
                 with patch(
-                    "claude_worktree.cli.get_project_name",
+                    "fujimoto.cli.get_project_name",
                     side_effect=GitError("not a repo"),
                 ):
                     await pilot.press("enter")
@@ -748,7 +1223,7 @@ class TestWorktreeAppProjectSwitch:
                     # Should not crash
 
 
-class TestWorktreeAppConflictSuffix:
+class TestSessionAppConflictSuffix:
     @pytest.mark.asyncio
     async def test_suffix_increments_past_existing(self, tmp_path: Path) -> None:
         existing = tmp_path / "existing-wt"
@@ -757,10 +1232,11 @@ class TestWorktreeAppConflictSuffix:
         (tmp_path / "existing-wt-2").mkdir()
         with (
             _patch_git_info(current="main", default="main"),
-            patch("claude_worktree.cli.build_worktree_path", return_value=existing),
-            patch("claude_worktree.cli.create_worktree") as mock_create,
+            patch("fujimoto.cli.build_worktree_path", return_value=existing),
+            patch("fujimoto.cli.create_worktree") as mock_create,
+            patch("fujimoto.cli.store_session_meta"),
         ):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.press("enter")  # Create new
                 await pilot.pause()
@@ -775,7 +1251,7 @@ class TestWorktreeAppConflictSuffix:
                 assert called_path.name == "existing-wt-3"
 
 
-class TestWorktreeAppEscapeFromNested:
+class TestSessionAppEscapeFromNested:
     @pytest.mark.asyncio
     async def test_escape_from_project_select_returns_home(
         self, tmp_path: Path
@@ -783,7 +1259,7 @@ class TestWorktreeAppEscapeFromNested:
         proj = tmp_path / "repo"
         proj.mkdir()
         with _patch_git_info(projects=[proj]):
-            app = WorktreeApp()
+            app = SessionApp()
             async with app.run_test() as pilot:
                 # Navigate to project select
                 for _ in range(10):

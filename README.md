@@ -1,10 +1,14 @@
-# claude-worktree-manager
+# fujimoto
 
-A terminal UI for creating git worktrees and launching Claude Code inside tmux sessions. Each worktree gets its own detachable tmux session, so you can run multiple Claude agents in parallel across isolated branches.
+A terminal UI for managing Claude Code sessions across git worktrees and repositories. Spin up isolated worktree sessions or launch Claude directly in an existing repo — all from an interactive TUI with tmux-powered detachable sessions.
 
-## Why
+## Why "Fujimoto"?
 
-When working on multiple tasks in the same repo, git worktrees let you check out different branches simultaneously without stashing or switching. This tool automates the ceremony of creating worktrees, naming branches, and launching Claude Code — all from an interactive TUI.
+Named after Fujimoto from Hayao Miyazaki's *Ponyo* — a former human turned fastidious caretaker of the sea. Fujimoto is obsessed with order and control, meticulously tending to the balance of his domain while managing his many daughters and their chaotic tendencies.
+
+Like his namesake, this tool is a caretaker and orchestrator — keeping your worktrees organised, your sessions tracked, and your branches tidy. It manages the lifecycle from creation through to cleanup, fretting over unpushed commits and unmerged branches so you don't have to. And like Fujimoto learning to accept that Ponyo must live her own life, it knows when to let go — spinning off background Claude sessions to handle their own PRs and gracefully cleaning up when the work is done.
+
+He carries himself with dignity, even in defeat. Your worktrees should too.
 
 ## Prerequisites
 
@@ -19,90 +23,101 @@ When working on multiple tasks in the same repo, git worktrees let you check out
 uv tool install --force --reinstall /path/to/this/repo
 ```
 
-This installs the `worktree` command globally. Re-run after code changes to pick up updates.
+This installs the `fujimoto` command globally. Re-run after code changes to pick up updates.
 
 ## Configuration
 
-Set the root directory where worktrees will be created:
-
 ```sh
-export CLAUDE_WORKTREE_MANAGER_WORKTREE_ROOT=~/git/worktrees/
+export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/   # Where worktrees are created
+export FUJIMOTO_GIT_ROOT=~/git/                   # Optional: enables project switching
 ```
 
-Add this to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.) to persist it.
-
-Worktrees are organized as `{root}/{project-name}/{YYYYMMDD}-{slugified-title}`. For example, running from a repo called `qsic-data` with title "fix unit tests" creates:
-
-```
-~/git/worktrees/qsic-data/20260309-fix-unit-tests/
-```
+Add these to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.) to persist them.
 
 ## Usage
 
 Run from inside any git repository:
 
 ```sh
-worktree
+fujimoto
 ```
 
 ### Home Screen
 
-The TUI shows a unified list with:
+```
++ New worktree session
++ New session in <project>
+───── active sessions ─────
+🟢 20260309-cleanup-ui          (worktree)
+🟢 direct-1                     (direct @ main)
+───── inactive worktrees ─────
+⚫ 20260308-old-experiment      (worktree)
+─────
+  Switch project
+```
 
-- **+ Create a new worktree** — at the top
-- **Existing worktrees** — listed below with active session indicators
+### Two Session Types
 
-Active tmux sessions show a green circle indicator. Select any existing worktree to attach to its tmux session (or create a new one if none exists).
+**Worktree sessions** create an isolated git worktree with its own branch. Useful for standalone tasks that become PRs, or investigations where you want to fork off and explore.
 
-### Creating a Worktree
+**Direct sessions** launch Claude in an existing repo directory on its current branch. Quick and lightweight — no worktree overhead.
 
-1. Select **+ Create a new worktree**
-2. Enter a title (e.g. "fix unit tests")
-3. Choose a base branch (current or default) — skipped if you're already on the default branch
-4. The worktree is created and Claude Code launches in a new tmux session
+### Session Actions
 
-If a worktree with the same name already exists, you're offered the choice to connect to it or create a new one with a numeric suffix.
+Select any session to see contextual options:
 
-### Worktree Naming
+| Session State | Options |
+|--------------|---------|
+| Active worktree | Connect, Terminate, Finish |
+| Inactive worktree | Launch, Finish |
+| Active direct | Connect, Terminate |
 
-- **Directory**: `{YYYYMMDD}-{slugified-title}` (e.g. `20260309-fix-unit-tests`)
-- **Git branch**: `worktree/{directory-name}` (e.g. `worktree/20260309-fix-unit-tests`)
-- **tmux session**: `{project}/{directory-name}` (e.g. `qsic-data/20260309-fix-unit-tests`)
+### Finish Flow
+
+When you're done with a worktree, the **Finish** flow checks the branch state and offers:
+
+- **Push & Create PR** — pushes the branch and spins up a background Claude session to create the PR
+- **Cherry-pick to base** — applies your commits back to the original branch, then cleans up
+- **Discard & Delete** — throws away the work (with confirmation if there are unpushed commits)
+
+For already-merged branches: **Delete** or **Delete + remove remote branch**.
+
+### Naming Conventions
+
+| Thing | Pattern | Example |
+|-------|---------|---------|
+| Worktree directory | `{YYYYMMDD}-{slug}` | `20260309-fix-unit-tests` |
+| Git branch | `worktree/{dir-name}` | `worktree/20260309-fix-unit-tests` |
+| tmux session (worktree) | `{project}/{dir-name}` | `qsic-data/20260309-fix-unit-tests` |
+| tmux session (direct) | `{project}/direct-{N}` | `qsic-data/direct-1` |
 
 ### tmux Session Controls
 
-Each tmux session remaps the prefix key to `Ctrl+A` (instead of the default `Ctrl+B`):
+Each session remaps the prefix key to `Ctrl+A`:
 
 | Shortcut | Action |
 |----------|--------|
-| `Ctrl+A D` | Detach from session (leaves it running) |
-| `Ctrl+A [` | Enter scroll/copy mode |
-| `Ctrl+A X` | Kill the current pane |
+| `Ctrl+A D` | Detach (leave running) |
+| `Ctrl+A [` | Scroll/copy mode |
+| `Ctrl+A X` | Kill pane |
 
-These bindings are set per-session and do not affect your global tmux configuration.
+These are set per-session and don't affect your global tmux config.
 
 ### Keyboard Shortcuts
 
 | Key | Action |
 |-----|--------|
-| `Enter` | Select highlighted item |
-| `Escape` | Go back (or quit from home screen) |
+| `Enter` | Select |
+| `Escape` | Back (or quit from home) |
 | `q` | Quit |
-| Arrow keys | Navigate lists |
+| Arrow keys | Navigate |
 
 ## Development
 
 ```sh
-# Clone and sync dependencies
-git clone <repo-url>
-cd worktree
 uv sync
-
-# Run locally without installing
-uv run worktree
-
-# Install globally for testing
-uv tool install --force --reinstall .
+uv run fujimoto        # Run locally
+uv run pytest          # Run tests with coverage
 ```
 
 ## License

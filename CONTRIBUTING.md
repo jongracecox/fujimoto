@@ -4,7 +4,7 @@
 
 ```sh
 git clone <repo-url>
-cd worktree
+cd fujimoto
 uv sync
 ```
 
@@ -13,13 +13,13 @@ uv sync
 You must be inside a git repository and have the environment variable set:
 
 ```sh
-export CLAUDE_WORKTREE_MANAGER_WORKTREE_ROOT=~/git/worktrees/
-uv run worktree
+export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/
+uv run fujimoto
 ```
 
 ## Installing Globally
 
-After making changes, reinstall to test the global `worktree` command:
+After making changes, reinstall to test the global `fujimoto` command:
 
 ```sh
 uv tool install --force --reinstall .
@@ -30,9 +30,9 @@ Both `--force` and `--reinstall` are required — `--force` alone reuses cached 
 ## Project Layout
 
 ```
-src/claude_worktree/
+src/fujimoto/
 ├── cli.py        # Textual TUI app and entry point
-├── config.py     # Env var loading, path construction, slugify
+├── config.py     # Env var loading, path construction, session metadata
 ├── git.py        # Git subprocess wrappers
 └── tmux.py       # tmux session management
 ```
@@ -77,10 +77,10 @@ Every `remove_children()` and `mount()` call must be awaited to prevent DOM race
 
 The Textual app cannot run simultaneously with tmux attach (both need the terminal). The pattern is:
 
-1. TUI sets `self._launch_target = (project, path)`
+1. TUI sets `self._launch_target = (project, path, tmux_name)`
 2. TUI calls `self.exit()` to cleanly shut down the event loop
 3. `main()` reads `_launch_target` after `app.run()` returns
-4. `launch_claude_in_tmux()` calls `os.execvp` to replace the process
+4. `launch_claude_in_tmux()` creates or attaches to the tmux session
 
 ### Adding a New View
 
@@ -98,12 +98,13 @@ The Textual app cannot run simultaneously with tmux attach (both need the termin
 
 ## Testing Manually
 
-1. Run `worktree` from a git repo
+1. Run `fujimoto` from a git repo
 2. Create a new worktree — verify the directory and git branch are created
 3. Detach from tmux (`Ctrl+A D`)
-4. Run `worktree` again — the worktree should show a green circle indicator
-5. Select the existing worktree — should reattach to the running session
-6. Test error cases:
+4. Run `fujimoto` again — the worktree should show a green circle, direct sessions listed
+5. Select an existing session — should show the actions submenu (Connect/Launch/Finish)
+6. Test the Finish flow on a worktree with unpushed commits
+7. Test error cases:
    - Run outside a git repo
-   - Unset `CLAUDE_WORKTREE_MANAGER_WORKTREE_ROOT`
+   - Unset `FUJIMOTO_WORKTREE_ROOT`
    - Create a worktree with a name that already exists
