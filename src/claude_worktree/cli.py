@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from textual import on
+from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, VerticalScroll
@@ -21,6 +21,7 @@ from claude_worktree.config import (
     ConfigError,
     build_worktree_path,
     get_project_worktrees_dir,
+    list_projects,
 )
 from claude_worktree.git import (
     GitError,
@@ -125,6 +126,34 @@ Screen {
     color: $text-muted;
     margin-top: 1;
 }
+
+#project-panel {
+    height: auto;
+    padding: 1 2;
+    border: round $primary;
+}
+
+#project-panel .form-label {
+    margin-bottom: 0;
+    text-style: bold;
+}
+
+#project-filter {
+    margin-bottom: 1;
+}
+
+#project-list {
+    height: auto;
+    max-height: 20;
+}
+
+#project-list > ListItem {
+    padding: 0 2;
+}
+
+#project-list:focus > ListItem.--highlight {
+    background: $accent;
+}
 """
 
 
@@ -133,11 +162,13 @@ class WorktreeApp(App):
     CSS = CSS
     BINDINGS = [
         Binding("q", "quit", "Quit"),
+        Binding("ctrl+c", "quit", "Quit", show=False),
         Binding("escape", "go_back", "Back", show=True),
     ]
 
     def __init__(self) -> None:
         super().__init__()
+        self._project_cwd: Path | None = None
         self._project_name: str = ""
         self._current_branch: str = ""
         self._default_branch: str = ""
@@ -148,6 +179,8 @@ class WorktreeApp(App):
         self._launch_target: tuple[str, Path] | None = None
         self._existing_worktrees: list[Path] = []
         self._worktree_paths: dict[str, Path] = {}
+        self._available_projects: list[Path] = []
+        self._project_dir_paths: dict[str, Path] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -165,10 +198,12 @@ class WorktreeApp(App):
             await self._show_error(str(e))
 
     def _init_git_info(self) -> None:
-        self._project_name = get_project_name()
-        self._current_branch = get_current_branch()
-        self._default_branch = get_default_branch()
+        cwd = self._project_cwd
+        self._project_name = get_project_name(cwd)
+        self._current_branch = get_current_branch(cwd)
+        self._default_branch = get_default_branch(cwd)
         self._active_sessions = set(list_project_sessions(self._project_name))
+        self._available_projects = list_projects()
         self.sub_title = self._project_name
 
         self._existing_worktrees = []
@@ -242,6 +277,23 @@ class WorktreeApp(App):
                 item_id = f"wt-{wt.name}"
                 self._worktree_paths[item_id] = wt
                 items.append(ListItem(Label(label_text), id=item_id))
+
+        if self._available_projects:
+            items.append(
+                ListItem(
+                    Static("─────────────────────────────", classes="separator-item"),
+                    disabled=True,
+                ),
+            )
+            items.append(
+                ListItem(
+                    Label(
+                        f"[dim]Switch project (current: {self._project_name})[/]",
+                        markup=True,
+                    ),
+                    id="action-switch-project",
+                ),
+            )
 
         await main.mount(
             Container(
@@ -330,18 +382,143 @@ class WorktreeApp(App):
     async def _do_create_and_launch(self) -> None:
         new_branch = f"worktree/{self._worktree_path.name}"
         try:
-            create_worktree(self._worktree_path, self._base_branch, new_branch)
+            create_worktree(
+                self._worktree_path,
+                self._base_branch,
+                new_branch,
+                cwd=self._project_cwd,
+            )
         except GitError as e:
             await self._show_error(str(e))
             return
         self._launch_target = (self._project_name, self._worktree_path)
         self.exit()
 
+    def _build_project_items(self, filter_text: str = "") -> list[ListItem]:
+        self._project_dir_paths = {}
+        items: list[ListItem] = []
+        query = filter_text.lower()
+        for proj in self._available_projects:
+            if query and query not in proj.name.lower():
+                continue
+            item_id = f"proj-{proj.name}"
+            self._project_dir_paths[item_id] = proj
+            if proj.name == self._project_name:
+                label_text = f"\U0001f7e2 {proj.name}"
+            else:
+                label_text = f"   {proj.name}"
+            items.append(ListItem(Label(label_text), id=item_id))
+        return items
+
+    async def _show_project_select(self) -> None:
+        await self._clear_main()
+        main = self.query_one("#main")
+
+        items = self._build_project_items()
+
+        await main.mount(
+            Container(
+                Label("Switch Project", classes="form-label"),
+                Input(placeholder="Type to filter...", id="project-filter"),
+                ListView(*items, id="project-list"),
+                id="project-panel",
+            )
+        )
+        self.query_one("#project-filter").focus()
+
+    def _update_project_suggestion(self) -> None:
+        """Set ghost text on the filter input based on the highlighted list item."""
+        filter_input = self.query_one("#project-filter", Input)
+        project_list = self.query_one("#project-list", ListView)
+        typed = filter_input.value
+        if len(project_list) > 0 and project_list.index is not None:
+            item = project_list.children[project_list.index]
+            if item.id and item.id in self._project_dir_paths:
+                name = self._project_dir_paths[item.id].name
+                if name.lower().startswith(typed.lower()):
+                    filter_input._suggestion = typed + name[len(typed) :]
+                    return
+        filter_input._suggestion = ""
+
+    @on(Input.Changed, "#project-filter")
+    async def on_project_filter_changed(self, event: Input.Changed) -> None:
+        project_list = self.query_one("#project-list", ListView)
+        await project_list.clear()
+        for item in self._build_project_items(event.value):
+            await project_list.append(item)
+        if len(project_list) > 0:
+            project_list.index = 0
+        self._update_project_suggestion()
+
+    @on(Input.Submitted, "#project-filter")
+    async def on_project_filter_submitted(self, event: Input.Submitted) -> None:
+        await self._select_highlighted_project()
+
+    async def _select_highlighted_project(self) -> None:
+        """Select whichever project is currently highlighted in the list."""
+        project_list = self.query_one("#project-list", ListView)
+        if len(project_list) == 0 or project_list.index is None:
+            return
+        item = project_list.children[project_list.index]
+        item_id = item.id
+        if item_id and item_id in self._project_dir_paths:
+            self._project_cwd = self._project_dir_paths[item_id]
+            try:
+                self._init_git_info()
+                await self._show_home()
+            except (ConfigError, GitError) as e:
+                await self._show_error(str(e))
+
+    @on(ListView.Selected, "#project-list")
+    async def on_project_selected(self, event: ListView.Selected) -> None:
+        item_id = event.item.id
+        if item_id and item_id in self._project_dir_paths:
+            self._project_cwd = self._project_dir_paths[item_id]
+            try:
+                self._init_git_info()
+                await self._show_home()
+            except (ConfigError, GitError) as e:
+                await self._show_error(str(e))
+
+    async def _on_key(self, event: events.Key) -> None:
+        """Handle arrow keys and tab for project filter autocomplete."""
+        if not (self.focused and self.focused.id == "project-filter"):
+            return
+
+        project_list_nodes = self.query("#project-list")
+        if not project_list_nodes:
+            return
+        project_list = self.query_one("#project-list", ListView)
+
+        if event.key in ("down", "up"):
+            event.prevent_default()
+            event.stop()
+            if len(project_list) == 0:
+                return
+            idx = project_list.index or 0
+            if event.key == "down":
+                idx = min(idx + 1, len(project_list) - 1)
+            else:
+                idx = max(idx - 1, 0)
+            project_list.index = idx
+            self._update_project_suggestion()
+
+        elif event.key == "tab":
+            event.prevent_default()
+            event.stop()
+            filter_input = self.query_one("#project-filter", Input)
+            if filter_input._suggestion:
+                filter_input.value = filter_input._suggestion
+                filter_input.cursor_position = len(filter_input.value)
+                filter_input._suggestion = ""
+
     @on(ListView.Selected, "#home-list")
     async def on_home_selected(self, event: ListView.Selected) -> None:
         item_id = event.item.id
         if item_id == "action-create":
             await self._show_create_form()
+        elif item_id == "action-switch-project":
+            await self._show_project_select()
         elif item_id and item_id in self._worktree_paths:
             self._launch_target = (self._project_name, self._worktree_paths[item_id])
             self.exit()
@@ -402,12 +579,15 @@ class WorktreeApp(App):
 
 def main() -> None:
     try:
-        app = WorktreeApp()
-        app.run()
+        while True:
+            app = WorktreeApp()
+            app.run()
 
-        if app._launch_target:
-            project_name, worktree_path = app._launch_target
-            launch_claude_in_tmux(project_name, worktree_path)
+            if app._launch_target:
+                project_name, worktree_path = app._launch_target
+                launch_claude_in_tmux(project_name, worktree_path)
+            else:
+                break
     except (ConfigError, GitError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

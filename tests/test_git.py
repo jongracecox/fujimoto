@@ -115,5 +115,16 @@ class TestCreateWorktree:
         with patch("claude_worktree.git._run") as mock_run:
             create_worktree(worktree_path, "main", "my-branch")
             mock_run.assert_called_once_with(
-                ["worktree", "add", "-b", "my-branch", str(worktree_path), "main"]
+                ["worktree", "add", "-b", "my-branch", str(worktree_path), "main"],
+                cwd=None,
+            )
+
+    def test_calls_git_worktree_add_with_cwd(self, tmp_path: Path) -> None:
+        worktree_path = tmp_path / "new-worktree"
+        project_dir = tmp_path / "my-repo"
+        with patch("claude_worktree.git._run") as mock_run:
+            create_worktree(worktree_path, "main", "my-branch", cwd=project_dir)
+            mock_run.assert_called_once_with(
+                ["worktree", "add", "-b", "my-branch", str(worktree_path), "main"],
+                cwd=project_dir,
             )

@@ -24,34 +24,36 @@ def _run(args: list[str], cwd: Path | str | None = None) -> str:
         raise GitError("git is not installed or not on PATH")
 
 
-def get_repo_root() -> Path:
-    return Path(_run(["rev-parse", "--show-toplevel"]))
+def get_repo_root(cwd: Path | str | None = None) -> Path:
+    return Path(_run(["rev-parse", "--show-toplevel"], cwd=cwd))
 
 
-def get_project_name() -> str:
-    return get_repo_root().name
+def get_project_name(cwd: Path | str | None = None) -> str:
+    return get_repo_root(cwd).name
 
 
-def get_current_branch() -> str:
-    return _run(["branch", "--show-current"])
+def get_current_branch(cwd: Path | str | None = None) -> str:
+    return _run(["branch", "--show-current"], cwd=cwd)
 
 
-def get_default_branch() -> str:
+def get_default_branch(cwd: Path | str | None = None) -> str:
     try:
-        ref = _run(["symbolic-ref", "refs/remotes/origin/HEAD"])
+        ref = _run(["symbolic-ref", "refs/remotes/origin/HEAD"], cwd=cwd)
         return ref.split("/")[-1]
     except GitError:
         pass
     for candidate in ("main", "master"):
         try:
-            _run(["rev-parse", "--verify", candidate])
+            _run(["rev-parse", "--verify", candidate], cwd=cwd)
             return candidate
         except GitError:
             continue
     return "main"
 
 
-def create_worktree(path: Path, base_branch: str, new_branch: str) -> None:
+def create_worktree(
+    path: Path, base_branch: str, new_branch: str, cwd: Path | str | None = None
+) -> None:
     if path.exists():
         raise GitError(f"Directory already exists: {path}")
-    _run(["worktree", "add", "-b", new_branch, str(path), base_branch])
+    _run(["worktree", "add", "-b", new_branch, str(path), base_branch], cwd=cwd)

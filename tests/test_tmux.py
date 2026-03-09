@@ -135,11 +135,11 @@ class TestCreateSession:
 
 
 class TestAttachSession:
-    def test_calls_execvp(self) -> None:
-        with patch("claude_worktree.tmux.os.execvp") as mock_execvp:
+    def test_calls_subprocess_run(self) -> None:
+        with patch("claude_worktree.tmux.subprocess.run") as mock_run:
             attach_session("proj/test")
-            mock_execvp.assert_called_once_with(
-                "tmux", ["tmux", "attach-session", "-t", "proj/test"]
+            mock_run.assert_called_once_with(
+                ["tmux", "attach-session", "-t", "proj/test"]
             )
 
 
