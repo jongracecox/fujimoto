@@ -125,7 +125,7 @@ class TestMain:
         # First iteration: launch target set -> attach tmux
         # Second iteration: no target -> exit loop
         app1 = SessionApp.__new__(SessionApp)
-        app1._launch_target = ("proj", Path("/tmp/test"), None)
+        app1._launch_target = ("proj", Path("/tmp/test"), None, "worktree")
         app2 = SessionApp.__new__(SessionApp)
         app2._launch_target = None
 
@@ -135,9 +135,13 @@ class TestMain:
             patch.object(app1, "run"),
             patch.object(app2, "run"),
             patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli._build_system_prompt", return_value="test") as mock_sp,
         ):
             main()
-            mock_launch.assert_called_once_with("proj", Path("/tmp/test"), None)
+            mock_sp.assert_called_once_with("worktree", "proj", Path("/tmp/test"))
+            mock_launch.assert_called_once_with(
+                "proj", Path("/tmp/test"), None, system_prompt="test"
+            )
 
     def test_no_launch_when_target_not_set(self) -> None:
         mock_app = SessionApp.__new__(SessionApp)
@@ -154,7 +158,7 @@ class TestMain:
 
     def test_launches_with_tmux_name(self) -> None:
         app1 = SessionApp.__new__(SessionApp)
-        app1._launch_target = ("proj", Path("/tmp/repo"), "proj/direct-1")
+        app1._launch_target = ("proj", Path("/tmp/repo"), "proj/direct-1", "direct")
         app2 = SessionApp.__new__(SessionApp)
         app2._launch_target = None
 
@@ -164,11 +168,39 @@ class TestMain:
             patch.object(app1, "run"),
             patch.object(app2, "run"),
             patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli._build_system_prompt", return_value="test"),
         ):
             main()
             mock_launch.assert_called_once_with(
-                "proj", Path("/tmp/repo"), "proj/direct-1"
+                "proj", Path("/tmp/repo"), "proj/direct-1", system_prompt="test"
             )
+
+
+class TestBuildSystemPrompt:
+    def test_worktree_prompt_includes_base_branch(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _build_system_prompt
+        from fujimoto.config import store_session_meta
+
+        store_session_meta(tmp_path, "main")
+        prompt = _build_system_prompt("worktree", "myproj", tmp_path)
+        assert "worktree" in prompt
+        assert "myproj" in prompt
+        assert "main" in prompt
+        assert "Do not push" in prompt
+
+    def test_worktree_prompt_without_meta(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _build_system_prompt
+
+        prompt = _build_system_prompt("worktree", "myproj", tmp_path)
+        assert "unknown" in prompt
+
+    def test_direct_prompt(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _build_system_prompt
+
+        prompt = _build_system_prompt("direct", "myproj", tmp_path)
+        assert "direct" in prompt
+        assert "myproj" in prompt
+        assert "not an isolated worktree" in prompt
 
 
 # -- TUI tests --

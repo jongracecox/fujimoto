@@ -281,7 +281,7 @@ class SessionApp(App):
         self._title_value: str = ""
         self._base_branch: str = ""
         self._worktree_path: Path | None = None
-        self._launch_target: tuple[str, Path, str | None] | None = None
+        self._launch_target: tuple[str, Path, str | None, str] | None = None
         self._existing_worktrees: list[Path] = []
         self._session_map: dict[str, SessionInfo] = {}
         self._available_projects: list[Path] = []
@@ -774,7 +774,12 @@ class SessionApp(App):
         except GitError as e:
             await self._show_error(str(e))
             return
-        self._launch_target = (self._project_name, self._worktree_path, None)
+        self._launch_target = (
+            self._project_name,
+            self._worktree_path,
+            None,
+            "worktree",
+        )
         self.exit()
 
     # -- Project switcher --
@@ -949,6 +954,7 @@ class SessionApp(App):
                 session.project,
                 session.path,
                 session.tmux_session,
+                session.session_type,
             )
             self.exit()
         elif action == "sa-launch":
@@ -956,6 +962,7 @@ class SessionApp(App):
                 session.project,
                 session.path,
                 session.tmux_session,
+                session.session_type,
             )
             self.exit()
         elif action == "sa-terminate":
@@ -1107,7 +1114,7 @@ class SessionApp(App):
             return
         tmux_name = f"{self._project_name}/{slugify(value)}"
         project_path = self._project_cwd or Path(".")
-        self._launch_target = (self._project_name, project_path, tmux_name)
+        self._launch_target = (self._project_name, project_path, tmux_name, "direct")
         self.exit()
 
     @on(Input.Submitted, "#rename-input")
@@ -1152,7 +1159,12 @@ class SessionApp(App):
     async def on_conflict_selected(self, event: ListView.Selected) -> None:
         assert self._worktree_path is not None
         if event.item.id == "conflict-connect":
-            self._launch_target = (self._project_name, self._worktree_path, None)
+            self._launch_target = (
+                self._project_name,
+                self._worktree_path,
+                None,
+                "worktree",
+            )
             self.exit()
         elif event.item.id == "conflict-suffix":
             suffix = 2
@@ -1195,6 +1207,24 @@ def _check_prerequisites() -> list[str]:
     return issues
 
 
+def _build_system_prompt(session_type: str, project: str, working_dir: Path) -> str:
+    if session_type == "worktree":
+        meta = read_session_meta(working_dir)
+        base_branch = meta.get("base_branch", "unknown") if meta else "unknown"
+        return (
+            f"You are working in a fujimoto worktree session for project '{project}'. "
+            f"This is an isolated git worktree branched from '{base_branch}'. "
+            "Do not push or create PRs directly — the user will finish this session "
+            "through fujimoto (push & PR, cherry-pick, or discard). "
+            "Focus your work on this worktree's branch."
+        )
+    return (
+        f"You are working in a fujimoto direct session for project '{project}'. "
+        "This is the project's main repository directory, not an isolated worktree. "
+        "Be cautious with branch operations — other sessions may share this directory."
+    )
+
+
 def main() -> None:
     try:
         issues = _check_prerequisites()
@@ -1209,8 +1239,16 @@ def main() -> None:
             app.run()
 
             if app._launch_target:
-                project_name, working_dir, tmux_name = app._launch_target
-                launch_claude_in_tmux(project_name, working_dir, tmux_name)
+                project_name, working_dir, tmux_name, session_type = app._launch_target
+                system_prompt = _build_system_prompt(
+                    session_type, project_name, working_dir
+                )
+                launch_claude_in_tmux(
+                    project_name,
+                    working_dir,
+                    tmux_name,
+                    system_prompt=system_prompt,
+                )
             else:
                 break
     except (ConfigError, GitError) as e:
