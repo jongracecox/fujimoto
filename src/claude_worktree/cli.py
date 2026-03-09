@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 import questionary
 
-from src.config import ConfigError, build_worktree_path, get_project_worktrees_dir, slugify
-from src.git import GitError, create_worktree, get_current_branch, get_default_branch, get_project_name
-from src.tmux import TmuxError, launch_claude_in_tmux
+from claude_worktree.config import (
+    ConfigError,
+    build_worktree_path,
+    get_project_worktrees_dir,
+    slugify,
+)
+from claude_worktree.git import (
+    GitError,
+    create_worktree,
+    get_current_branch,
+    get_default_branch,
+    get_project_name,
+)
+from claude_worktree.tmux import TmuxError, launch_claude_in_tmux
 
 
 def main() -> None:

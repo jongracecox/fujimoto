@@ -8,8 +8,12 @@ dependencies = [
     "questionary>=2.0.0",
 ]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project.scripts]
-worktree = "src.cli:main"
+worktree = "claude_worktree.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src"]
+packages = ["src/claude_worktree"]
