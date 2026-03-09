@@ -172,6 +172,27 @@ class TestCreateSession:
                 check=True,
             )
 
+    def test_creates_session_with_system_prompt(self, tmp_path: Path) -> None:
+        with patch(
+            "fujimoto.tmux.subprocess.run", return_value=MagicMock(returncode=0)
+        ) as mock_run:
+            create_session("proj/test", tmp_path, system_prompt="You are in a worktree")
+
+            calls = mock_run.call_args_list
+            assert calls[0] == call(
+                [
+                    "tmux",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "proj/test",
+                    "-c",
+                    str(tmp_path),
+                    "claude --append-system-prompt 'You are in a worktree'",
+                ],
+                check=True,
+            )
+
 
 class TestCreateSessionWithCommand:
     def test_creates_session_with_custom_command(self, tmp_path: Path) -> None:
@@ -222,7 +243,9 @@ class TestLaunchClaudeInTmux:
         ):
             wt_path = tmp_path / "20260309-test"
             launch_claude_in_tmux("proj", wt_path)
-            mock_create.assert_called_once_with("proj/20260309-test", wt_path)
+            mock_create.assert_called_once_with(
+                "proj/20260309-test", wt_path, system_prompt=None
+            )
             mock_attach.assert_called_once_with("proj/20260309-test")
 
     def test_uses_explicit_tmux_name(self, tmp_path: Path) -> None:

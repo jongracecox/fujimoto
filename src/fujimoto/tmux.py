@@ -97,7 +97,13 @@ def _configure_session(name: str) -> None:
     )
 
 
-def create_session(name: str, working_dir: Path) -> None:
+def create_session(
+    name: str, working_dir: Path, system_prompt: str | None = None
+) -> None:
+    claude_cmd = "claude"
+    if system_prompt:
+        escaped = system_prompt.replace("'", "'\\''")
+        claude_cmd = f"claude --append-system-prompt '{escaped}'"
     subprocess.run(
         [
             "tmux",
@@ -107,7 +113,7 @@ def create_session(name: str, working_dir: Path) -> None:
             name,
             "-c",
             str(working_dir),
-            "claude",
+            claude_cmd,
         ],
         check=True,
     )
@@ -146,11 +152,14 @@ def attach_session(name: str) -> None:
 
 
 def launch_claude_in_tmux(
-    project_name: str, working_dir: Path, tmux_name: str | None = None
+    project_name: str,
+    working_dir: Path,
+    tmux_name: str | None = None,
+    system_prompt: str | None = None,
 ) -> None:
     name = tmux_name or session_name(project_name, working_dir.name)
     if session_exists(name):
         attach_session(name)
     else:
-        create_session(name, working_dir)
+        create_session(name, working_dir, system_prompt=system_prompt)
         attach_session(name)
