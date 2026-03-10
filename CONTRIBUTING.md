@@ -34,7 +34,10 @@ src/fujimoto/
 ├── cli.py        # Textual TUI app and entry point
 ├── config.py     # Env var loading, path construction, session metadata
 ├── git.py        # Git subprocess wrappers
-└── tmux.py       # tmux session management
+├── tmux.py       # tmux session management
+└── claude/
+    ├── __init__.py      # Re-exports public API
+    └── log_parser.py    # Parse Claude JSONL session logs
 ```
 
 See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation.
@@ -95,6 +98,14 @@ The Textual app cannot run simultaneously with tmux attach (both need the termin
 - tmux operations go in `tmux.py` using `subprocess.run`
 - Both should raise their respective error types (`GitError`, `TmuxError`)
 - Import and use them in `cli.py`
+
+### Claude Log Integration
+
+The `claude/` subpackage parses Claude Code's JSONL session logs (`~/.claude/projects/`). Not yet wired into the TUI — currently a standalone module with its own test suite.
+
+- Add new entry types or stop reasons to the StrEnums in `log_parser.py` — unknown values raise `ClaudeLogError` immediately
+- Path encoding matches Claude's convention: `str(path).replace("/", "-")`
+- Test with `tmp_path` fixtures — never access real `~/.claude/` in tests
 
 ## Testing Manually
 

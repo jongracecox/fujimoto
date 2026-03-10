@@ -32,7 +32,10 @@ src/fujimoto/
 ├── cli.py        # Textual TUI app, entry point (main()), all UI screens and event handlers
 ├── config.py     # Environment variable loading, path construction, session metadata
 ├── git.py        # Git subprocess wrappers (worktree lifecycle, branch operations)
-└── tmux.py       # tmux session lifecycle (create, attach, kill, list, install)
+├── tmux.py       # tmux session lifecycle (create, attach, kill, list, install)
+└── claude/
+    ├── __init__.py      # Re-exports public API
+    └── log_parser.py    # Parse Claude JSONL session logs (state, metadata, session lookup)
 ```
 
 ## Architecture
@@ -94,6 +97,15 @@ src/fujimoto/
 - `kill_session(name)` — `tmux kill-session -t`
 - `attach_session(name)` — prints shortcut banner, then `subprocess.run` tmux attach (returns on detach)
 - `launch_claude_in_tmux(project, path, tmux_name)` — orchestrates create-or-attach
+
+**`claude/log_parser.py`** — Parse Claude Code's JSONL session logs:
+- `ClaudeLogError` — raised on empty/unreadable logs or unknown enum values
+- `EntryType` / `StopReason` / `SessionState` — StrEnums with strict `from_raw()` parsing
+- `ClaudeSession` — frozen dataclass: session_id, state, cwd, git_branch, last_activity, etc.
+- `encode_project_path(path)` — `str(path).replace("/", "-")` (matches Claude's directory encoding)
+- `get_claude_projects_dir()` — `~/.claude/projects`
+- `parse_session(jsonl_path)` — reads JSONL, tracks last meaningful (non-sidechain) entry, derives state
+- `get_sessions_for_path(project_path)` — encodes path, globs `*.jsonl`, returns sorted sessions
 
 **`cli.py`** — Textual TUI with async view management:
 - `SessionInfo` — dataclass for session state (type, project, path, tmux name, active status)
@@ -169,6 +181,7 @@ Things discovered during development that are easy to forget:
 - **`git reflog` records branch creation origin** (`branch: Created from main`) — useful for recovering the base branch if `.fujimoto-meta.json` is missing.
 - **`claude -p` (print mode)** runs non-interactively. For background tasks, pair with `--allowedTools` to scope permissions rather than `--dangerously-skip-permissions`.
 - **Global find-replace for renames** works well but always verify test patch target strings — they are plain strings not checked by the import system. Run the full test suite after any rename.
+- **Claude log entry types evolve** — real logs contain `progress` entries alongside `assistant`, `user`, `system`, and `file-history-snapshot`. Always smoke-test the log parser against real `~/.claude/projects/` data after changes to `EntryType`.
 
 ## Git Commits and PRs
 
