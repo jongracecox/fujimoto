@@ -7,6 +7,7 @@ import pytest
 
 from fujimoto.tmux import (
     TmuxError,
+    _ensure_extended_keys,
     attach_session,
     create_session,
     create_session_with_command,
@@ -259,6 +260,61 @@ class TestLaunchClaudeInTmux:
         ):
             launch_claude_in_tmux("proj", tmp_path, "proj/direct-1")
             mock_attach.assert_called_once_with("proj/direct-1")
+
+
+class TestEnsureExtendedKeys:
+    def test_sets_global_extended_keys_and_appends_extkeys(self) -> None:
+        def run_side_effect(args: list[str], **kwargs: object) -> MagicMock:
+            if args[:3] == ["tmux", "show-options", "-s"]:
+                return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0)
+
+        with patch(
+            "fujimoto.tmux.subprocess.run", side_effect=run_side_effect
+        ) as mock_run:
+            _ensure_extended_keys()
+
+            calls = mock_run.call_args_list
+            assert (
+                call(
+                    ["tmux", "set-option", "-g", "extended-keys", "always"],
+                    check=True,
+                )
+                in calls
+            )
+            assert (
+                call(
+                    [
+                        "tmux",
+                        "set-option",
+                        "-s",
+                        "-a",
+                        "terminal-features",
+                        "xterm*:extkeys",
+                    ],
+                    check=True,
+                )
+                in calls
+            )
+
+    def test_skips_append_when_extkeys_already_present(self) -> None:
+        def run_side_effect(args: list[str], **kwargs: object) -> MagicMock:
+            if args[:3] == ["tmux", "show-options", "-s"]:
+                return MagicMock(
+                    returncode=0,
+                    stdout="terminal-features[0] xterm*:extkeys\n",
+                )
+            return MagicMock(returncode=0)
+
+        with patch(
+            "fujimoto.tmux.subprocess.run", side_effect=run_side_effect
+        ) as mock_run:
+            _ensure_extended_keys()
+
+            # Should NOT have the append call
+            for c in mock_run.call_args_list:
+                if c[0][0][:4] == ["tmux", "set-option", "-s", "-a"]:
+                    pytest.fail("Should not append extkeys when already present")
 
 
 class TestSetTerminalTitle:

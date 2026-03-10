@@ -87,6 +87,33 @@ def kill_session(name: str) -> None:
         raise TmuxError(f"Failed to kill session: {name}")
 
 
+def _ensure_extended_keys() -> None:
+    """Ensure tmux server forwards extended key sequences (like Shift+Enter).
+
+    Both options are server/global-level:
+    - ``extended-keys always`` forces CSI u sequences to all panes
+      (``on`` only works if the app sends the kitty activation sequence,
+      which Claude Code does not)
+    - ``terminal-features xterm*:extkeys`` enables the extkeys capability
+
+    Requires tmux 3.2+.
+    """
+    subprocess.run(
+        ["tmux", "set-option", "-g", "extended-keys", "always"],
+        check=True,
+    )
+    result = subprocess.run(
+        ["tmux", "show-options", "-s", "terminal-features"],
+        capture_output=True,
+        text=True,
+    )
+    if "extkeys" not in result.stdout:
+        subprocess.run(
+            ["tmux", "set-option", "-s", "-a", "terminal-features", "xterm*:extkeys"],
+            check=True,
+        )
+
+
 def _configure_session(name: str) -> None:
     """Apply standard tmux configuration to a session."""
     options: dict[str, str] = {
@@ -136,6 +163,7 @@ def create_session(
         check=True,
     )
     _configure_session(name)
+    _ensure_extended_keys()
 
 
 def create_session_with_command(name: str, working_dir: Path, command: str) -> None:
@@ -154,6 +182,7 @@ def create_session_with_command(name: str, working_dir: Path, command: str) -> N
         check=True,
     )
     _configure_session(name)
+    _ensure_extended_keys()
 
 
 def attach_session(name: str) -> None:
