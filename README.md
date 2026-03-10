@@ -1,5 +1,8 @@
 # fujimoto
 
+![Tests](https://github.com/jongracecox/fujimoto/actions/workflows/tests.yml/badge.svg)
+![Coverage](https://raw.githubusercontent.com/jongracecox/fujimoto/badges/coverage.svg)
+
 A terminal UI for managing Claude Code sessions across git worktrees and repositories. Spin up isolated worktree sessions or launch Claude directly in an existing repo — all from an interactive TUI with tmux-powered detachable sessions.
 
 ## Why "Fujimoto"?
