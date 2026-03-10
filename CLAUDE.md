@@ -94,11 +94,11 @@ src/fujimoto/
 - `is_tmux_installed()` / `install_tmux()` — detection and brew install
 - `list_project_sessions(project)` — lists active tmux sessions for a project
 - `session_name(project, dir)` — naming convention: `{project}/{dir}`
-- `create_session(name, dir)` — creates detached session, sets prefix to Ctrl+A, runs `claude`
+- `create_session(name, dir, system_prompt, resume_session_id)` — creates detached session, sets prefix to Ctrl+A, runs `claude` (with optional `--resume`)
 - `create_session_with_command(name, dir, command)` — like `create_session` but with custom command
 - `kill_session(name)` — `tmux kill-session -t`
 - `attach_session(name)` — prints shortcut banner, then `subprocess.run` tmux attach (returns on detach)
-- `launch_claude_in_tmux(project, path, tmux_name)` — orchestrates create-or-attach
+- `launch_claude_in_tmux(project, path, tmux_name, system_prompt, resume_session_id)` — orchestrates create-or-attach, supports resuming previous Claude sessions
 
 **`claude/log_parser.py`** — Parse Claude Code's JSONL session logs:
 - `ClaudeLogError` — raised on empty/unreadable logs or unknown enum values
@@ -110,16 +110,18 @@ src/fujimoto/
 - `get_sessions_for_path(project_path)` — encodes path, globs `*.jsonl`, returns sorted sessions
 
 **`cli.py`** — Textual TUI with async view management:
-- `SessionInfo` — dataclass for session state (type, project, path, tmux name, active status)
+- `SessionInfo` — dataclass for session state (type, project, path, tmux name, active status, claude_session_id, claude_state)
 - `SessionApp` — main app class with CSS styling
+- Module-level helpers: `_claude_state_label(state)`, `_relative_time(dt)`, `_get_claude_sessions(root, worktrees)`
+- Instance helpers: `_build_session_label(session, state_suffix)` — generates label text for session items, used by both `_show_home` initial render and `_poll_session_states` in-place updates
 - Views: home (sessions list), session actions submenu, finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), conflict resolution, project switcher (with autocomplete filter), tmux install, error
-- Home screen sections: actions ("New worktree session", "New session in X"), active sessions, inactive worktrees, switch project
+- Home screen sections: actions ("New worktree session", "New session in X"), active sessions (with Claude state indicators), inactive worktrees (with Claude state), previous Claude sessions (resumable, capped at 5), switch project
 - Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
-- Session actions submenu: Connect/Launch, Terminate, Finish (worktree only)
+- Session actions submenu: Connect/Launch, Terminate, Resume (claude sessions), Rename, Finish (worktree only)
 - Finish flow: Push & Create PR (background Claude), Cherry-pick to base, Discard & Delete
 - All view transitions are `async` — `await _clear_main()` then `await mount()`
 - Session data stored in `_session_map` dict keyed by ListItem ID
-- `_launch_target` is `(project, path, tmux_name)`, set before `self.exit()`
+- `_launch_target` is `(project, path, tmux_name, session_type, resume_id)`, set before `self.exit()`
 
 ### Error Handling
 
@@ -137,6 +139,7 @@ Three custom exception types, all caught in `main()`:
 | tmux session (worktree) | `{project}/{dir-name}` | `qsic-data/20260309-fix-unit-tests` |
 | tmux session (direct) | `{project}/direct-{N}` | `qsic-data/direct-1` |
 | Widget ID (direct) | `ds-{project}--direct-{N}` | `ds-qsic-data--direct-1` |
+| Widget ID (claude session) | `cs-{session-id}` | `cs-abc12345-def6-7890` |
 
 ### Key Design Decisions
 
@@ -145,6 +148,8 @@ Three custom exception types, all caught in `main()`:
 - **Global install via `uv tool`**: Requires `--force --reinstall` to rebuild the wheel from source. Plain `--force` reuses cached builds.
 - **Session metadata**: `.fujimoto-meta.json` stored in worktree directory records the base branch for cherry-pick targeting.
 - **Background PR creation**: Uses `claude -p --allowedTools "Bash(git:*) Bash(gh:*)"` in a tmux session for unattended PR creation.
+- **Claude session integration**: The home screen fetches Claude session state from `~/.claude/projects/` JSONL logs via the log parser. Active/inactive sessions show state indicators (⏳ awaiting input / ⚙ working). Previous Claude sessions (from the project root, capped at 5) appear as resumable items. Resuming launches `claude --resume SESSION_ID` in a new tmux session. The latest Claude session per path is "claimed" by the corresponding tmux/worktree item to avoid duplication.
+- **Live polling**: The home screen uses `set_interval(3s)` to poll Claude JSONL logs for state changes. When a session's state changes, labels are updated in-place via `label.update()` — the screen is never cleared or rebuilt, which avoids blank-screen flicker. A snapshot dict (`path → (session_id, state)`) is compared each tick to detect changes efficiently. The timer is stopped when navigating away (`_clear_main` cancels it) and restarted by `_show_home`.
 
 ## Testing
 

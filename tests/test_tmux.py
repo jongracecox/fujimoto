@@ -245,7 +245,10 @@ class TestLaunchClaudeInTmux:
             wt_path = tmp_path / "20260309-test"
             launch_claude_in_tmux("proj", wt_path)
             mock_create.assert_called_once_with(
-                "proj/20260309-test", wt_path, system_prompt=None
+                "proj/20260309-test",
+                wt_path,
+                system_prompt=None,
+                resume_session_id=None,
             )
             mock_attach.assert_called_once_with("proj/20260309-test")
 
