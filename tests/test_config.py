@@ -10,6 +10,7 @@ from fujimoto.config import (
     ConfigError,
     build_worktree_path,
     get_git_projects_root,
+    get_next_adhoc_session_name,
     get_next_direct_session_name,
     get_project_worktrees_dir,
     get_worktree_root,
@@ -238,3 +239,19 @@ class TestGetNextDirectSessionName:
         sessions = {"proj/direct-2"}
         result = get_next_direct_session_name("proj", sessions)
         assert result == "proj/direct-1"
+
+
+class TestGetNextAdhocSessionName:
+    def test_returns_adhoc_1_when_no_sessions(self) -> None:
+        result = get_next_adhoc_session_name(set())
+        assert result == "adhoc-1"
+
+    def test_increments_past_existing(self) -> None:
+        sessions = {"adhoc-1", "adhoc-2"}
+        result = get_next_adhoc_session_name(sessions)
+        assert result == "adhoc-3"
+
+    def test_fills_gaps(self) -> None:
+        sessions = {"adhoc-2"}
+        result = get_next_adhoc_session_name(sessions)
+        assert result == "adhoc-1"

@@ -37,8 +37,8 @@ def install_tmux() -> None:
         raise TmuxError("tmux was installed but not found on PATH")
 
 
-def list_project_sessions(project_name: str) -> list[str]:
-    """Return tmux session names that belong to the given project."""
+def list_all_sessions() -> list[str]:
+    """Return all tmux session names."""
     result = subprocess.run(
         ["tmux", "list-sessions", "-F", "#{session_name}"],
         capture_output=True,
@@ -46,8 +46,13 @@ def list_project_sessions(project_name: str) -> list[str]:
     )
     if result.returncode != 0:
         return []
+    return result.stdout.strip().splitlines()
+
+
+def list_project_sessions(project_name: str) -> list[str]:
+    """Return tmux session names that belong to the given project."""
     prefix = f"{project_name}/"
-    return [s for s in result.stdout.strip().splitlines() if s.startswith(prefix)]
+    return [s for s in list_all_sessions() if s.startswith(prefix)]
 
 
 def session_name(project_name: str, worktree_dir_name: str) -> str:

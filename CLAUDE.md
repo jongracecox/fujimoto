@@ -60,6 +60,12 @@ src/fujimoto/
 - Multiple concurrent sessions possible on same repo
 - Named `{project}/direct-N` in tmux
 
+**Ad hoc sessions** — Claude launched in a temporary directory, outside any git project:
+- For quick questions, investigations, and one-off tasks
+- Working directory is a `tempfile.mkdtemp(prefix="fujimoto-adhoc-")` temp dir
+- Named `adhoc-N` in tmux (not project-scoped)
+- System prompt tells Claude there is no git repository
+
 ### Module Responsibilities
 
 **`config.py`** — Pure functions, no side effects except directory creation:
@@ -71,6 +77,7 @@ src/fujimoto/
 - `get_project_worktrees_dir(project)` — `{root}/{project}`
 - `store_session_meta(path, base_branch)` / `read_session_meta(path)` — JSON metadata
 - `get_next_direct_session_name(project, sessions)` — computes `{project}/direct-N`
+- `get_next_adhoc_session_name(sessions)` — computes `adhoc-N`
 
 **`git.py`** — Thin wrappers around `git` subprocess calls:
 - `_run(args, cwd)` — subprocess runner, raises `GitError` on non-zero exit
@@ -92,6 +99,7 @@ src/fujimoto/
 
 **`tmux.py`** — tmux session management:
 - `is_tmux_installed()` / `install_tmux()` — detection and brew install
+- `list_all_sessions()` — lists all active tmux session names
 - `list_project_sessions(project)` — lists active tmux sessions for a project
 - `session_name(project, dir)` — naming convention: `{project}/{dir}`
 - `create_session(name, dir, system_prompt, resume_session_id)` — creates detached session, sets prefix to Ctrl+A, runs `claude` (with optional `--resume`)
@@ -115,7 +123,7 @@ src/fujimoto/
 - Module-level helpers: `_claude_state_label(state)`, `_relative_time(dt)`, `_get_claude_sessions(root, worktrees)`
 - Instance helpers: `_build_session_label(session, state_suffix)` — generates label text for session items, used by both `_show_home` initial render and `_poll_session_states` in-place updates
 - Views: home (sessions list), session actions submenu, finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), conflict resolution, project switcher (with autocomplete filter), tmux install, error
-- Home screen sections: actions ("New worktree session", "New session in X"), active sessions (with Claude state indicators), inactive worktrees (with Claude state), previous Claude sessions (resumable, capped at 5), switch project
+- Home screen sections: actions ("New worktree session", "New session in X", "Ad hoc session"), active sessions (with Claude state indicators), inactive worktrees (with Claude state), previous Claude sessions (resumable, capped at 5), switch project
 - Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
 - Session actions submenu: Connect/Launch, Terminate, Resume (claude sessions), Rename, Finish (worktree only)
 - Finish flow: Push & Create PR (background Claude), Cherry-pick to base, Discard & Delete
@@ -138,6 +146,7 @@ Three custom exception types, all caught in `main()`:
 | Git branch | `worktree/{dir-name}` | `worktree/20260309-fix-unit-tests` |
 | tmux session (worktree) | `{project}/{dir-name}` | `qsic-data/20260309-fix-unit-tests` |
 | tmux session (direct) | `{project}/direct-{N}` | `qsic-data/direct-1` |
+| tmux session (adhoc) | `adhoc-{N}` | `adhoc-1` |
 | Widget ID (direct) | `ds-{project}--direct-{N}` | `ds-qsic-data--direct-1` |
 | Widget ID (claude session) | `cs-{session-id}` | `cs-abc12345-def6-7890` |
 
