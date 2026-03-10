@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from textual import events, on
@@ -18,6 +19,7 @@ from textual.widgets import (
     Static,
 )
 
+from fujimoto.claude import ClaudeSession, SessionState, get_sessions_for_path
 from fujimoto.config import (
     ConfigError,
     build_worktree_path,
@@ -60,6 +62,56 @@ from fujimoto.tmux import (
 )
 
 BRANCH_ICON = "\ue0a0"
+
+
+def _claude_state_label(state: SessionState) -> str:
+    if state == SessionState.WAITING_FOR_USER:
+        return " [dim]\u23f3 awaiting input[/]"
+    if state == SessionState.PROCESSING:
+        return " [dim]\u2699 working[/]"
+    return ""
+
+
+def _relative_time(dt: datetime) -> str:
+    now = datetime.now(tz=timezone.utc)
+    delta = now - dt
+    if delta.days > 30:
+        months = delta.days // 30
+        return f"{months}mo ago"
+    if delta.days > 0:
+        return f"{delta.days}d ago"
+    hours = delta.seconds // 3600
+    if hours > 0:
+        return f"{hours}h ago"
+    minutes = delta.seconds // 60
+    if minutes > 0:
+        return f"{minutes}m ago"
+    return "just now"
+
+
+def _get_claude_sessions(
+    project_root: Path | None,
+    worktrees: list[Path],
+) -> tuple[dict[str, ClaudeSession], list[ClaudeSession]]:
+    """Fetch Claude sessions for the project root and worktree paths.
+
+    Returns (path_to_latest_session, project_root_sessions).
+    """
+    path_to_latest: dict[str, ClaudeSession] = {}
+    root_sessions: list[ClaudeSession] = []
+
+    if project_root is not None:
+        root_sessions = get_sessions_for_path(project_root)
+        if root_sessions:
+            path_to_latest[str(project_root)] = root_sessions[0]
+
+    for wt in worktrees:
+        wt_sessions = get_sessions_for_path(wt)
+        if wt_sessions:
+            path_to_latest[str(wt)] = wt_sessions[0]
+
+    return path_to_latest, root_sessions
+
 
 CSS = """\
 Screen {
@@ -267,12 +319,14 @@ Screen {
 @dataclass
 class SessionInfo:
     name: str
-    session_type: str  # "worktree" or "direct"
+    session_type: str  # "worktree", "direct", or "claude"
     project: str
     path: Path
     tmux_session: str
     is_active: bool
     branch: str
+    claude_session_id: str | None = field(default=None)
+    claude_state: SessionState | None = field(default=None)
 
 
 class SessionApp(App):
@@ -294,7 +348,8 @@ class SessionApp(App):
         self._title_value: str = ""
         self._base_branch: str = ""
         self._worktree_path: Path | None = None
-        self._launch_target: tuple[str, Path, str | None, str] | None = None
+        self._launch_target: tuple[str, Path, str | None, str, str | None] | None = None
+        self._project_root: Path | None = None
         self._existing_worktrees: list[Path] = []
         self._session_map: dict[str, SessionInfo] = {}
         self._available_projects: list[Path] = []
@@ -302,6 +357,8 @@ class SessionApp(App):
         self._selected_session: SessionInfo | None = None
         self._finish_action: str = ""
         self._branch_picker_names: dict[str, str] = {}
+        self._poll_timer: object | None = None
+        self._claude_state_snapshot: dict[str, tuple[str, SessionState]] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -321,6 +378,7 @@ class SessionApp(App):
     def _init_git_info(self) -> None:
         cwd = self._project_cwd
         self._project_name = get_project_name(cwd)
+        self._project_root = get_repo_root(cwd)
         self._current_branch = get_current_branch(cwd)
         self._default_branch = get_default_branch(cwd)
         self._active_sessions = set(list_project_sessions(self._project_name))
@@ -340,8 +398,14 @@ class SessionApp(App):
             pass
 
     async def _clear_main(self) -> None:
+        self._stop_polling()
         main = self.query_one("#main")
         await main.remove_children()
+
+    def _stop_polling(self) -> None:
+        if self._poll_timer is not None:
+            self._poll_timer.stop()  # type: ignore[union-attr]
+            self._poll_timer = None
 
     async def _show_error(self, message: str) -> None:
         await self._clear_main()
@@ -373,6 +437,15 @@ class SessionApp(App):
     async def _show_home(self) -> None:
         await self._clear_main()
         main = self.query_one("#main")
+
+        # Fetch Claude session data for state indicators
+        path_to_latest, root_claude_sessions = _get_claude_sessions(
+            self._project_root, self._existing_worktrees
+        )
+        self._claude_state_snapshot = {
+            k: (v.session_id, v.state) for k, v in path_to_latest.items()
+        }
+        claimed_claude_ids: set[str] = set()
 
         items: list[ListItem] = [
             ListItem(
@@ -423,8 +496,14 @@ class SessionApp(App):
 
             for sname in direct_sessions:
                 item_id = f"ds-{sname.replace('/', '--')}"
-                # Direct sessions: extract the suffix part for display
                 display_name = sname.split("/", 1)[1] if "/" in sname else sname
+                project_root_str = str(self._project_root) if self._project_root else ""
+                cs = path_to_latest.get(project_root_str)
+                cs_id = cs.session_id if cs else None
+                cs_state = cs.state if cs else None
+                if cs_id:
+                    claimed_claude_ids.add(cs_id)
+                state_suffix = _claude_state_label(cs_state) if cs_state else ""
                 self._session_map[item_id] = SessionInfo(
                     name=display_name,
                     session_type="direct",
@@ -433,10 +512,13 @@ class SessionApp(App):
                     tmux_session=sname,
                     is_active=True,
                     branch=self._current_branch,
+                    claude_session_id=cs_id,
+                    claude_state=cs_state,
                 )
                 label_text = (
                     f"\U0001f7e2 {display_name}"
-                    f"  [dim]({self._project_name} {BRANCH_ICON} {self._current_branch})[/]"
+                    f"  [dim]({self._project_name} {BRANCH_ICON}"
+                    f" {self._current_branch})[/]{state_suffix}"
                 )
                 items.append(ListItem(Label(label_text, markup=True), id=item_id))
 
@@ -444,6 +526,12 @@ class SessionApp(App):
                 sname = session_name(self._project_name, wt.name)
                 item_id = f"wt-{wt.name}"
                 branch = f"worktree/{wt.name}"
+                cs = path_to_latest.get(str(wt))
+                cs_id = cs.session_id if cs else None
+                cs_state = cs.state if cs else None
+                if cs_id:
+                    claimed_claude_ids.add(cs_id)
+                state_suffix = _claude_state_label(cs_state) if cs_state else ""
                 self._session_map[item_id] = SessionInfo(
                     name=wt.name,
                     session_type="worktree",
@@ -452,8 +540,13 @@ class SessionApp(App):
                     tmux_session=sname,
                     is_active=True,
                     branch=branch,
+                    claude_session_id=cs_id,
+                    claude_state=cs_state,
                 )
-                label_text = f"\U0001f7e2 {wt.name}  [dim]({BRANCH_ICON} {branch})[/]"
+                label_text = (
+                    f"\U0001f7e2 {wt.name}"
+                    f"  [dim]({BRANCH_ICON} {branch})[/]{state_suffix}"
+                )
                 items.append(ListItem(Label(label_text, markup=True), id=item_id))
 
         # Inactive worktrees section
@@ -477,6 +570,12 @@ class SessionApp(App):
                 sname = session_name(self._project_name, wt.name)
                 item_id = f"wt-{wt.name}"
                 branch = f"worktree/{wt.name}"
+                cs = path_to_latest.get(str(wt))
+                cs_id = cs.session_id if cs else None
+                cs_state = cs.state if cs else None
+                if cs_id:
+                    claimed_claude_ids.add(cs_id)
+                state_suffix = _claude_state_label(cs_state) if cs_state else ""
                 self._session_map[item_id] = SessionInfo(
                     name=wt.name,
                     session_type="worktree",
@@ -485,8 +584,49 @@ class SessionApp(App):
                     tmux_session=sname,
                     is_active=False,
                     branch=branch,
+                    claude_session_id=cs_id,
+                    claude_state=cs_state,
                 )
-                label_text = f"\u26ab {wt.name}  [dim]({BRANCH_ICON} {branch})[/]"
+                label_text = (
+                    f"\u26ab {wt.name}  [dim]({BRANCH_ICON} {branch})[/]{state_suffix}"
+                )
+                items.append(ListItem(Label(label_text, markup=True), id=item_id))
+
+        # Previous Claude sessions (from project root, not claimed by active items)
+        previous_claude = [
+            cs for cs in root_claude_sessions if cs.session_id not in claimed_claude_ids
+        ][:5]
+
+        if previous_claude:
+            items.append(
+                ListItem(
+                    Static(
+                        "───── previous claude sessions ─────",
+                        classes="separator-item",
+                    ),
+                    disabled=True,
+                ),
+            )
+            for cs in previous_claude:
+                short_id = cs.session_id[:8]
+                item_id = f"cs-{cs.session_id}"
+                time_label = _relative_time(cs.last_activity)
+                branch_label = f"{BRANCH_ICON} {cs.git_branch}" if cs.git_branch else ""
+                state_suffix = _claude_state_label(cs.state)
+                label_text = (
+                    f"  {short_id}  [dim]{branch_label}  {time_label}[/]{state_suffix}"
+                )
+                self._session_map[item_id] = SessionInfo(
+                    name=short_id,
+                    session_type="claude",
+                    project=self._project_name,
+                    path=cs.cwd,
+                    tmux_session="",
+                    is_active=False,
+                    branch=cs.git_branch or "",
+                    claude_session_id=cs.session_id,
+                    claude_state=cs.state,
+                )
                 items.append(ListItem(Label(label_text, markup=True), id=item_id))
 
         if self._available_projects:
@@ -521,6 +661,65 @@ class SessionApp(App):
             )
         )
         self.query_one("#home-list").focus()
+        self._poll_timer = self.set_interval(3, self._poll_session_states)
+
+    async def _poll_session_states(self) -> None:
+        """Poll for Claude session state changes and update labels in-place."""
+        if not self.query("#home-list"):
+            return
+
+        new_path_to_latest, _ = _get_claude_sessions(
+            self._project_root, self._existing_worktrees
+        )
+        new_snapshot = {
+            k: (v.session_id, v.state) for k, v in new_path_to_latest.items()
+        }
+        if new_snapshot == self._claude_state_snapshot:
+            return
+
+        self._claude_state_snapshot = new_snapshot
+
+        # Update labels in-place for sessions with changed Claude state
+        for item_id, session in self._session_map.items():
+            if session.session_type == "claude":
+                continue  # Previous sessions don't need live updates
+            if session.session_type == "direct":
+                path_key = str(self._project_root) if self._project_root else ""
+            else:
+                path_key = str(session.path)
+            new_cs = new_path_to_latest.get(path_key)
+            new_state = new_cs.state if new_cs else None
+            if new_state == session.claude_state:
+                continue
+            # State changed — update the session and its label
+            session.claude_state = new_state
+            session.claude_session_id = new_cs.session_id if new_cs else None
+            state_suffix = _claude_state_label(new_state) if new_state else ""
+            label_text = self._build_session_label(session, state_suffix)
+            try:
+                item = self.query_one(f"#{item_id}")
+                label = item.query_one(Label)
+                label.update(label_text)
+            except Exception:  # pragma: no cover
+                pass
+
+    def _build_session_label(self, session: SessionInfo, state_suffix: str) -> str:
+        """Build the display label for a session item."""
+        if session.is_active:
+            if session.session_type == "direct":
+                return (
+                    f"\U0001f7e2 {session.name}"
+                    f"  [dim]({session.project} {BRANCH_ICON}"
+                    f" {session.branch})[/]{state_suffix}"
+                )
+            return (
+                f"\U0001f7e2 {session.name}"
+                f"  [dim]({BRANCH_ICON} {session.branch})[/]{state_suffix}"
+            )
+        return (
+            f"\u26ab {session.name}"
+            f"  [dim]({BRANCH_ICON} {session.branch})[/]{state_suffix}"
+        )
 
     # -- Session actions submenu --
 
@@ -531,21 +730,36 @@ class SessionApp(App):
 
         items: list[ListItem] = []
 
-        if session.is_active:
+        if session.session_type == "claude":
+            items.append(ListItem(Label("Resume"), id="sa-resume"))
+        elif session.is_active:
             items.append(ListItem(Label("Connect"), id="sa-connect"))
             items.append(ListItem(Label("Terminate session"), id="sa-terminate"))
         else:
             items.append(ListItem(Label("Launch"), id="sa-launch"))
 
-        items.append(ListItem(Label("Rename"), id="sa-rename"))
+        if session.session_type != "claude":
+            items.append(ListItem(Label("Rename"), id="sa-rename"))
 
         if session.session_type == "worktree":
             items.append(ListItem(Label("Finish (cleanup/merge)"), id="sa-finish"))
 
         items.append(ListItem(Label("[dim]Cancel[/]", markup=True), id="sa-cancel"))
 
-        type_label = session.project if session.session_type == "direct" else "worktree"
-        status_label = "active" if session.is_active else "inactive"
+        if session.session_type == "claude":
+            type_label = "claude session"
+            status_label = (
+                _claude_state_label(session.claude_state).strip()
+                if session.claude_state
+                else "unknown"
+            )
+            # Strip markup tags for plain text info line
+            status_label = status_label.replace("[dim]", "").replace("[/]", "")
+        else:
+            type_label = (
+                session.project if session.session_type == "direct" else "worktree"
+            )
+            status_label = "active" if session.is_active else "inactive"
         info_text = f"{type_label} | {status_label} | {BRANCH_ICON} {session.branch}"
 
         await main.mount(
@@ -827,6 +1041,7 @@ class SessionApp(App):
             self._worktree_path,
             None,
             "worktree",
+            None,
         )
         self.exit()
 
@@ -1025,6 +1240,7 @@ class SessionApp(App):
                 session.path,
                 session.tmux_session,
                 session.session_type,
+                None,
             )
             self.exit()
         elif action == "sa-launch":
@@ -1033,6 +1249,19 @@ class SessionApp(App):
                 session.path,
                 session.tmux_session,
                 session.session_type,
+                None,
+            )
+            self.exit()
+        elif action == "sa-resume":
+            tmux_name = get_next_direct_session_name(
+                session.project, self._active_sessions
+            )
+            self._launch_target = (
+                session.project,
+                session.path,
+                tmux_name,
+                "direct",
+                session.claude_session_id,
             )
             self.exit()
         elif action == "sa-terminate":
@@ -1184,7 +1413,13 @@ class SessionApp(App):
             return
         tmux_name = f"{self._project_name}/{slugify(value)}"
         project_path = self._project_cwd or Path(".")
-        self._launch_target = (self._project_name, project_path, tmux_name, "direct")
+        self._launch_target = (
+            self._project_name,
+            project_path,
+            tmux_name,
+            "direct",
+            None,
+        )
         self.exit()
 
     @on(Input.Submitted, "#rename-input")
@@ -1273,6 +1508,7 @@ class SessionApp(App):
                 self._worktree_path,
                 None,
                 "worktree",
+                None,
             )
             self.exit()
         elif event.item.id == "conflict-suffix":
@@ -1369,20 +1605,20 @@ def main() -> None:
             app.run()
 
             if app._launch_target:
-                project_name, working_dir, tmux_name, session_type = app._launch_target
-                set_terminal_title(
-                    _session_terminal_title(
-                        project_name, tmux_name, working_dir, session_type
-                    )
+                project_name, working_dir, tmux_name, session_type, resume_id = (
+                    app._launch_target
                 )
-                system_prompt = _build_system_prompt(
-                    session_type, project_name, working_dir
+                system_prompt = (
+                    None
+                    if resume_id
+                    else _build_system_prompt(session_type, project_name, working_dir)
                 )
                 launch_claude_in_tmux(
                     project_name,
                     working_dir,
                     tmux_name,
                     system_prompt=system_prompt,
+                    resume_session_id=resume_id,
                 )
             else:
                 break

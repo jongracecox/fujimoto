@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -7,7 +8,15 @@ import pytest
 
 from textual.widgets import Input, ListView
 
-from fujimoto.cli import SessionApp, _session_terminal_title, main
+from fujimoto.claude import ClaudeSession, SessionState
+from fujimoto.claude.log_parser import EntryType, StopReason
+from fujimoto.cli import (
+    SessionApp,
+    _claude_state_label,
+    _get_claude_sessions,
+    _relative_time,
+    main,
+)
 from fujimoto.config import ConfigError
 from fujimoto.git import GitError
 from fujimoto.tmux import TmuxError
@@ -23,6 +32,7 @@ def _patch_git_info(
     sessions: list[str] | None = None,
     worktrees: list[Path] | None = None,
     projects: list[Path] | None = None,
+    claude_sessions_fn: object | None = None,
 ):
     """Return a context manager that patches git/tmux info for TUI tests."""
     import contextlib
@@ -43,6 +53,10 @@ def _patch_git_info(
         with (
             patch("fujimoto.cli.is_tmux_installed", return_value=True),
             patch("fujimoto.cli.get_project_name", return_value=project),
+            patch(
+                "fujimoto.cli.get_repo_root",
+                return_value=Path("/fake/repo"),
+            ),
             patch("fujimoto.cli.get_current_branch", return_value=current),
             patch("fujimoto.cli.get_default_branch", return_value=default),
             patch(
@@ -57,6 +71,10 @@ def _patch_git_info(
             patch(
                 "fujimoto.cli.list_projects",
                 return_value=projects or [],
+            ),
+            patch(
+                "fujimoto.cli.get_sessions_for_path",
+                side_effect=claude_sessions_fn or (lambda _path: []),
             ),
         ):
             yield
@@ -125,7 +143,7 @@ class TestMain:
         # First iteration: launch target set -> attach tmux
         # Second iteration: no target -> exit loop
         app1 = SessionApp.__new__(SessionApp)
-        app1._launch_target = ("proj", Path("/tmp/test"), None, "worktree")
+        app1._launch_target = ("proj", Path("/tmp/test"), None, "worktree", None)
         app2 = SessionApp.__new__(SessionApp)
         app2._launch_target = None
 
@@ -141,7 +159,11 @@ class TestMain:
             main()
             mock_sp.assert_called_once_with("worktree", "proj", Path("/tmp/test"))
             mock_launch.assert_called_once_with(
-                "proj", Path("/tmp/test"), None, system_prompt="test"
+                "proj",
+                Path("/tmp/test"),
+                None,
+                system_prompt="test",
+                resume_session_id=None,
             )
 
     def test_no_launch_when_target_not_set(self) -> None:
@@ -159,7 +181,13 @@ class TestMain:
 
     def test_launches_with_tmux_name(self) -> None:
         app1 = SessionApp.__new__(SessionApp)
-        app1._launch_target = ("proj", Path("/tmp/repo"), "proj/direct-1", "direct")
+        app1._launch_target = (
+            "proj",
+            Path("/tmp/repo"),
+            "proj/direct-1",
+            "direct",
+            None,
+        )
         app2 = SessionApp.__new__(SessionApp)
         app2._launch_target = None
 
@@ -174,7 +202,11 @@ class TestMain:
         ):
             main()
             mock_launch.assert_called_once_with(
-                "proj", Path("/tmp/repo"), "proj/direct-1", system_prompt="test"
+                "proj",
+                Path("/tmp/repo"),
+                "proj/direct-1",
+                system_prompt="test",
+                resume_session_id=None,
             )
 
 
@@ -203,34 +235,6 @@ class TestBuildSystemPrompt:
         assert "direct" in prompt
         assert "myproj" in prompt
         assert "not an isolated worktree" in prompt
-
-
-class TestSessionTerminalTitle:
-    def test_worktree_session_shows_relative_path(self) -> None:
-        title = _session_terminal_title(
-            "my-proj", None, Path("/tmp/20260309-fix-tests"), "worktree"
-        )
-        assert "my-proj/20260309-fix-tests" in title
-        assert "\U0001f9d9\U0001f3fd\u200d\u2642\ufe0f" in title
-        assert "+" not in title
-
-    def test_direct_session_shows_project_and_branch(self) -> None:
-        with patch("fujimoto.cli.get_current_branch", return_value="feat/cool"):
-            title = _session_terminal_title(
-                "my-proj", "my-proj/direct-1", Path("/tmp/repo"), "direct"
-            )
-        assert "my-proj" in title
-        assert "+ feat/cool" in title
-        # Should not contain the full path
-        assert "/tmp/repo" not in title
-
-    def test_direct_session_git_error(self) -> None:
-        with patch("fujimoto.cli.get_current_branch", side_effect=GitError("fail")):
-            title = _session_terminal_title(
-                "my-proj", "my-proj/direct-1", Path("/tmp/repo"), "direct"
-            )
-        assert "my-proj" in title
-        assert "+" not in title
 
 
 # -- TUI tests --
@@ -1340,6 +1344,7 @@ class TestSessionAppTmuxInstall:
             patch("fujimoto.cli.is_tmux_installed", side_effect=fake_is_installed),
             patch("fujimoto.cli.install_tmux") as mock_install,
             patch("fujimoto.cli.get_project_name", return_value="proj"),
+            patch("fujimoto.cli.get_repo_root", return_value=Path("/fake/repo")),
             patch("fujimoto.cli.get_current_branch", return_value="main"),
             patch("fujimoto.cli.get_default_branch", return_value="main"),
             patch("fujimoto.cli.list_project_sessions", return_value=[]),
@@ -1347,6 +1352,7 @@ class TestSessionAppTmuxInstall:
                 "fujimoto.cli.get_project_worktrees_dir",
                 return_value=Path("/nonexistent"),
             ),
+            patch("fujimoto.cli.get_sessions_for_path", return_value=[]),
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -1669,3 +1675,381 @@ class TestSessionAppEscapeFromNested:
                 await pilot.press("escape")
                 await pilot.pause()
                 assert len(app.query("#home-list")) > 0
+
+
+def _make_claude_session(
+    session_id: str = "abc12345-def6-7890",
+    state: SessionState = SessionState.WAITING_FOR_USER,
+    cwd: Path = Path("/fake/repo"),
+    git_branch: str | None = "main",
+    last_activity: datetime | None = None,
+) -> ClaudeSession:
+    return ClaudeSession(
+        jsonl_path=Path(f"/fake/.claude/projects/test/{session_id}.jsonl"),
+        session_id=session_id,
+        state=state,
+        last_entry_type=EntryType.ASSISTANT,
+        stop_reason=StopReason.END_TURN,
+        cwd=cwd,
+        git_branch=git_branch,
+        last_activity=last_activity or datetime.now(tz=timezone.utc),
+    )
+
+
+class TestClaudeStateLabel:
+    def test_waiting_for_user(self) -> None:
+        label = _claude_state_label(SessionState.WAITING_FOR_USER)
+        assert "\u23f3" in label
+        assert "awaiting input" in label
+
+    def test_processing(self) -> None:
+        label = _claude_state_label(SessionState.PROCESSING)
+        assert "\u2699" in label
+        assert "working" in label
+
+    def test_unknown(self) -> None:
+        assert _claude_state_label(SessionState.UNKNOWN) == ""
+
+
+class TestRelativeTime:
+    def test_just_now(self) -> None:
+        now = datetime.now(tz=timezone.utc)
+        assert _relative_time(now) == "just now"
+
+    def test_minutes_ago(self) -> None:
+        from datetime import timedelta
+
+        dt = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+        assert _relative_time(dt) == "5m ago"
+
+    def test_hours_ago(self) -> None:
+        from datetime import timedelta
+
+        dt = datetime.now(tz=timezone.utc) - timedelta(hours=3)
+        assert _relative_time(dt) == "3h ago"
+
+    def test_days_ago(self) -> None:
+        from datetime import timedelta
+
+        dt = datetime.now(tz=timezone.utc) - timedelta(days=7)
+        assert _relative_time(dt) == "7d ago"
+
+    def test_months_ago(self) -> None:
+        from datetime import timedelta
+
+        dt = datetime.now(tz=timezone.utc) - timedelta(days=60)
+        assert _relative_time(dt) == "2mo ago"
+
+
+class TestGetClaudeSessions:
+    def test_returns_empty_when_no_sessions(self) -> None:
+        with patch("fujimoto.cli.get_sessions_for_path", return_value=[]):
+            path_to_latest, root_sessions = _get_claude_sessions(Path("/fake/repo"), [])
+        assert path_to_latest == {}
+        assert root_sessions == []
+
+    def test_returns_root_sessions(self) -> None:
+        cs = _make_claude_session()
+        with patch("fujimoto.cli.get_sessions_for_path", return_value=[cs]):
+            path_to_latest, root_sessions = _get_claude_sessions(Path("/fake/repo"), [])
+        assert str(Path("/fake/repo")) in path_to_latest
+        assert root_sessions == [cs]
+
+    def test_returns_worktree_sessions(self) -> None:
+        wt_path = Path("/fake/worktrees/wt1")
+        cs = _make_claude_session(cwd=wt_path)
+
+        def fake_sessions(path: Path) -> list[ClaudeSession]:
+            if path == wt_path:
+                return [cs]
+            return []
+
+        with patch("fujimoto.cli.get_sessions_for_path", side_effect=fake_sessions):
+            path_to_latest, root_sessions = _get_claude_sessions(
+                Path("/fake/repo"), [wt_path]
+            )
+        assert str(wt_path) in path_to_latest
+        assert root_sessions == []
+
+    def test_none_project_root(self) -> None:
+        with patch("fujimoto.cli.get_sessions_for_path", return_value=[]):
+            path_to_latest, root_sessions = _get_claude_sessions(None, [])
+        assert path_to_latest == {}
+        assert root_sessions == []
+
+
+class TestClaudeSessionsOnHome:
+    @pytest.mark.asyncio
+    async def test_active_session_shows_claude_state(self, tmp_path: Path) -> None:
+        cs = _make_claude_session(state=SessionState.WAITING_FOR_USER)
+
+        with _patch_git_info(
+            sessions=["test-proj/direct-1"],
+            claude_sessions_fn=lambda _path: [cs],
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                session = app._session_map["ds-test-proj--direct-1"]
+                assert session.claude_state == SessionState.WAITING_FOR_USER
+                assert session.claude_session_id == cs.session_id
+
+    @pytest.mark.asyncio
+    async def test_inactive_worktree_shows_claude_state(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-fix"
+        cs = _make_claude_session(
+            state=SessionState.PROCESSING,
+            cwd=wt,
+        )
+
+        def fake_sessions(path: Path) -> list[ClaudeSession]:
+            # Match on dir name since _patch_git_info creates a temp copy
+            if path.name == "20260309-fix":
+                return [cs]
+            return []
+
+        with _patch_git_info(
+            worktrees=[wt],
+            claude_sessions_fn=fake_sessions,
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                session = app._session_map["wt-20260309-fix"]
+                assert session.claude_state == SessionState.PROCESSING
+
+    @pytest.mark.asyncio
+    async def test_previous_claude_sessions_shown(self) -> None:
+        cs1 = _make_claude_session(session_id="session-1111-aaaa")
+        cs2 = _make_claude_session(session_id="session-2222-bbbb")
+
+        with _patch_git_info(
+            claude_sessions_fn=lambda _path: [cs1, cs2],
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                assert "cs-session-" in str(list(app._session_map.keys()))
+                # Both sessions should be in the map (no active tmux to claim them)
+                claude_sessions = [
+                    s for s in app._session_map.values() if s.session_type == "claude"
+                ]
+                assert len(claude_sessions) == 2
+
+    @pytest.mark.asyncio
+    async def test_claimed_session_not_in_previous(self) -> None:
+        """The latest Claude session for an active direct tmux session is claimed."""
+        cs1 = _make_claude_session(session_id="session-1111-aaaa")
+        cs2 = _make_claude_session(session_id="session-2222-bbbb")
+
+        with _patch_git_info(
+            sessions=["test-proj/direct-1"],
+            claude_sessions_fn=lambda _path: [cs1, cs2],
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                # cs1 is the latest and should be claimed by the active session
+                direct = app._session_map["ds-test-proj--direct-1"]
+                assert direct.claude_session_id == cs1.session_id
+                # Only cs2 should appear as a previous Claude session
+                claude_sessions = [
+                    s for s in app._session_map.values() if s.session_type == "claude"
+                ]
+                assert len(claude_sessions) == 1
+                assert claude_sessions[0].claude_session_id == cs2.session_id
+
+    @pytest.mark.asyncio
+    async def test_previous_sessions_limited_to_five(self) -> None:
+        sessions = [
+            _make_claude_session(session_id=f"sess-{i:04d}-aaaa") for i in range(10)
+        ]
+        with _patch_git_info(
+            claude_sessions_fn=lambda _path: sessions,
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                claude_sessions = [
+                    s for s in app._session_map.values() if s.session_type == "claude"
+                ]
+                assert len(claude_sessions) == 5
+
+
+class TestClaudeSessionActions:
+    @pytest.mark.asyncio
+    async def test_resume_action_shown_for_claude_session(self) -> None:
+        cs = _make_claude_session()
+        with _patch_git_info(
+            claude_sessions_fn=lambda _path: [cs],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                # Navigate to the claude session item
+                home_list = app.query_one("#home-list", ListView)
+                # Find the claude session item index
+                for i, child in enumerate(home_list.children):
+                    if child.id and child.id.startswith("cs-"):
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # Should show session actions with Resume
+                assert len(app.query("#sa-resume")) > 0
+                # Should NOT show Rename
+                assert len(app.query("#sa-rename")) == 0
+
+    @pytest.mark.asyncio
+    async def test_resume_sets_launch_target(self) -> None:
+        cs = _make_claude_session()
+        with (
+            _patch_git_info(
+                claude_sessions_fn=lambda _path: [cs],
+            ),
+            patch(
+                "fujimoto.cli.get_next_direct_session_name",
+                return_value="test-proj/direct-1",
+            ),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, child in enumerate(home_list.children):
+                    if child.id and child.id.startswith("cs-"):
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # Select Resume
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+                assert app._launch_target[4] == cs.session_id
+                assert app._launch_target[2] == "test-proj/direct-1"
+
+
+class TestPolling:
+    @pytest.mark.asyncio
+    async def test_poll_timer_starts_on_home(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test():
+                assert app._poll_timer is not None
+
+    @pytest.mark.asyncio
+    async def test_poll_timer_stops_on_navigate_away(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                assert app._poll_timer is not None
+                # Navigate to create form
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._poll_timer is None
+
+    @pytest.mark.asyncio
+    async def test_poll_updates_label_on_state_change(self) -> None:
+        cs = _make_claude_session(state=SessionState.PROCESSING)
+        call_count = 0
+
+        def counting_sessions(path: Path) -> list[ClaudeSession]:
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 1:
+                return [cs]
+            return [_make_claude_session(state=SessionState.WAITING_FOR_USER)]
+
+        with _patch_git_info(
+            sessions=["test-proj/direct-1"],
+            claude_sessions_fn=counting_sessions,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                session = app._session_map["ds-test-proj--direct-1"]
+                assert session.claude_state == SessionState.PROCESSING
+                # Trigger a poll — should update label in-place
+                await app._poll_session_states()
+                await pilot.pause()
+                session = app._session_map["ds-test-proj--direct-1"]
+                assert session.claude_state == SessionState.WAITING_FOR_USER
+                # Home list should still exist (no rebuild)
+                assert len(app.query("#home-list")) > 0
+
+    @pytest.mark.asyncio
+    async def test_poll_no_update_when_unchanged(self) -> None:
+        cs = _make_claude_session(state=SessionState.WAITING_FOR_USER)
+        with _patch_git_info(
+            sessions=["test-proj/direct-1"],
+            claude_sessions_fn=lambda _path: [cs],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                home_list.index = 1
+                await app._poll_session_states()
+                await pilot.pause()
+                # Index preserved — no rebuild
+                home_list = app.query_one("#home-list", ListView)
+                assert home_list.index == 1
+
+    @pytest.mark.asyncio
+    async def test_poll_preserves_selection(self) -> None:
+        call_count = 0
+
+        def changing_sessions(path: Path) -> list[ClaudeSession]:
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 1:
+                return [_make_claude_session(state=SessionState.PROCESSING)]
+            return [_make_claude_session(state=SessionState.WAITING_FOR_USER)]
+
+        with _patch_git_info(
+            sessions=["test-proj/direct-1"],
+            claude_sessions_fn=changing_sessions,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                home_list.index = 1
+                await app._poll_session_states()
+                await pilot.pause()
+                # In-place update should not change selection
+                home_list = app.query_one("#home-list", ListView)
+                assert home_list.index == 1
+
+    @pytest.mark.asyncio
+    async def test_poll_skipped_when_not_on_home(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                # Navigate away from home
+                await pilot.press("enter")
+                await pilot.pause()
+                # Poll should be a no-op (no #home-list)
+                await app._poll_session_states()
+                # Should not crash
+
+
+class TestMainResume:
+    def test_resume_skips_system_prompt(self) -> None:
+        app1 = SessionApp.__new__(SessionApp)
+        app1._launch_target = (
+            "proj",
+            Path("/tmp/repo"),
+            "proj/direct-1",
+            "direct",
+            "resume-session-id",
+        )
+        app2 = SessionApp.__new__(SessionApp)
+        app2._launch_target = None
+
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]),
+            patch.object(app1, "run"),
+            patch.object(app2, "run"),
+            patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+        ):
+            main()
+            mock_launch.assert_called_once_with(
+                "proj",
+                Path("/tmp/repo"),
+                "proj/direct-1",
+                system_prompt=None,
+                resume_session_id="resume-session-id",
+            )
