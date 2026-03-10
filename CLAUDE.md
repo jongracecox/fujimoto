@@ -101,8 +101,8 @@ src/fujimoto/
 - `launch_claude_in_tmux(project, path, tmux_name, system_prompt, resume_session_id)` — orchestrates create-or-attach, supports resuming previous Claude sessions
 
 **`claude/log_parser.py`** — Parse Claude Code's JSONL session logs:
-- `ClaudeLogError` — raised on empty/unreadable logs or unknown enum values
-- `EntryType` / `StopReason` / `SessionState` — StrEnums with strict `from_raw()` parsing
+- `ClaudeLogError` — raised on empty/unreadable logs
+- `EntryType` / `StopReason` / `SessionState` — StrEnums with lenient `from_raw()` parsing (returns `None` for unrecognized values)
 - `ClaudeSession` — frozen dataclass: session_id, state, cwd, git_branch, last_activity, etc.
 - `encode_project_path(path)` — `str(path).replace("/", "-")` (matches Claude's directory encoding)
 - `get_claude_projects_dir()` — `~/.claude/projects`
@@ -148,7 +148,7 @@ Three custom exception types, all caught in `main()`:
 - **Global install via `uv tool`**: Requires `--force --reinstall` to rebuild the wheel from source. Plain `--force` reuses cached builds.
 - **Session metadata**: `.fujimoto-meta.json` stored in worktree directory records the base branch for cherry-pick targeting.
 - **Background PR creation**: Uses `claude -p --allowedTools "Bash(git:*) Bash(gh:*)"` in a tmux session for unattended PR creation.
-- **Claude session integration**: The home screen fetches Claude session state from `~/.claude/projects/` JSONL logs via the log parser. Active/inactive sessions show state indicators (⏳ awaiting input / ⚙ working). Previous Claude sessions (from the project root, capped at 5) appear as resumable items. Resuming launches `claude --resume SESSION_ID` in a new tmux session. The latest Claude session per path is "claimed" by the corresponding tmux/worktree item to avoid duplication.
+- **Claude session integration**: The home screen fetches Claude session state from `~/.claude/projects/` JSONL logs via the log parser. Session states: 👀 awaiting input (`WAITING_FOR_USER`), 🛡️ approve tool (`WAITING_FOR_TOOL_APPROVAL`), ⚙ working (`WORKING`), 💤 idle (`IDLE`), no indicator (`UNKNOWN`). State logic: `last-prompt` marker → `IDLE` (session ended). For assistant entries: `stop_reason=tool_use` without a following `tool_result` → `WAITING_FOR_TOOL_APPROVAL` (pending user approval), `stop_reason=tool_use` with `tool_result` → `WORKING`, any other stop reason or no stop reason → `WAITING_FOR_USER`. Last entry is user → `WORKING`. Previous Claude sessions (from the project root, capped at 5) appear as resumable items. Resuming launches `claude --resume SESSION_ID` in a new tmux session. The latest Claude session per path is "claimed" by the corresponding tmux/worktree item to avoid duplication.
 - **Live polling**: The home screen uses `set_interval(3s)` to poll Claude JSONL logs for state changes. When a session's state changes, labels are updated in-place via `label.update()` — the screen is never cleared or rebuilt, which avoids blank-screen flicker. A snapshot dict (`path → (session_id, state)`) is compared each tick to detect changes efficiently. The timer is stopped when navigating away (`_clear_main` cancels it) and restarted by `_show_home`.
 
 ## Testing
@@ -189,7 +189,7 @@ Things discovered during development that are easy to forget:
 - **`git reflog` records branch creation origin** (`branch: Created from main`) — useful for recovering the base branch if `.fujimoto-meta.json` is missing.
 - **`claude -p` (print mode)** runs non-interactively. For background tasks, pair with `--allowedTools` to scope permissions rather than `--dangerously-skip-permissions`.
 - **Global find-replace for renames** works well but always verify test patch target strings — they are plain strings not checked by the import system. Run the full test suite after any rename.
-- **Claude log entry types evolve** — real logs contain `progress` entries alongside `assistant`, `user`, `system`, and `file-history-snapshot`. Always smoke-test the log parser against real `~/.claude/projects/` data after changes to `EntryType`.
+- **Claude log entry types evolve** — real logs contain `last-prompt`, `queue-operation`, `progress` and other types beyond `assistant`/`user`/`system`/`file-history-snapshot`. The parser skips unrecognized types gracefully. `last-prompt` signals session end → `IDLE` state. `stop_reason=None` on assistant entries means interrupted/canceled (Esc) → `WAITING_FOR_USER`. Always smoke-test against real `~/.claude/projects/` data after changes.
 
 ## Git Commits and PRs
 
