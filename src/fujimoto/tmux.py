@@ -2,11 +2,24 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
 class TmuxError(Exception):
     pass
+
+
+def set_terminal_title(title: str) -> None:
+    """Set the terminal window/tab title via OSC escape sequence.
+
+    Works in iTerm2 and most modern terminals. Silently ignored otherwise.
+    """
+    try:
+        sys.stdout.write(f"\033]0;{title}\007")
+        sys.stdout.flush()
+    except OSError:
+        pass
 
 
 def is_tmux_installed() -> bool:
@@ -76,7 +89,7 @@ def kill_session(name: str) -> None:
 
 def _configure_session(name: str) -> None:
     """Apply standard tmux configuration to a session."""
-    options = {
+    options: dict[str, str] = {
         "prefix": "C-a",
         "status-right": '"Detach: ^A D | Scroll: ^A [ | Kill: ^A X"',
         "status-style": "bg=colour235,fg=colour248",
@@ -98,7 +111,9 @@ def _configure_session(name: str) -> None:
 
 
 def create_session(
-    name: str, working_dir: Path, system_prompt: str | None = None
+    name: str,
+    working_dir: Path,
+    system_prompt: str | None = None,
 ) -> None:
     claude_cmd = "claude"
     if system_prompt:

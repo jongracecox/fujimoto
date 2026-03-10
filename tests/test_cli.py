@@ -7,7 +7,7 @@ import pytest
 
 from textual.widgets import Input, ListView
 
-from fujimoto.cli import SessionApp, main
+from fujimoto.cli import SessionApp, _session_terminal_title, main
 from fujimoto.config import ConfigError
 from fujimoto.git import GitError
 from fujimoto.tmux import TmuxError
@@ -136,6 +136,7 @@ class TestMain:
             patch.object(app2, "run"),
             patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
             patch("fujimoto.cli._build_system_prompt", return_value="test") as mock_sp,
+            patch("fujimoto.cli._session_terminal_title", return_value="test-title"),
         ):
             main()
             mock_sp.assert_called_once_with("worktree", "proj", Path("/tmp/test"))
@@ -169,6 +170,7 @@ class TestMain:
             patch.object(app2, "run"),
             patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
             patch("fujimoto.cli._build_system_prompt", return_value="test"),
+            patch("fujimoto.cli._session_terminal_title", return_value="test-title"),
         ):
             main()
             mock_launch.assert_called_once_with(
@@ -201,6 +203,34 @@ class TestBuildSystemPrompt:
         assert "direct" in prompt
         assert "myproj" in prompt
         assert "not an isolated worktree" in prompt
+
+
+class TestSessionTerminalTitle:
+    def test_worktree_session_shows_relative_path(self) -> None:
+        title = _session_terminal_title(
+            "my-proj", None, Path("/tmp/20260309-fix-tests"), "worktree"
+        )
+        assert "my-proj/20260309-fix-tests" in title
+        assert "\U0001f9d9\U0001f3fd\u200d\u2642\ufe0f" in title
+        assert "+" not in title
+
+    def test_direct_session_shows_project_and_branch(self) -> None:
+        with patch("fujimoto.cli.get_current_branch", return_value="feat/cool"):
+            title = _session_terminal_title(
+                "my-proj", "my-proj/direct-1", Path("/tmp/repo"), "direct"
+            )
+        assert "my-proj" in title
+        assert "+ feat/cool" in title
+        # Should not contain the full path
+        assert "/tmp/repo" not in title
+
+    def test_direct_session_git_error(self) -> None:
+        with patch("fujimoto.cli.get_current_branch", side_effect=GitError("fail")):
+            title = _session_terminal_title(
+                "my-proj", "my-proj/direct-1", Path("/tmp/repo"), "direct"
+            )
+        assert "my-proj" in title
+        assert "+" not in title
 
 
 # -- TUI tests --

@@ -54,6 +54,7 @@ from fujimoto.tmux import (
     list_project_sessions,
     rename_session,
     session_name,
+    set_terminal_title,
 )
 
 BRANCH_ICON = "\ue0a0"
@@ -1207,7 +1208,6 @@ def _check_prerequisites() -> list[str]:
     return issues
 
 
-
 def _build_system_prompt(session_type: str, project: str, working_dir: Path) -> str:
     if session_type == "worktree":
         meta = read_session_meta(working_dir)
@@ -1226,6 +1226,26 @@ def _build_system_prompt(session_type: str, project: str, working_dir: Path) -> 
     )
 
 
+def _session_terminal_title(
+    project: str, tmux_name: str | None, working_dir: Path, session_type: str
+) -> str:
+    """Build a terminal title string for a session."""
+    wizard = "\U0001f9d9\U0001f3fd\u200d\u2642\ufe0f"
+    if session_type == "worktree":
+        # e.g. fujimoto/20260309-fix-tests
+        relative = f"{project}/{working_dir.name}"
+        return f"{wizard} fujimoto — {relative}"
+    else:
+        try:
+            branch = get_current_branch(working_dir)
+        except GitError:
+            branch = ""
+        title = f"{wizard} fujimoto — {project}"
+        if branch:
+            title += f" + {branch}"
+        return title
+
+
 def main() -> None:
     try:
         issues = _check_prerequisites()
@@ -1236,11 +1256,17 @@ def main() -> None:
             sys.exit(1)
 
         while True:
+            set_terminal_title("\U0001f9d9\U0001f3fd\u200d\u2642\ufe0f fujimoto")
             app = SessionApp()
             app.run()
 
             if app._launch_target:
                 project_name, working_dir, tmux_name, session_type = app._launch_target
+                set_terminal_title(
+                    _session_terminal_title(
+                        project_name, tmux_name, working_dir, session_type
+                    )
+                )
                 system_prompt = _build_system_prompt(
                     session_type, project_name, working_dir
                 )
@@ -1252,12 +1278,16 @@ def main() -> None:
                 )
             else:
                 break
+        set_terminal_title("")
     except (ConfigError, GitError) as e:
+        set_terminal_title("")
         print(f"\nfujimoto: {e}", file=sys.stderr)
         sys.exit(1)
     except TmuxError as e:
+        set_terminal_title("")
         print(f"\nfujimoto: {e}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
+        set_terminal_title("")
         print("\nAborted.")
         sys.exit(130)
