@@ -23,6 +23,7 @@ from fujimoto.config import (
     build_worktree_path,
     get_next_direct_session_name,
     get_project_worktrees_dir,
+    get_worktree_root,
     list_projects,
     read_session_meta,
     store_session_meta,
@@ -35,6 +36,7 @@ from fujimoto.git import (
     get_current_branch,
     get_default_branch,
     get_project_name,
+    get_repo_root,
     get_unpushed_commits,
     has_remote_branch,
     is_branch_merged,
@@ -686,7 +688,13 @@ class SessionApp(App):
         self.query_one("#branch-list").focus()
 
     async def _finalize_create(self) -> None:
-        self._worktree_path = build_worktree_path(self._project_name, self._title_value)
+        try:
+            self._worktree_path = build_worktree_path(
+                self._project_name, self._title_value
+            )
+        except ConfigError as e:
+            await self._show_error(str(e))
+            return
 
         if self._worktree_path.exists():
             await self._show_conflict()
@@ -1079,8 +1087,35 @@ class SessionApp(App):
                 self.exit()
 
 
+def _check_prerequisites() -> list[str]:
+    """Validate environment before launching the TUI. Returns a list of issues."""
+    issues: list[str] = []
+
+    try:
+        get_worktree_root()
+    except ConfigError as e:
+        issues.append(str(e))
+
+    try:
+        get_repo_root()
+    except GitError:
+        issues.append(
+            "Not inside a git repository.\n"
+            "Run fujimoto from within a git project directory."
+        )
+
+    return issues
+
+
 def main() -> None:
     try:
+        issues = _check_prerequisites()
+        if issues:
+            print("fujimoto: configuration error\n", file=sys.stderr)
+            for issue in issues:
+                print(f"  {issue}\n", file=sys.stderr)
+            sys.exit(1)
+
         while True:
             app = SessionApp()
             app.run()
@@ -1091,10 +1126,10 @@ def main() -> None:
             else:
                 break
     except (ConfigError, GitError) as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(f"\nfujimoto: {e}", file=sys.stderr)
         sys.exit(1)
     except TmuxError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(f"\nfujimoto: {e}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
         print("\nAborted.")

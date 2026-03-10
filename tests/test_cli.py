@@ -70,6 +70,7 @@ def _patch_git_info(
 class TestMain:
     def test_exits_on_config_error(self) -> None:
         with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
             patch("fujimoto.cli.SessionApp") as mock_app_cls,
             pytest.raises(SystemExit) as exc_info,
         ):
@@ -79,6 +80,7 @@ class TestMain:
 
     def test_exits_on_git_error(self) -> None:
         with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
             patch("fujimoto.cli.SessionApp") as mock_app_cls,
             pytest.raises(SystemExit) as exc_info,
         ):
@@ -88,6 +90,7 @@ class TestMain:
 
     def test_exits_on_tmux_error(self) -> None:
         with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
             patch("fujimoto.cli.SessionApp") as mock_app_cls,
             pytest.raises(SystemExit) as exc_info,
         ):
@@ -95,8 +98,22 @@ class TestMain:
             main()
         assert exc_info.value.code == 1
 
+    def test_exits_early_on_prerequisite_failure(self) -> None:
+        with (
+            patch(
+                "fujimoto.cli._check_prerequisites",
+                return_value=["FUJIMOTO_WORKTREE_ROOT is not set."],
+            ),
+            patch("fujimoto.cli.SessionApp") as mock_app_cls,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        assert exc_info.value.code == 1
+        mock_app_cls.assert_not_called()
+
     def test_exits_on_keyboard_interrupt(self) -> None:
         with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
             patch("fujimoto.cli.SessionApp") as mock_app_cls,
             pytest.raises(SystemExit) as exc_info,
         ):
@@ -113,6 +130,7 @@ class TestMain:
         app2._launch_target = None
 
         with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
             patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]),
             patch.object(app1, "run"),
             patch.object(app2, "run"),
@@ -126,6 +144,7 @@ class TestMain:
         mock_app._launch_target = None
 
         with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
             patch("fujimoto.cli.SessionApp", return_value=mock_app),
             patch.object(mock_app, "run"),
             patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
@@ -140,6 +159,7 @@ class TestMain:
         app2._launch_target = None
 
         with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
             patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]),
             patch.object(app1, "run"),
             patch.object(app2, "run"),
@@ -891,6 +911,28 @@ class TestSessionAppErrors:
             app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.pause()
+
+    @pytest.mark.asyncio
+    async def test_create_worktree_config_error(self) -> None:
+        with (
+            _patch_git_info(current="main", default="main"),
+            patch(
+                "fujimoto.cli.build_worktree_path",
+                side_effect=ConfigError("FUJIMOTO_WORKTREE_ROOT is not set."),
+            ),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press(*"title")
+                await pilot.press("enter")
+                await pilot.pause()
+                # Should show error in TUI, not crash
+                assert app._launch_target is None
+                main = app.query_one("#main")
+                text = main.query("Static")[0].render().plain
+                assert "FUJIMOTO_WORKTREE_ROOT" in text
 
     @pytest.mark.asyncio
     async def test_create_worktree_git_error(self, tmp_path: Path) -> None:
