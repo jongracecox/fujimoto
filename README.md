@@ -50,6 +50,7 @@ fujimoto
 ```
 + New worktree session
 + New session in <project>
++ Ad hoc session
 ───── active sessions ─────
 🟢 20260309-cleanup-ui          (worktree)
 🟢 direct-1                     (direct @ main)
@@ -59,11 +60,13 @@ fujimoto
   Switch project
 ```
 
-### Two Session Types
+### Three Session Types
 
 **Worktree sessions** create an isolated git worktree with its own branch. Useful for standalone tasks that become PRs, or investigations where you want to fork off and explore.
 
 **Direct sessions** launch Claude in an existing repo directory on its current branch. Quick and lightweight — no worktree overhead.
+
+**Ad hoc sessions** launch Claude in a temporary directory outside any git project. For quick questions, investigations, and one-off tasks that don't need a repository.
 
 ### Session Actions
 

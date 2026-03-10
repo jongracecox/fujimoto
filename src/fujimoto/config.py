@@ -109,3 +109,11 @@ def get_next_direct_session_name(project_name: str, active_sessions: set[str]) -
     while f"{prefix}{n}" in active_sessions:
         n += 1
     return f"{prefix}{n}"
+
+
+def get_next_adhoc_session_name(active_sessions: set[str]) -> str:
+    """Compute the next adhoc-N tmux session name."""
+    n = 1
+    while f"adhoc-{n}" in active_sessions:
+        n += 1
+    return f"adhoc-{n}"

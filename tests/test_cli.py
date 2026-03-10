@@ -239,6 +239,14 @@ class TestBuildSystemPrompt:
         assert "myproj" in prompt
         assert "not an isolated worktree" in prompt
 
+    def test_adhoc_prompt(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _build_system_prompt
+
+        prompt = _build_system_prompt("adhoc", "adhoc", tmp_path)
+        assert "ad hoc" in prompt
+        assert "not in a git project" in prompt
+        assert "temporary directory" in prompt
+
 
 # -- TUI tests --
 
@@ -369,6 +377,51 @@ class TestSessionAppDirectSession:
                 await pilot.pause()
                 assert app._launch_target is not None
                 assert app._launch_target[2] == "test-proj/my-task"
+
+
+class TestSessionAppAdhocSession:
+    @pytest.mark.asyncio
+    async def test_launch_adhoc_session(self) -> None:
+        with (
+            _patch_git_info(),
+            patch("fujimoto.cli.list_all_sessions", return_value=[]),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                # Navigate to "Ad hoc session" (3rd item, index 2)
+                await pilot.press("down", "down")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+                project, working_dir, tmux_name, session_type, resume_id = (
+                    app._launch_target
+                )
+                assert project == "adhoc"
+                assert session_type == "adhoc"
+                assert tmux_name == "adhoc-1"
+                assert resume_id is None
+                assert working_dir.exists()
+
+    @pytest.mark.asyncio
+    async def test_launch_adhoc_increments_name(self) -> None:
+        with (
+            _patch_git_info(),
+            patch("fujimoto.cli.list_all_sessions", return_value=["adhoc-1"]),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("down", "down")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+                assert app._launch_target[2] == "adhoc-2"
+
+    @pytest.mark.asyncio
+    async def test_home_shows_adhoc_option(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test():
+                assert app.query_one("#action-adhoc")
 
 
 class TestSessionAppSessionActions:

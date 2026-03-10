@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,7 @@ from fujimoto.claude import ClaudeSession, SessionState, get_sessions_for_path
 from fujimoto.config import (
     ConfigError,
     build_worktree_path,
+    get_next_adhoc_session_name,
     get_next_direct_session_name,
     get_project_worktrees_dir,
     get_worktree_root,
@@ -55,6 +57,7 @@ from fujimoto.tmux import (
     is_tmux_installed,
     kill_session,
     launch_claude_in_tmux,
+    list_all_sessions,
     list_project_sessions,
     rename_session,
     session_name,
@@ -331,7 +334,7 @@ Screen {
 @dataclass
 class SessionInfo:
     name: str
-    session_type: str  # "worktree", "direct", or "claude"
+    session_type: str  # "worktree", "direct", "adhoc", or "claude"
     project: str
     path: Path
     tmux_session: str
@@ -470,6 +473,10 @@ class SessionApp(App):
                     markup=True,
                 ),
                 id="action-direct",
+            ),
+            ListItem(
+                Label("[bold]+ Ad hoc session[/]", markup=True),
+                id="action-adhoc",
             ),
         ]
 
@@ -1200,10 +1207,25 @@ class SessionApp(App):
             await self._show_create_form()
         elif item_id == "action-direct":
             await self._launch_direct_session()
+        elif item_id == "action-adhoc":
+            self._launch_adhoc_session()
         elif item_id == "action-switch-project":
             await self._show_project_select()
         elif item_id and item_id in self._session_map:
             await self._show_session_actions(self._session_map[item_id])
+
+    def _launch_adhoc_session(self) -> None:
+        all_sessions = set(list_all_sessions())
+        tmux_name = get_next_adhoc_session_name(all_sessions)
+        adhoc_dir = Path(tempfile.mkdtemp(prefix="fujimoto-adhoc-"))
+        self._launch_target = (
+            "adhoc",
+            adhoc_dir,
+            tmux_name,
+            "adhoc",
+            None,
+        )
+        self.exit()
 
     async def _launch_direct_session(self) -> None:
         await self._show_direct_title_form()
@@ -1557,6 +1579,12 @@ def _check_prerequisites() -> list[str]:
 
 
 def _build_system_prompt(session_type: str, project: str, working_dir: Path) -> str:
+    if session_type == "adhoc":
+        return (
+            "This is an ad hoc Claude session that is not in a git project. "
+            "It is running in a temporary directory for quick questions, "
+            "investigations, and one-off tasks. There is no git repository here."
+        )
     if session_type == "worktree":
         meta = read_session_meta(working_dir)
         base_branch = meta.get("base_branch", "unknown") if meta else "unknown"
@@ -1579,6 +1607,9 @@ def _session_terminal_title(
 ) -> str:
     """Build a terminal title string for a session."""
     wizard = ICON_WIZARD
+    if session_type == "adhoc":
+        name = tmux_name or "adhoc"
+        return f"{wizard} fujimoto — {name}"
     if session_type == "worktree":
         # e.g. fujimoto/20260309-fix-tests
         relative = f"{project}/{working_dir.name}"
