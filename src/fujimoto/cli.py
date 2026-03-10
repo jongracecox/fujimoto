@@ -62,13 +62,25 @@ from fujimoto.tmux import (
 )
 
 BRANCH_ICON = "\ue0a0"
+ICON_EYES = "\U0001f440"
+ICON_SHIELD = "\U0001f6e1\ufe0f"
+ICON_GEAR = "\u2699"
+ICON_ZZZ = "\U0001f4a4"
+ICON_GREEN_CIRCLE = "\U0001f7e2"
+ICON_BLACK_CIRCLE = "\u26ab"
+ICON_HLINE = "\u2500"
+ICON_WIZARD = "\U0001f9d9\U0001f3fd\u200d\u2642\ufe0f"
 
 
 def _claude_state_label(state: SessionState) -> str:
     if state == SessionState.WAITING_FOR_USER:
-        return " [dim]\u23f3 awaiting input[/]"
-    if state == SessionState.PROCESSING:
-        return " [dim]\u2699 working[/]"
+        return f" [dim]{ICON_EYES} awaiting input[/]"
+    if state == SessionState.WAITING_FOR_TOOL_APPROVAL:
+        return f" [dim]{ICON_SHIELD} approve tool[/]"
+    if state == SessionState.WORKING:
+        return f" [dim]{ICON_GEAR} working[/]"
+    if state == SessionState.IDLE:
+        return f" [dim]{ICON_ZZZ} idle[/]"
     return ""
 
 
@@ -516,7 +528,7 @@ class SessionApp(App):
                     claude_state=cs_state,
                 )
                 label_text = (
-                    f"\U0001f7e2 {display_name}"
+                    f"{ICON_GREEN_CIRCLE} {display_name}"
                     f"  [dim]({self._project_name} {BRANCH_ICON}"
                     f" {self._current_branch})[/]{state_suffix}"
                 )
@@ -544,7 +556,7 @@ class SessionApp(App):
                     claude_state=cs_state,
                 )
                 label_text = (
-                    f"\U0001f7e2 {wt.name}"
+                    f"{ICON_GREEN_CIRCLE} {wt.name}"
                     f"  [dim]({BRANCH_ICON} {branch})[/]{state_suffix}"
                 )
                 items.append(ListItem(Label(label_text, markup=True), id=item_id))
@@ -575,7 +587,6 @@ class SessionApp(App):
                 cs_state = cs.state if cs else None
                 if cs_id:
                     claimed_claude_ids.add(cs_id)
-                state_suffix = _claude_state_label(cs_state) if cs_state else ""
                 self._session_map[item_id] = SessionInfo(
                     name=wt.name,
                     session_type="worktree",
@@ -588,7 +599,7 @@ class SessionApp(App):
                     claude_state=cs_state,
                 )
                 label_text = (
-                    f"\u26ab {wt.name}  [dim]({BRANCH_ICON} {branch})[/]{state_suffix}"
+                    f"{ICON_BLACK_CIRCLE} {wt.name}  [dim]({BRANCH_ICON} {branch})[/]"
                 )
                 items.append(ListItem(Label(label_text, markup=True), id=item_id))
 
@@ -612,10 +623,7 @@ class SessionApp(App):
                 item_id = f"cs-{cs.session_id}"
                 time_label = _relative_time(cs.last_activity)
                 branch_label = f"{BRANCH_ICON} {cs.git_branch}" if cs.git_branch else ""
-                state_suffix = _claude_state_label(cs.state)
-                label_text = (
-                    f"  {short_id}  [dim]{branch_label}  {time_label}[/]{state_suffix}"
-                )
+                label_text = f"  {short_id}  [dim]{branch_label}  {time_label}[/]"
                 self._session_map[item_id] = SessionInfo(
                     name=short_id,
                     session_type="claude",
@@ -633,12 +641,7 @@ class SessionApp(App):
             items.append(
                 ListItem(
                     Static(
-                        "\u2500\u2500\u2500\u2500\u2500"
-                        "\u2500\u2500\u2500\u2500\u2500"
-                        "\u2500\u2500\u2500\u2500\u2500"
-                        "\u2500\u2500\u2500\u2500\u2500"
-                        "\u2500\u2500\u2500\u2500\u2500"
-                        "\u2500\u2500\u2500\u2500",
+                        ICON_HLINE * 29,
                         classes="separator-item",
                     ),
                     disabled=True,
@@ -694,7 +697,11 @@ class SessionApp(App):
             # State changed — update the session and its label
             session.claude_state = new_state
             session.claude_session_id = new_cs.session_id if new_cs else None
-            state_suffix = _claude_state_label(new_state) if new_state else ""
+            state_suffix = (
+                _claude_state_label(new_state)
+                if new_state and session.is_active
+                else ""
+            )
             label_text = self._build_session_label(session, state_suffix)
             try:
                 item = self.query_one(f"#{item_id}")
@@ -708,18 +715,15 @@ class SessionApp(App):
         if session.is_active:
             if session.session_type == "direct":
                 return (
-                    f"\U0001f7e2 {session.name}"
+                    f"{ICON_GREEN_CIRCLE} {session.name}"
                     f"  [dim]({session.project} {BRANCH_ICON}"
                     f" {session.branch})[/]{state_suffix}"
                 )
             return (
-                f"\U0001f7e2 {session.name}"
+                f"{ICON_GREEN_CIRCLE} {session.name}"
                 f"  [dim]({BRANCH_ICON} {session.branch})[/]{state_suffix}"
             )
-        return (
-            f"\u26ab {session.name}"
-            f"  [dim]({BRANCH_ICON} {session.branch})[/]{state_suffix}"
-        )
+        return f"{ICON_BLACK_CIRCLE} {session.name}  [dim]({BRANCH_ICON} {session.branch})[/]"
 
     # -- Session actions submenu --
 
@@ -1057,7 +1061,7 @@ class SessionApp(App):
             item_id = f"proj-{proj.name}"
             self._project_dir_paths[item_id] = proj
             if proj.name == self._project_name:
-                label_text = f"\U0001f7e2 {proj.name}"
+                label_text = f"{ICON_GREEN_CIRCLE} {proj.name}"
             else:
                 label_text = f"   {proj.name}"
             items.append(ListItem(Label(label_text), id=item_id))
@@ -1574,7 +1578,7 @@ def _session_terminal_title(
     project: str, tmux_name: str | None, working_dir: Path, session_type: str
 ) -> str:
     """Build a terminal title string for a session."""
-    wizard = "\U0001f9d9\U0001f3fd\u200d\u2642\ufe0f"
+    wizard = ICON_WIZARD
     if session_type == "worktree":
         # e.g. fujimoto/20260309-fix-tests
         relative = f"{project}/{working_dir.name}"
@@ -1600,7 +1604,7 @@ def main() -> None:
             sys.exit(1)
 
         while True:
-            set_terminal_title("\U0001f9d9\U0001f3fd\u200d\u2642\ufe0f fujimoto")
+            set_terminal_title(f"{ICON_WIZARD} fujimoto")
             app = SessionApp()
             app.run()
 

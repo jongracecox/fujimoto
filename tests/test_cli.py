@@ -11,6 +11,9 @@ from textual.widgets import Input, ListView
 from fujimoto.claude import ClaudeSession, SessionState
 from fujimoto.claude.log_parser import EntryType, StopReason
 from fujimoto.cli import (
+    ICON_EYES,
+    ICON_GEAR,
+    ICON_SHIELD,
     SessionApp,
     _claude_state_label,
     _get_claude_sessions,
@@ -1679,7 +1682,7 @@ class TestSessionAppEscapeFromNested:
 
 def _make_claude_session(
     session_id: str = "abc12345-def6-7890",
-    state: SessionState = SessionState.WAITING_FOR_USER,
+    state: SessionState = SessionState.IDLE,
     cwd: Path = Path("/fake/repo"),
     git_branch: str | None = "main",
     last_activity: datetime | None = None,
@@ -1699,12 +1702,17 @@ def _make_claude_session(
 class TestClaudeStateLabel:
     def test_waiting_for_user(self) -> None:
         label = _claude_state_label(SessionState.WAITING_FOR_USER)
-        assert "\u23f3" in label
+        assert ICON_EYES in label
         assert "awaiting input" in label
 
+    def test_waiting_for_tool_approval(self) -> None:
+        label = _claude_state_label(SessionState.WAITING_FOR_TOOL_APPROVAL)
+        assert ICON_SHIELD in label
+        assert "approve tool" in label
+
     def test_processing(self) -> None:
-        label = _claude_state_label(SessionState.PROCESSING)
-        assert "\u2699" in label
+        label = _claude_state_label(SessionState.WORKING)
+        assert ICON_GEAR in label
         assert "working" in label
 
     def test_unknown(self) -> None:
@@ -1797,7 +1805,7 @@ class TestClaudeSessionsOnHome:
     async def test_inactive_worktree_shows_claude_state(self, tmp_path: Path) -> None:
         wt = tmp_path / "20260309-fix"
         cs = _make_claude_session(
-            state=SessionState.PROCESSING,
+            state=SessionState.WORKING,
             cwd=wt,
         )
 
@@ -1814,7 +1822,7 @@ class TestClaudeSessionsOnHome:
             app = SessionApp()
             async with app.run_test():
                 session = app._session_map["wt-20260309-fix"]
-                assert session.claude_state == SessionState.PROCESSING
+                assert session.claude_state == SessionState.WORKING
 
     @pytest.mark.asyncio
     async def test_previous_claude_sessions_shown(self) -> None:
@@ -1944,7 +1952,7 @@ class TestPolling:
 
     @pytest.mark.asyncio
     async def test_poll_updates_label_on_state_change(self) -> None:
-        cs = _make_claude_session(state=SessionState.PROCESSING)
+        cs = _make_claude_session(state=SessionState.WORKING)
         call_count = 0
 
         def counting_sessions(path: Path) -> list[ClaudeSession]:
@@ -1961,7 +1969,7 @@ class TestPolling:
             app = SessionApp()
             async with app.run_test() as pilot:
                 session = app._session_map["ds-test-proj--direct-1"]
-                assert session.claude_state == SessionState.PROCESSING
+                assert session.claude_state == SessionState.WORKING
                 # Trigger a poll — should update label in-place
                 await app._poll_session_states()
                 await pilot.pause()
@@ -1995,7 +2003,7 @@ class TestPolling:
             nonlocal call_count
             call_count += 1
             if call_count <= 1:
-                return [_make_claude_session(state=SessionState.PROCESSING)]
+                return [_make_claude_session(state=SessionState.WORKING)]
             return [_make_claude_session(state=SessionState.WAITING_FOR_USER)]
 
         with _patch_git_info(
