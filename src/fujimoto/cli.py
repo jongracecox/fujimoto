@@ -34,6 +34,7 @@ from fujimoto.git import (
     cherry_pick_branch,
     create_worktree,
     delete_branch,
+    fetch_and_rebase_branch,
     get_current_branch,
     get_default_branch,
     get_project_name,
@@ -41,6 +42,7 @@ from fujimoto.git import (
     get_unpushed_commits,
     has_remote_branch,
     is_branch_merged,
+    list_branches,
     push_branch,
     remove_worktree,
 )
@@ -119,6 +121,16 @@ Screen {
 }
 
 #branch-list:focus > ListItem.--highlight {
+    background: $accent;
+}
+
+#branch-picker-list {
+    height: auto;
+    max-height: 16;
+    margin-bottom: 1;
+}
+
+#branch-picker-list:focus > ListItem.--highlight {
     background: $accent;
 }
 
@@ -289,6 +301,7 @@ class SessionApp(App):
         self._project_dir_paths: dict[str, Path] = {}
         self._selected_session: SessionInfo | None = None
         self._finish_action: str = ""
+        self._branch_picker_names: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -697,29 +710,63 @@ class SessionApp(App):
         await self._clear_main()
         main = self.query_one("#main")
 
-        if self._current_branch == self._default_branch:
-            self._base_branch = self._default_branch
-            await self._finalize_create()
-            return
+        items: list[ListItem] = [
+            ListItem(
+                Label(f"Default branch ({self._default_branch}) — fetch & rebase"),
+                id="branch-default",
+            ),
+            ListItem(
+                Label(f"Current branch ({self._current_branch})"),
+                id="branch-current",
+            ),
+        ]
+
+        items.append(
+            ListItem(
+                Label("Another branch…"),
+                id="branch-other",
+            ),
+        )
 
         await main.mount(
             Container(
                 Label("Select Base Branch", classes="form-label"),
-                ListView(
-                    ListItem(
-                        Label(f"Current branch ({self._current_branch})"),
-                        id="branch-current",
-                    ),
-                    ListItem(
-                        Label(f"Default branch ({self._default_branch})"),
-                        id="branch-default",
-                    ),
-                    id="branch-list",
-                ),
+                ListView(*items, id="branch-list"),
                 id="create-panel",
             )
         )
         self.query_one("#branch-list").focus()
+
+    async def _show_branch_picker(self) -> None:
+        """Show a filterable list of all local branches."""
+        await self._clear_main()
+        main = self.query_one("#main")
+
+        try:
+            branches = [
+                b
+                for b in list_branches(cwd=self._project_cwd)
+                if not b.startswith("worktree/")
+            ]
+        except GitError:
+            branches = []
+
+        self._branch_picker_names: dict[str, str] = {}
+        items: list[ListItem] = []
+        for i, branch in enumerate(branches):
+            item_id = f"bp-{i}"
+            self._branch_picker_names[item_id] = branch
+            items.append(ListItem(Label(branch), id=item_id))
+
+        await main.mount(
+            Container(
+                Label("Select Branch", classes="form-label"),
+                Input(placeholder="Type to filter...", id="branch-filter"),
+                ListView(*items, id="branch-picker-list"),
+                id="create-panel",
+            )
+        )
+        self.query_one("#branch-filter").focus()
 
     async def _finalize_create(self) -> None:
         try:
@@ -874,8 +921,30 @@ class SessionApp(App):
                 await self._show_error(str(e))
 
     async def _on_key(self, event: events.Key) -> None:
-        """Handle arrow keys and tab for project filter autocomplete."""
-        if not (self.focused and self.focused.id == "project-filter"):
+        """Handle arrow keys and tab for filter autocomplete."""
+        if not self.focused:
+            return
+
+        if self.focused.id == "branch-filter":
+            branch_list_nodes = self.query("#branch-picker-list")
+            if not branch_list_nodes:
+                return
+            branch_list = self.query_one("#branch-picker-list", ListView)
+
+            if event.key in ("down", "up"):
+                event.prevent_default()
+                event.stop()
+                if len(branch_list) == 0:
+                    return
+                idx = branch_list.index or 0
+                if event.key == "down":
+                    idx = min(idx + 1, len(branch_list) - 1)
+                else:
+                    idx = max(idx - 1, 0)
+                branch_list.index = idx
+            return
+
+        if self.focused.id != "project-filter":
             return
 
         project_list_nodes = self.query("#project-list")
@@ -1152,9 +1221,48 @@ class SessionApp(App):
     async def on_branch_selected(self, event: ListView.Selected) -> None:
         if event.item.id == "branch-current":
             self._base_branch = self._current_branch
-        else:
+            await self._finalize_create()
+        elif event.item.id == "branch-default":
             self._base_branch = self._default_branch
-        await self._finalize_create()
+            try:
+                fetch_and_rebase_branch(self._default_branch, cwd=self._project_cwd)
+            except GitError:
+                pass  # Offline or no remote — proceed with local state
+            await self._finalize_create()
+        elif event.item.id == "branch-other":
+            await self._show_branch_picker()
+
+    @on(Input.Changed, "#branch-filter")
+    async def on_branch_filter_changed(self, event: Input.Changed) -> None:
+        branch_list = self.query_one("#branch-picker-list", ListView)
+        await branch_list.clear()
+        query = event.value.lower()
+        for item_id, name in self._branch_picker_names.items():
+            if query and query not in name.lower():
+                continue
+            await branch_list.append(ListItem(Label(name), id=item_id))
+        if len(branch_list) > 0:
+            branch_list.index = 0
+
+    @on(Input.Submitted, "#branch-filter")
+    async def on_branch_filter_submitted(self, event: Input.Submitted) -> None:
+        await self._select_highlighted_branch()
+
+    async def _select_highlighted_branch(self) -> None:
+        branch_list = self.query_one("#branch-picker-list", ListView)
+        if len(branch_list) == 0 or branch_list.index is None:
+            return
+        item = branch_list.children[branch_list.index]
+        if item.id and item.id in self._branch_picker_names:
+            self._base_branch = self._branch_picker_names[item.id]
+            await self._finalize_create()
+
+    @on(ListView.Selected, "#branch-picker-list")
+    async def on_branch_picker_selected(self, event: ListView.Selected) -> None:
+        item_id = event.item.id
+        if item_id and item_id in self._branch_picker_names:
+            self._base_branch = self._branch_picker_names[item_id]
+            await self._finalize_create()
 
     @on(ListView.Selected, "#conflict-list")
     async def on_conflict_selected(self, event: ListView.Selected) -> None:

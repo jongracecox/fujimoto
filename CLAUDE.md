@@ -78,6 +78,8 @@ src/fujimoto/
 - `get_project_name()` — basename of repo root
 - `get_current_branch()` — `git branch --show-current`
 - `get_default_branch()` — tries `symbolic-ref`, falls back to checking main/master
+- `fetch_and_rebase_branch(branch)` — `git fetch origin` + `git rebase origin/{branch}`
+- `list_branches()` — sorted list of local branch names
 - `create_worktree(path, base_branch, new_branch)` — `git worktree add -b`
 - `remove_worktree(path)` — `git worktree remove --force`
 - `get_unpushed_commits(branch)` — commits not yet on remote
@@ -110,8 +112,9 @@ src/fujimoto/
 **`cli.py`** — Textual TUI with async view management:
 - `SessionInfo` — dataclass for session state (type, project, path, tmux name, active status)
 - `SessionApp` — main app class with CSS styling
-- Views: home (sessions list), session actions submenu, finish flow, confirm dialog, create form, branch select, conflict resolution, project switcher (with autocomplete filter), tmux install, error
+- Views: home (sessions list), session actions submenu, finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), conflict resolution, project switcher (with autocomplete filter), tmux install, error
 - Home screen sections: actions ("New worktree session", "New session in X"), active sessions, inactive worktrees, switch project
+- Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
 - Session actions submenu: Connect/Launch, Terminate, Finish (worktree only)
 - Finish flow: Push & Create PR (background Claude), Cherry-pick to base, Discard & Delete
 - All view transitions are `async` — `await _clear_main()` then `await mount()`

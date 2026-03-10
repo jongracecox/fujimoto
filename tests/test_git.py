@@ -12,6 +12,7 @@ from fujimoto.git import (
     cherry_pick_branch,
     create_worktree,
     delete_branch,
+    fetch_and_rebase_branch,
     get_current_branch,
     get_default_branch,
     get_merge_base,
@@ -20,6 +21,7 @@ from fujimoto.git import (
     get_unpushed_commits,
     has_remote_branch,
     is_branch_merged,
+    list_branches,
     push_branch,
     remove_worktree,
 )
@@ -259,6 +261,57 @@ class TestDeleteBranch:
 
         with patch("fujimoto.git._run", side_effect=mock_run):
             delete_branch("my-branch", remote=True)  # Should not raise
+
+
+class TestFetchAndRebaseBranch:
+    def test_calls_fetch_then_rebase(self) -> None:
+        calls: list[list[str]] = []
+
+        def mock_run(args: list[str], **kwargs) -> str:  # type: ignore[no-untyped-def]
+            calls.append(args)
+            return ""
+
+        with patch("fujimoto.git._run", side_effect=mock_run):
+            fetch_and_rebase_branch("main")
+            assert calls[0] == ["fetch", "origin", "main"]
+            assert calls[1] == ["rebase", "origin/main", "main"]
+
+    def test_passes_cwd(self) -> None:
+        calls: list[tuple[list[str], Path]] = []
+
+        def mock_run(args: list[str], cwd: Path | None = None) -> str:
+            calls.append((args, cwd))
+            return ""
+
+        with patch("fujimoto.git._run", side_effect=mock_run):
+            fetch_and_rebase_branch("main", cwd=Path("/repo"))
+            assert calls[0] == (["fetch", "origin", "main"], Path("/repo"))
+            assert calls[1] == (["rebase", "origin/main", "main"], Path("/repo"))
+
+    def test_raises_on_fetch_failure(self) -> None:
+        with patch("fujimoto.git._run", side_effect=GitError("no remote")):
+            with pytest.raises(GitError):
+                fetch_and_rebase_branch("main")
+
+
+class TestListBranches:
+    def test_returns_sorted_branches(self) -> None:
+        with patch(
+            "fujimoto.git._run", return_value="main\nfeature/b\nfeature/a\ndevelop"
+        ):
+            result = list_branches()
+            assert result == ["develop", "feature/a", "feature/b", "main"]
+
+    def test_returns_empty_list_when_no_output(self) -> None:
+        with patch("fujimoto.git._run", return_value=""):
+            assert list_branches() == []
+
+    def test_passes_cwd(self) -> None:
+        with patch("fujimoto.git._run", return_value="main") as mock_run:
+            list_branches(cwd=Path("/repo"))
+            mock_run.assert_called_once_with(
+                ["branch", "--format=%(refname:short)"], cwd=Path("/repo")
+            )
 
 
 class TestCherryPickBranch:

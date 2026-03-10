@@ -899,36 +899,97 @@ class TestSessionAppCreateFlow:
                 assert len(app.query("#home-list")) > 0
 
     @pytest.mark.asyncio
-    async def test_create_shows_branch_select_when_different(self) -> None:
-        with _patch_git_info(current="feat/test", default="main"):
+    async def test_create_always_shows_branch_select(self) -> None:
+        with _patch_git_info(current="main", default="main"):
             app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.press("enter")  # Select "Create new"
                 await pilot.pause()
-                # Type a title
                 await pilot.press(*"test-title")
                 await pilot.press("enter")
                 await pilot.pause()
                 assert len(app.query("#branch-list")) > 0
 
     @pytest.mark.asyncio
-    async def test_create_skips_branch_when_on_default(self, tmp_path: Path) -> None:
+    async def test_branch_select_always_shows_three_options(self) -> None:
+        with _patch_git_info(current="feat/test", default="main"):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("enter")  # Select "Create new"
+                await pilot.pause()
+                await pilot.press(*"test-title")
+                await pilot.press("enter")
+                await pilot.pause()
+                branch_list = app.query_one("#branch-list", ListView)
+                # Default, current, another = 3 items
+                assert len(branch_list) == 3
+
+    @pytest.mark.asyncio
+    async def test_branch_select_shows_current_even_when_on_default(self) -> None:
+        with _patch_git_info(current="main", default="main"):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press(*"test-title")
+                await pilot.press("enter")
+                await pilot.pause()
+                branch_list = app.query_one("#branch-list", ListView)
+                # Default, current, another = always 3 items
+                assert len(branch_list) == 3
+
+    @pytest.mark.asyncio
+    async def test_branch_select_default_with_fetch(self, tmp_path: Path) -> None:
         with (
-            _patch_git_info(current="main", default="main"),
+            _patch_git_info(current="feat/test", default="main"),
             patch(
                 "fujimoto.cli.build_worktree_path",
                 return_value=tmp_path / "new-wt",
             ),
             patch("fujimoto.cli.create_worktree") as mock_create,
             patch("fujimoto.cli.store_session_meta"),
+            patch("fujimoto.cli.fetch_and_rebase_branch") as mock_fetch,
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
-                await pilot.press("enter")  # Select "Create new"
+                await pilot.press("enter")  # Create new
                 await pilot.pause()
-                await pilot.press(*"my-title")
+                await pilot.press(*"title")
+                await pilot.press("enter")  # Submit title
+                await pilot.pause()
+                await pilot.press("enter")  # Select default branch (first option)
+                await pilot.pause()
+                mock_fetch.assert_called_once_with("main", cwd=None)
+                mock_create.assert_called_once()
+                assert app._base_branch == "main"
+
+    @pytest.mark.asyncio
+    async def test_branch_select_default_fetch_failure_continues(
+        self, tmp_path: Path
+    ) -> None:
+        with (
+            _patch_git_info(current="feat/test", default="main"),
+            patch(
+                "fujimoto.cli.build_worktree_path",
+                return_value=tmp_path / "new-wt",
+            ),
+            patch("fujimoto.cli.create_worktree") as mock_create,
+            patch("fujimoto.cli.store_session_meta"),
+            patch(
+                "fujimoto.cli.fetch_and_rebase_branch",
+                side_effect=GitError("no remote"),
+            ),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
                 await pilot.press("enter")
                 await pilot.pause()
+                await pilot.press(*"title")
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("enter")  # Select default branch
+                await pilot.pause()
+                # Should still create despite fetch failure
                 mock_create.assert_called_once()
 
     @pytest.mark.asyncio
@@ -949,20 +1010,55 @@ class TestSessionAppCreateFlow:
                 await pilot.press(*"title")
                 await pilot.press("enter")  # Submit title
                 await pilot.pause()
-                await pilot.press("enter")  # Select current branch (first option)
+                await pilot.press("down")  # Move to current branch (second option)
+                await pilot.press("enter")
                 await pilot.pause()
                 mock_create.assert_called_once()
                 assert app._base_branch == "feat/test"
 
     @pytest.mark.asyncio
-    async def test_branch_select_default(self, tmp_path: Path) -> None:
+    async def test_branch_select_other_shows_picker(self) -> None:
         with (
             _patch_git_info(current="feat/test", default="main"),
+            patch(
+                "fujimoto.cli.list_branches",
+                return_value=[
+                    "develop",
+                    "feat/test",
+                    "main",
+                    "worktree/20260309-old",
+                ],
+            ),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("enter")  # Create new
+                await pilot.pause()
+                await pilot.press(*"title")
+                await pilot.press("enter")  # Submit title
+                await pilot.pause()
+                # Move to "Another branch…" (3rd option)
+                await pilot.press("down", "down")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#branch-picker-list")) > 0
+                # worktree/ branches should be excluded
+                branch_list = app.query_one("#branch-picker-list", ListView)
+                assert len(branch_list) == 3
+
+    @pytest.mark.asyncio
+    async def test_branch_picker_select(self, tmp_path: Path) -> None:
+        with (
+            _patch_git_info(current="feat/test", default="main"),
+            patch(
+                "fujimoto.cli.list_branches",
+                return_value=["develop", "feat/test", "main"],
+            ),
             patch(
                 "fujimoto.cli.build_worktree_path",
                 return_value=tmp_path / "new-wt",
             ),
-            patch("fujimoto.cli.create_worktree"),
+            patch("fujimoto.cli.create_worktree") as mock_create,
             patch("fujimoto.cli.store_session_meta"),
         ):
             app = SessionApp()
@@ -972,10 +1068,72 @@ class TestSessionAppCreateFlow:
                 await pilot.press(*"title")
                 await pilot.press("enter")  # Submit title
                 await pilot.pause()
-                await pilot.press("down")  # Move to default branch
-                await pilot.press("enter")  # Select default branch
+                await pilot.press("down", "down")  # Another branch
+                await pilot.press("enter")
                 await pilot.pause()
-                assert app._base_branch == "main"
+                # Select "develop" (first in list)
+                branch_list = app.query_one("#branch-picker-list", ListView)
+                branch_list.index = 0
+                await pilot.press("enter")
+                await pilot.pause()
+                mock_create.assert_called_once()
+                assert app._base_branch == "develop"
+
+    @pytest.mark.asyncio
+    async def test_branch_picker_filter(self) -> None:
+        with (
+            _patch_git_info(current="feat/test", default="main"),
+            patch(
+                "fujimoto.cli.list_branches",
+                return_value=["develop", "feat/test", "main", "release/1.0"],
+            ),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("enter")  # Create new
+                await pilot.pause()
+                await pilot.press(*"title")
+                await pilot.press("enter")  # Submit title
+                await pilot.pause()
+                await pilot.press("down", "down")  # Another branch
+                await pilot.press("enter")
+                await pilot.pause()
+                # Type filter
+                await pilot.press(*"dev")
+                await pilot.pause()
+                branch_list = app.query_one("#branch-picker-list", ListView)
+                assert len(branch_list) == 1
+
+    @pytest.mark.asyncio
+    async def test_branch_picker_submit_filter(self, tmp_path: Path) -> None:
+        with (
+            _patch_git_info(current="feat/test", default="main"),
+            patch(
+                "fujimoto.cli.list_branches",
+                return_value=["develop", "feat/test", "main"],
+            ),
+            patch(
+                "fujimoto.cli.build_worktree_path",
+                return_value=tmp_path / "new-wt",
+            ),
+            patch("fujimoto.cli.create_worktree") as mock_create,
+            patch("fujimoto.cli.store_session_meta"),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press(*"title")
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("down", "down")  # Another branch
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press(*"dev")
+                await pilot.press("enter")  # Submit filter selects highlighted
+                await pilot.pause()
+                mock_create.assert_called_once()
+                assert app._base_branch == "develop"
 
     @pytest.mark.asyncio
     async def test_create_stores_session_meta(self, tmp_path: Path) -> None:
@@ -987,6 +1145,7 @@ class TestSessionAppCreateFlow:
             ),
             patch("fujimoto.cli.create_worktree"),
             patch("fujimoto.cli.store_session_meta") as mock_meta,
+            patch("fujimoto.cli.fetch_and_rebase_branch"),
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -994,6 +1153,8 @@ class TestSessionAppCreateFlow:
                 await pilot.pause()
                 await pilot.press(*"title")
                 await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("enter")  # Select default branch
                 await pilot.pause()
                 mock_meta.assert_called_once_with(tmp_path / "new-wt", "main")
 
@@ -1006,6 +1167,7 @@ class TestSessionAppConflict:
         with (
             _patch_git_info(current="main", default="main"),
             patch("fujimoto.cli.build_worktree_path", return_value=existing),
+            patch("fujimoto.cli.fetch_and_rebase_branch"),
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -1013,6 +1175,8 @@ class TestSessionAppConflict:
                 await pilot.pause()
                 await pilot.press(*"title")
                 await pilot.press("enter")  # Submit title
+                await pilot.pause()
+                await pilot.press("enter")  # Select default branch
                 await pilot.pause()
                 assert len(app.query("#conflict-list")) > 0
 
@@ -1023,6 +1187,7 @@ class TestSessionAppConflict:
         with (
             _patch_git_info(current="main", default="main"),
             patch("fujimoto.cli.build_worktree_path", return_value=existing),
+            patch("fujimoto.cli.fetch_and_rebase_branch"),
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -1030,6 +1195,8 @@ class TestSessionAppConflict:
                 await pilot.pause()
                 await pilot.press(*"title")
                 await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("enter")  # Select default branch
                 await pilot.pause()
                 await pilot.press("enter")  # Connect to existing
                 await pilot.pause()
@@ -1045,6 +1212,7 @@ class TestSessionAppConflict:
             patch("fujimoto.cli.build_worktree_path", return_value=existing),
             patch("fujimoto.cli.create_worktree") as mock_create,
             patch("fujimoto.cli.store_session_meta"),
+            patch("fujimoto.cli.fetch_and_rebase_branch"),
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -1052,6 +1220,8 @@ class TestSessionAppConflict:
                 await pilot.pause()
                 await pilot.press(*"title")
                 await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("enter")  # Select default branch
                 await pilot.pause()
                 await pilot.press("down")  # Move to "Create new with suffix"
                 await pilot.press("enter")
@@ -1097,6 +1267,7 @@ class TestSessionAppErrors:
                 "fujimoto.cli.build_worktree_path",
                 side_effect=ConfigError("FUJIMOTO_WORKTREE_ROOT is not set."),
             ),
+            patch("fujimoto.cli.fetch_and_rebase_branch"),
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -1104,6 +1275,8 @@ class TestSessionAppErrors:
                 await pilot.pause()
                 await pilot.press(*"title")
                 await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("enter")  # Select default branch
                 await pilot.pause()
                 # Should show error in TUI, not crash
                 assert app._launch_target is None
@@ -1123,6 +1296,7 @@ class TestSessionAppErrors:
                 "fujimoto.cli.create_worktree",
                 side_effect=GitError("branch already exists"),
             ),
+            patch("fujimoto.cli.fetch_and_rebase_branch"),
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -1130,6 +1304,8 @@ class TestSessionAppErrors:
                 await pilot.pause()
                 await pilot.press(*"title")
                 await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("enter")  # Select default branch
                 await pilot.pause()
                 # Should show error, not crash
                 assert app._launch_target is None
@@ -1454,6 +1630,7 @@ class TestSessionAppConflictSuffix:
             patch("fujimoto.cli.build_worktree_path", return_value=existing),
             patch("fujimoto.cli.create_worktree") as mock_create,
             patch("fujimoto.cli.store_session_meta"),
+            patch("fujimoto.cli.fetch_and_rebase_branch"),
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -1461,6 +1638,8 @@ class TestSessionAppConflictSuffix:
                 await pilot.pause()
                 await pilot.press(*"title")
                 await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("enter")  # Select default branch
                 await pilot.pause()
                 await pilot.press("down")  # Move to "Create new with suffix"
                 await pilot.press("enter")

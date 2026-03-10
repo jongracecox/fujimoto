@@ -121,6 +121,20 @@ def delete_branch(
             pass  # Remote branch may not exist
 
 
+def fetch_and_rebase_branch(branch: str, cwd: Path | str | None = None) -> None:
+    """Fetch from origin and rebase a local branch onto its remote counterpart."""
+    _run(["fetch", "origin", branch], cwd=cwd)
+    _run(["rebase", f"origin/{branch}", branch], cwd=cwd)
+
+
+def list_branches(cwd: Path | str | None = None) -> list[str]:
+    """Return sorted list of local branch names."""
+    output = _run(["branch", "--format=%(refname:short)"], cwd=cwd)
+    if not output:
+        return []
+    return sorted(output.splitlines())
+
+
 def cherry_pick_branch(branch: str, onto: str, cwd: Path | str | None = None) -> None:
     """Cherry-pick all commits from branch onto another branch.
 
