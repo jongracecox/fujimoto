@@ -1,0 +1,42 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run tests
+        run: uv run pytest --cov-report=json:coverage.json
+
+      - name: Generate coverage badge
+        if: github.ref == 'refs/heads/main'
+        run: |
+          COVERAGE=$(uv run python -c "import json; print(int(json.load(open('coverage.json'))['totals']['percent_covered_display']))")
+          uvx anybadge --value="$COVERAGE" --file=coverage.svg --label=coverage \
+            --overwrite 50=red 60=orange 70=yellow 80=green 90=brightgreen
+
+      - name: Publish badge
+        if: github.ref == 'refs/heads/main'
+        run: |
+          cp coverage.svg /tmp/coverage.svg
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin badges:badges 2>/dev/null && git checkout badges || { git checkout --orphan badges && git rm -rf . ; }
+          cp /tmp/coverage.svg coverage.svg
+          git add coverage.svg
+          git commit -m "Update coverage badge" || true
+          git push origin badges --force
