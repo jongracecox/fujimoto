@@ -703,6 +703,7 @@ class SessionApp(App):
         await self._do_create_and_launch()
 
     async def _show_conflict(self) -> None:
+        assert self._worktree_path is not None
         await self._clear_main()
         main = self.query_one("#main")
         await main.mount(
@@ -727,6 +728,7 @@ class SessionApp(App):
         self.query_one("#conflict-list").focus()
 
     async def _do_create_and_launch(self) -> None:
+        assert self._worktree_path is not None
         new_branch = f"worktree/{self._worktree_path.name}"
         try:
             create_worktree(
@@ -1063,6 +1065,7 @@ class SessionApp(App):
 
     @on(ListView.Selected, "#conflict-list")
     async def on_conflict_selected(self, event: ListView.Selected) -> None:
+        assert self._worktree_path is not None
         if event.item.id == "conflict-connect":
             self._launch_target = (self._project_name, self._worktree_path, None)
             self.exit()
