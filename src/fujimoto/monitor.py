@@ -6,6 +6,8 @@ transition to states that need user attention (e.g. tool approval).
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -16,15 +18,57 @@ from fujimoto.claude import (
     get_sessions_for_path,
 )
 
+ICON_WIZARD = "\U0001f9d9\U0001f3fd\u200d\u2642\ufe0f"
+
+
+class NotifierError(Exception):
+    pass
+
+
+def is_notifier_installed() -> bool:
+    """Check if terminal-notifier is on PATH."""
+    return shutil.which("terminal-notifier") is not None
+
+
+def notifications_skipped() -> bool:
+    """Check if notifications are disabled via environment variable."""
+    return os.environ.get("FUJIMOTO_SKIP_NOTIFICATIONS", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def install_notifier() -> None:
+    """Install terminal-notifier via brew. Raises NotifierError on failure."""
+    if not shutil.which("brew"):
+        raise NotifierError(
+            "brew is not installed. Install terminal-notifier manually."
+        )
+    result = subprocess.run(["brew", "install", "terminal-notifier"])
+    if result.returncode != 0:
+        raise NotifierError("Failed to install terminal-notifier via brew")
+    if not shutil.which("terminal-notifier"):
+        raise NotifierError("terminal-notifier was installed but not found on PATH")
+
 
 def _send_notification(title: str, message: str) -> None:
-    """Send a macOS notification via osascript."""
-    script = (
-        f'display notification "{message}" with title "{title}" sound name "default"'
-    )
-    subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True,
+    """Send a macOS notification via terminal-notifier.
+
+    Launched via ``Popen`` so it doesn't block the monitor thread.
+    """
+    subprocess.Popen(
+        [
+            "terminal-notifier",
+            "-title",
+            f"{ICON_WIZARD} {title}",
+            "-message",
+            message,
+            "-sound",
+            "default",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
 
@@ -73,9 +117,12 @@ def _poll_once(
         # State changed — check if it's interesting
         if latest.state in _NOTIFY_STATES:
             session_label = path.name
+            message = _state_display(latest.state)
+            if latest.pending_tool_summary:
+                message = f"{message}\n{latest.pending_tool_summary}"
             _send_notification(
                 f"fujimoto — {session_label}",
-                _state_display(latest.state),
+                message,
             )
 
     return new_snapshot

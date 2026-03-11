@@ -6,12 +6,18 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from fujimoto.claude import ClaudeSession, EntryType, SessionState, StopReason
 from fujimoto.monitor import (
+    NotifierError,
     SessionMonitor,
     _poll_once,
     _send_notification,
     _state_display,
+    install_notifier,
+    is_notifier_installed,
+    notifications_skipped,
 )
 
 
@@ -37,6 +43,77 @@ def _make_session(
     )
 
 
+class TestIsNotifierInstalled:
+    @patch(
+        "fujimoto.monitor.shutil.which", return_value="/usr/local/bin/terminal-notifier"
+    )
+    def test_installed(self, _mock: object) -> None:
+        assert is_notifier_installed() is True
+
+    @patch("fujimoto.monitor.shutil.which", return_value=None)
+    def test_not_installed(self, _mock: object) -> None:
+        assert is_notifier_installed() is False
+
+
+class TestInstallNotifier:
+    @patch(
+        "fujimoto.monitor.shutil.which",
+        side_effect=["/usr/local/bin/brew", "/usr/local/bin/terminal-notifier"],
+    )
+    @patch("fujimoto.monitor.subprocess.run")
+    def test_successful_install(self, mock_run: MagicMock, _which: object) -> None:
+        mock_run.return_value = MagicMock(returncode=0)
+        install_notifier()
+        mock_run.assert_called_once_with(["brew", "install", "terminal-notifier"])
+
+    @patch("fujimoto.monitor.shutil.which", return_value=None)
+    def test_raises_without_brew(self, _mock: object) -> None:
+        with pytest.raises(NotifierError, match="brew is not installed"):
+            install_notifier()
+
+    @patch("fujimoto.monitor.shutil.which", return_value="/usr/local/bin/brew")
+    @patch("fujimoto.monitor.subprocess.run")
+    def test_raises_on_brew_failure(self, mock_run: MagicMock, _which: object) -> None:
+        mock_run.return_value = MagicMock(returncode=1)
+        with pytest.raises(NotifierError, match="Failed to install"):
+            install_notifier()
+
+    @patch("fujimoto.monitor.shutil.which", side_effect=["/usr/local/bin/brew", None])
+    @patch("fujimoto.monitor.subprocess.run")
+    def test_raises_when_not_on_path_after_install(
+        self, mock_run: MagicMock, _which: object
+    ) -> None:
+        mock_run.return_value = MagicMock(returncode=0)
+        with pytest.raises(NotifierError, match="not found on PATH"):
+            install_notifier()
+
+
+class TestNotificationsSkipped:
+    @patch.dict("os.environ", {"FUJIMOTO_SKIP_NOTIFICATIONS": "1"})
+    def test_skipped_with_1(self) -> None:
+        assert notifications_skipped() is True
+
+    @patch.dict("os.environ", {"FUJIMOTO_SKIP_NOTIFICATIONS": "true"})
+    def test_skipped_with_true(self) -> None:
+        assert notifications_skipped() is True
+
+    @patch.dict("os.environ", {"FUJIMOTO_SKIP_NOTIFICATIONS": "yes"})
+    def test_skipped_with_yes(self) -> None:
+        assert notifications_skipped() is True
+
+    @patch.dict("os.environ", {"FUJIMOTO_SKIP_NOTIFICATIONS": "TRUE"})
+    def test_skipped_case_insensitive(self) -> None:
+        assert notifications_skipped() is True
+
+    @patch.dict("os.environ", {"FUJIMOTO_SKIP_NOTIFICATIONS": ""})
+    def test_not_skipped_with_empty(self) -> None:
+        assert notifications_skipped() is False
+
+    @patch.dict("os.environ", {}, clear=True)
+    def test_not_skipped_when_unset(self) -> None:
+        assert notifications_skipped() is False
+
+
 class TestStateDisplay:
     def test_tool_approval(self) -> None:
         assert (
@@ -52,17 +129,17 @@ class TestStateDisplay:
 
 
 class TestSendNotification:
-    @patch("fujimoto.monitor.subprocess.run")
-    def test_calls_osascript(self, mock_run: MagicMock) -> None:
+    @patch("fujimoto.monitor.subprocess.Popen")
+    def test_calls_terminal_notifier(self, mock_popen: MagicMock) -> None:
         _send_notification("Test Title", "Test message")
 
-        mock_run.assert_called_once()
-        args = mock_run.call_args[0][0]
-        assert args[0] == "osascript"
-        assert args[1] == "-e"
-        assert "Test Title" in args[2]
-        assert "Test message" in args[2]
-        assert 'sound name "default"' in args[2]
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert args[0] == "terminal-notifier"
+        assert "-title" in args
+        assert "Test Title" in args[args.index("-title") + 1]
+        assert "-message" in args
+        assert args[args.index("-message") + 1] == "Test message"
 
 
 class TestPollOnce:

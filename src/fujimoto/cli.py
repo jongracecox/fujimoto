@@ -50,7 +50,13 @@ from fujimoto.git import (
     push_branch,
     remove_worktree,
 )
-from fujimoto.monitor import SessionMonitor
+from fujimoto.monitor import (
+    NotifierError,
+    SessionMonitor,
+    install_notifier,
+    is_notifier_installed,
+    notifications_skipped,
+)
 from fujimoto.terminal import open_terminal
 from fujimoto.vscode import open_vscode
 from fujimoto.tmux import (
@@ -388,6 +394,9 @@ class SessionApp(App):
             if not is_tmux_installed():
                 await self._show_tmux_install()
                 return
+            if not notifications_skipped() and not is_notifier_installed():
+                await self._show_notifier_install()
+                return
             self._init_git_info()
             await self._show_home()
         except (ConfigError, GitError) as e:
@@ -449,6 +458,27 @@ class SessionApp(App):
             )
         )
         self.query_one("#tmux-install-list").focus()
+
+    async def _show_notifier_install(self) -> None:
+        await self._clear_main()
+        main = self.query_one("#main")
+        await main.mount(
+            Container(
+                Label("terminal-notifier is not installed", classes="form-label"),
+                Static(
+                    "terminal-notifier is required for background session notifications."
+                ),
+                Static(""),
+                ListView(
+                    ListItem(Label("Install with brew"), id="install-notifier"),
+                    ListItem(Label("Skip"), id="skip-notifier"),
+                    ListItem(Label("Quit"), id="quit-app"),
+                    id="notifier-install-list",
+                ),
+                id="conflict-panel",
+            )
+        )
+        self.query_one("#notifier-install-list").focus()
 
     # -- Home screen --
 
@@ -1448,6 +1478,24 @@ class SessionApp(App):
         else:
             self.exit()
 
+    @on(ListView.Selected, "#notifier-install-list")
+    async def on_notifier_install_selected(self, event: ListView.Selected) -> None:
+        if event.item.id == "install-notifier":
+            try:
+                install_notifier()
+                self._init_git_info()
+                await self._show_home()
+            except (NotifierError, ConfigError, GitError) as e:
+                await self._show_error(str(e))
+        elif event.item.id == "skip-notifier":
+            try:
+                self._init_git_info()
+                await self._show_home()
+            except (ConfigError, GitError) as e:
+                await self._show_error(str(e))
+        else:
+            self.exit()
+
     @on(Input.Submitted, "#direct-title-input")
     async def on_direct_title_submitted(self, event: Input.Submitted) -> None:
         value = event.value.strip()
@@ -1665,19 +1713,21 @@ def main() -> None:
                     else _build_system_prompt(session_type, project_name, working_dir)
                 )
 
-                # Collect all paths to monitor for background notifications
-                monitor_paths: list[Path] = []
-                if app._project_root:
-                    monitor_paths.append(app._project_root)
-                monitor_paths.extend(app._existing_worktrees)
-                if working_dir not in monitor_paths:
-                    monitor_paths.append(working_dir)
+                # Start background monitor if notifications are available
+                monitor: SessionMonitor | None = None
+                if is_notifier_installed():
+                    monitor_paths: list[Path] = []
+                    if app._project_root:
+                        monitor_paths.append(app._project_root)
+                    monitor_paths.extend(app._existing_worktrees)
+                    if working_dir not in monitor_paths:
+                        monitor_paths.append(working_dir)
+                    monitor = SessionMonitor(
+                        paths=monitor_paths,
+                        attached_path=working_dir,
+                    )
+                    monitor.start()
 
-                monitor = SessionMonitor(
-                    paths=monitor_paths,
-                    attached_path=working_dir,
-                )
-                monitor.start()
                 try:
                     launch_claude_in_tmux(
                         project_name,
@@ -1687,7 +1737,8 @@ def main() -> None:
                         resume_session_id=resume_id,
                     )
                 finally:
-                    monitor.stop()
+                    if monitor:
+                        monitor.stop()
             else:
                 break
         set_terminal_title("")
