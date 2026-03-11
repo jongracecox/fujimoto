@@ -32,6 +32,7 @@ src/fujimoto/
 ├── cli.py        # Textual TUI app, entry point (main()), all UI screens and event handlers
 ├── config.py     # Environment variable loading, path construction, session metadata
 ├── git.py        # Git subprocess wrappers (worktree lifecycle, branch operations)
+├── terminal.py   # Open native terminal windows (iTerm2 with Terminal.app fallback)
 ├── tmux.py       # tmux session lifecycle (create, attach, kill, list, install)
 └── claude/
     ├── __init__.py      # Re-exports public API
@@ -97,6 +98,12 @@ src/fujimoto/
 - `delete_branch(branch, remote)` — `git branch -D`, optionally remote
 - `cherry_pick_branch(branch, onto)` — cherry-picks commit range onto target
 
+**`terminal.py`** — Open native terminal windows in a session's directory:
+- `open_terminal(directory)` — opens iTerm2 if installed, otherwise Terminal.app. Raises `OSError` on non-macOS.
+- `_has_iterm()` — checks for `/Applications/iTerm.app`
+- `_open_iterm(directory)` — AppleScript to create new iTerm2 window
+- `_open_terminal_app(directory)` — `open -a Terminal` fallback
+
 **`tmux.py`** — tmux session management:
 - `is_tmux_installed()` / `install_tmux()` — detection and brew install
 - `list_all_sessions()` — lists all active tmux session names
@@ -125,7 +132,7 @@ src/fujimoto/
 - Views: home (sessions list), session actions submenu, finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), conflict resolution, project switcher (with autocomplete filter), tmux install, error
 - Home screen sections: actions ("New worktree session", "New session in X", "Ad hoc session"), active sessions (with Claude state indicators), inactive worktrees (with Claude state), previous Claude sessions (resumable, capped at 5), switch project
 - Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
-- Session actions submenu: Connect/Launch, Terminate, Resume (claude sessions), Rename, Finish (worktree only)
+- Session actions submenu: Connect/Launch, Terminate, Resume (claude sessions), Rename, Open terminal, Finish (worktree only)
 - Finish flow: Push & Create PR (background Claude), Cherry-pick to base, Discard & Delete
 - All view transitions are `async` — `await _clear_main()` then `await mount()`
 - Session data stored in `_session_map` dict keyed by ListItem ID
@@ -207,7 +214,9 @@ Do not mention Claude or AI when authoring git commits or pull requests. No co-a
 
 ## Linting and Type Checking
 
-Pre-commit hooks run automatically:
+Pre-commit hooks handle all linting and formatting automatically — do not run `ruff`, `ty`, or other linters manually. Let the hooks run at commit time and fix any issues they report. Any new linting or formatting tools should be added to `.pre-commit-config.yaml`, not run ad hoc.
+
+Current hooks:
 - **ruff** — linting and formatting
 - **ty** — type checking (strict: no `unresolved-attribute` allowed)
 

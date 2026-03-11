@@ -50,6 +50,7 @@ from fujimoto.git import (
     push_branch,
     remove_worktree,
 )
+from fujimoto.terminal import open_terminal
 from fujimoto.tmux import (
     TmuxError,
     create_session_with_command,
@@ -752,6 +753,8 @@ class SessionApp(App):
         if session.session_type != "claude":
             items.append(ListItem(Label("Rename"), id="sa-rename"))
 
+        items.append(ListItem(Label("Open terminal"), id="sa-terminal"))
+
         if session.session_type == "worktree":
             items.append(ListItem(Label("Finish (cleanup/merge)"), id="sa-finish"))
 
@@ -1297,6 +1300,16 @@ class SessionApp(App):
                 self._init_git_info()
                 await self._show_home()
             except (TmuxError, ConfigError, GitError) as e:
+                await self._show_error(str(e))
+        elif action == "sa-terminal":
+            try:
+                open_terminal(session.path)
+            except OSError as e:
+                await self._show_error(str(e))
+                return
+            try:
+                await self._show_home()
+            except (ConfigError, GitError) as e:  # pragma: no cover
                 await self._show_error(str(e))
         elif action == "sa-rename":
             await self._show_rename(session)
