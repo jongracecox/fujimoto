@@ -81,6 +81,7 @@ class ClaudeSession:
     cwd: Path
     git_branch: str | None
     last_activity: datetime
+    pending_tool_summary: str | None = None
 
     @property
     def is_active(self) -> bool:
@@ -89,6 +90,45 @@ class ClaudeSession:
             SessionState.WAITING_FOR_USER,
             SessionState.WAITING_FOR_TOOL_APPROVAL,
         )
+
+
+def _extract_tool_summary(
+    entry: dict,
+    preceding_text: str | None,
+) -> str | None:
+    """Extract a human-readable summary of the pending tool use from an assistant entry.
+
+    Uses the preceding assistant text (Claude's explanation) as the primary summary,
+    falling back to a tool name + detail description.
+    """
+    if preceding_text:
+        if len(preceding_text) > 120:
+            preceding_text = preceding_text[:117] + "..."
+        return preceding_text
+
+    # Fall back to tool name + detail if no preceding text
+    content = entry.get("message", {}).get("content", [])
+    if not isinstance(content, list):
+        return None
+
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        name = block.get("name", "Unknown")
+        inp = block.get("input", {})
+
+        if name == "Bash" and "command" in inp:
+            cmd = inp["command"]
+            if len(cmd) > 80:
+                cmd = cmd[:77] + "..."
+            return f"Bash: {cmd}"
+        if name in ("Edit", "Write") and "file_path" in inp:
+            return f"{name}: {Path(inp['file_path']).name}"
+        if name == "Read" and "file_path" in inp:
+            return f"Read: {Path(inp['file_path']).name}"
+        return name
+
+    return None
 
 
 def encode_project_path(path: Path) -> str:
@@ -135,6 +175,7 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
     last_any: dict | None = None
     session_ended = False
     tool_result_after_last_tool_use = False
+    last_assistant_text: str | None = None
 
     for line in text.splitlines():
         line = line.strip()
@@ -163,6 +204,16 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
 
         if entry_type in (EntryType.ASSISTANT, EntryType.USER):
             last_meaningful = entry
+
+        # Track assistant text for tool approval context
+        if entry_type == EntryType.ASSISTANT:
+            content = entry.get("message", {}).get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_val = block.get("text", "").strip()
+                        if text_val:
+                            last_assistant_text = text_val
 
         # Track whether a tool_result follows the most recent tool_use
         if entry_type == EntryType.ASSISTANT:
@@ -222,6 +273,12 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
         # Last meaningful entry is USER → working
         state = SessionState.WORKING
 
+    tool_summary = (
+        _extract_tool_summary(last_meaningful, last_assistant_text)
+        if state == SessionState.WAITING_FOR_TOOL_APPROVAL
+        else None
+    )
+
     return ClaudeSession(
         jsonl_path=jsonl_path,
         session_id=session_id,
@@ -231,6 +288,7 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
         cwd=Path(last_meaningful.get("cwd", "/")),
         git_branch=last_meaningful.get("gitBranch"),
         last_activity=_parse_timestamp(last_meaningful.get("timestamp", "")),
+        pending_tool_summary=tool_summary,
     )
 
 

@@ -22,6 +22,7 @@ from fujimoto.cli import (
 )
 from fujimoto.config import ConfigError
 from fujimoto.git import GitError
+from fujimoto.monitor import NotifierError
 from fujimoto.tmux import TmuxError
 
 
@@ -55,6 +56,7 @@ def _patch_git_info(
 
         with (
             patch("fujimoto.cli.is_tmux_installed", return_value=True),
+            patch("fujimoto.cli.is_notifier_installed", return_value=True),
             patch("fujimoto.cli.get_project_name", return_value=project),
             patch(
                 "fujimoto.cli.get_repo_root",
@@ -147,6 +149,8 @@ class TestMain:
         # Second iteration: no target -> exit loop
         app1 = SessionApp.__new__(SessionApp)
         app1._launch_target = ("proj", Path("/tmp/test"), None, "worktree", None)
+        app1._project_root = Path("/tmp/repo")
+        app1._existing_worktrees = []
         app2 = SessionApp.__new__(SessionApp)
         app2._launch_target = None
 
@@ -158,6 +162,7 @@ class TestMain:
             patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
             patch("fujimoto.cli._build_system_prompt", return_value="test") as mock_sp,
             patch("fujimoto.cli._session_terminal_title", return_value="test-title"),
+            patch("fujimoto.cli.is_notifier_installed", return_value=False),
         ):
             main()
             mock_sp.assert_called_once_with("worktree", "proj", Path("/tmp/test"))
@@ -191,6 +196,8 @@ class TestMain:
             "direct",
             None,
         )
+        app1._project_root = Path("/tmp/repo")
+        app1._existing_worktrees = []
         app2 = SessionApp.__new__(SessionApp)
         app2._launch_target = None
 
@@ -202,6 +209,7 @@ class TestMain:
             patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
             patch("fujimoto.cli._build_system_prompt", return_value="test"),
             patch("fujimoto.cli._session_terminal_title", return_value="test-title"),
+            patch("fujimoto.cli.is_notifier_installed", return_value=False),
         ):
             main()
             mock_launch.assert_called_once_with(
@@ -1434,6 +1442,7 @@ class TestSessionAppErrors:
     async def test_shows_error_on_git_failure(self) -> None:
         with (
             patch("fujimoto.cli.is_tmux_installed", return_value=True),
+            patch("fujimoto.cli.is_notifier_installed", return_value=True),
             patch(
                 "fujimoto.cli.get_project_name",
                 side_effect=GitError("not a repo"),
@@ -1448,6 +1457,7 @@ class TestSessionAppErrors:
     async def test_shows_error_on_config_error(self) -> None:
         with (
             patch("fujimoto.cli.is_tmux_installed", return_value=True),
+            patch("fujimoto.cli.is_notifier_installed", return_value=True),
             patch(
                 "fujimoto.cli.get_project_name",
                 side_effect=ConfigError("env not set"),
@@ -1568,6 +1578,132 @@ class TestSessionAppTmuxInstall:
             patch(
                 "fujimoto.cli.install_tmux",
                 side_effect=TmuxError("brew failed"),
+            ),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("enter")  # Select "Install with brew"
+                await pilot.pause()
+
+
+class TestSessionAppNotifierInstall:
+    @pytest.mark.asyncio
+    async def test_shows_install_prompt_when_missing(self) -> None:
+        with (
+            patch("fujimoto.cli.is_tmux_installed", return_value=True),
+            patch("fujimoto.cli.is_notifier_installed", return_value=False),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert len(app.query("#notifier-install-list")) > 0
+
+    @pytest.mark.asyncio
+    async def test_quit_from_install_prompt(self) -> None:
+        with (
+            patch("fujimoto.cli.is_tmux_installed", return_value=True),
+            patch("fujimoto.cli.is_notifier_installed", return_value=False),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                lst = app.query_one("#notifier-install-list", ListView)
+                lst.index = 2  # "Quit" is the 3rd item
+                await pilot.press("enter")
+                await pilot.pause()
+
+    @pytest.mark.asyncio
+    async def test_skip_proceeds_to_home(self) -> None:
+        with (
+            patch("fujimoto.cli.is_tmux_installed", return_value=True),
+            patch("fujimoto.cli.is_notifier_installed", return_value=False),
+            patch("fujimoto.cli.get_project_name", return_value="proj"),
+            patch("fujimoto.cli.get_repo_root", return_value=Path("/fake/repo")),
+            patch("fujimoto.cli.get_current_branch", return_value="main"),
+            patch("fujimoto.cli.get_default_branch", return_value="main"),
+            patch("fujimoto.cli.list_project_sessions", return_value=[]),
+            patch(
+                "fujimoto.cli.get_project_worktrees_dir",
+                return_value=Path("/nonexistent"),
+            ),
+            patch("fujimoto.cli.get_sessions_for_path", return_value=[]),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                lst = app.query_one("#notifier-install-list", ListView)
+                lst.index = 1  # "Skip" is the 2nd item
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#home-list")) > 0
+
+    @pytest.mark.asyncio
+    async def test_skipped_via_env_var(self) -> None:
+        with (
+            patch("fujimoto.cli.is_tmux_installed", return_value=True),
+            patch("fujimoto.cli.is_notifier_installed", return_value=False),
+            patch("fujimoto.cli.notifications_skipped", return_value=True),
+            patch("fujimoto.cli.get_project_name", return_value="proj"),
+            patch("fujimoto.cli.get_repo_root", return_value=Path("/fake/repo")),
+            patch("fujimoto.cli.get_current_branch", return_value="main"),
+            patch("fujimoto.cli.get_default_branch", return_value="main"),
+            patch("fujimoto.cli.list_project_sessions", return_value=[]),
+            patch(
+                "fujimoto.cli.get_project_worktrees_dir",
+                return_value=Path("/nonexistent"),
+            ),
+            patch("fujimoto.cli.get_sessions_for_path", return_value=[]),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                # Should go straight to home, no install prompt
+                assert len(app.query("#notifier-install-list")) == 0
+                assert len(app.query("#home-list")) > 0
+
+    @pytest.mark.asyncio
+    async def test_install_success_shows_home(self) -> None:
+        installed = False
+
+        def fake_is_installed() -> bool:
+            return installed
+
+        with (
+            patch("fujimoto.cli.is_tmux_installed", return_value=True),
+            patch("fujimoto.cli.is_notifier_installed", side_effect=fake_is_installed),
+            patch("fujimoto.cli.install_notifier") as mock_install,
+            patch("fujimoto.cli.get_project_name", return_value="proj"),
+            patch("fujimoto.cli.get_repo_root", return_value=Path("/fake/repo")),
+            patch("fujimoto.cli.get_current_branch", return_value="main"),
+            patch("fujimoto.cli.get_default_branch", return_value="main"),
+            patch("fujimoto.cli.list_project_sessions", return_value=[]),
+            patch(
+                "fujimoto.cli.get_project_worktrees_dir",
+                return_value=Path("/nonexistent"),
+            ),
+            patch("fujimoto.cli.get_sessions_for_path", return_value=[]),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+
+                def do_install() -> None:
+                    nonlocal installed
+                    installed = True
+
+                mock_install.side_effect = do_install
+                await pilot.press("enter")  # Select "Install with brew"
+                await pilot.pause()
+                mock_install.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_install_failure_shows_error(self) -> None:
+        with (
+            patch("fujimoto.cli.is_tmux_installed", return_value=True),
+            patch("fujimoto.cli.is_notifier_installed", return_value=False),
+            patch(
+                "fujimoto.cli.install_notifier",
+                side_effect=NotifierError("brew failed"),
             ),
         ):
             app = SessionApp()
@@ -2234,6 +2370,8 @@ class TestMainResume:
             "direct",
             "resume-session-id",
         )
+        app1._project_root = Path("/tmp/repo")
+        app1._existing_worktrees = []
         app2 = SessionApp.__new__(SessionApp)
         app2._launch_target = None
 
@@ -2243,6 +2381,7 @@ class TestMainResume:
             patch.object(app1, "run"),
             patch.object(app2, "run"),
             patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli.is_notifier_installed", return_value=False),
         ):
             main()
             mock_launch.assert_called_once_with(
