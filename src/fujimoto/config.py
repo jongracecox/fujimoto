@@ -81,19 +81,34 @@ def get_project_worktrees_dir(project_name: str) -> Path:
     return get_worktree_root() / project_name
 
 
-META_FILENAME = ".fujimoto-meta.json"
+META_DIR = ".fujimoto"
+META_FILENAME = "meta.json"
+
+
+def _get_meta_dir(worktree_path: Path) -> Path:
+    return worktree_path / META_DIR
+
+
+def _ensure_meta_dir(worktree_path: Path) -> Path:
+    meta_dir = _get_meta_dir(worktree_path)
+    meta_dir.mkdir(exist_ok=True)
+    gitignore = meta_dir / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text("*\n")
+    return meta_dir
 
 
 def store_session_meta(worktree_path: Path, base_branch: str) -> None:
     """Write session metadata to a JSON file in the worktree directory."""
     meta = {"base_branch": base_branch}
-    meta_path = worktree_path / META_FILENAME
+    meta_dir = _ensure_meta_dir(worktree_path)
+    meta_path = meta_dir / META_FILENAME
     meta_path.write_text(json.dumps(meta))
 
 
 def read_session_meta(worktree_path: Path) -> dict[str, str]:
     """Read session metadata from the worktree directory."""
-    meta_path = worktree_path / META_FILENAME
+    meta_path = _get_meta_dir(worktree_path) / META_FILENAME
     if not meta_path.exists():
         return {}
     try:
