@@ -581,8 +581,8 @@ class TestSessionAppOpenTerminal:
                     await pilot.press("enter")
                     await pilot.pause()
                     mock_open.assert_called_once()
-                    # Should return to home after opening
-                    assert len(app.query("#home-list")) > 0
+                    # Should stay on session actions menu
+                    assert len(app.query("#session-actions")) > 0
 
     @pytest.mark.asyncio
     async def test_open_terminal_error_shows_error(self) -> None:

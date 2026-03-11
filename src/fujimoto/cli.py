@@ -1306,11 +1306,6 @@ class SessionApp(App):
                 open_terminal(session.path)
             except OSError as e:
                 await self._show_error(str(e))
-                return
-            try:
-                await self._show_home()
-            except (ConfigError, GitError) as e:  # pragma: no cover
-                await self._show_error(str(e))
         elif action == "sa-rename":
             await self._show_rename(session)
         elif action == "sa-finish":
