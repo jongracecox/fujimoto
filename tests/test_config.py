@@ -195,21 +195,37 @@ class TestGetProjectWorktreesDir:
 class TestStoreSessionMeta:
     def test_writes_meta_file(self, tmp_path: Path) -> None:
         store_session_meta(tmp_path, "main")
-        meta_path = tmp_path / ".fujimoto-meta.json"
+        meta_path = tmp_path / ".fujimoto" / "meta.json"
         assert meta_path.exists()
         data = json.loads(meta_path.read_text())
         assert data["base_branch"] == "main"
 
+    def test_creates_gitignore(self, tmp_path: Path) -> None:
+        store_session_meta(tmp_path, "main")
+        gitignore = tmp_path / ".fujimoto" / ".gitignore"
+        assert gitignore.exists()
+        assert gitignore.read_text() == "*\n"
+
     def test_overwrites_existing(self, tmp_path: Path) -> None:
         store_session_meta(tmp_path, "main")
         store_session_meta(tmp_path, "develop")
-        data = json.loads((tmp_path / ".fujimoto-meta.json").read_text())
+        data = json.loads((tmp_path / ".fujimoto" / "meta.json").read_text())
         assert data["base_branch"] == "develop"
+
+    def test_does_not_overwrite_existing_gitignore(self, tmp_path: Path) -> None:
+        meta_dir = tmp_path / ".fujimoto"
+        meta_dir.mkdir()
+        gitignore = meta_dir / ".gitignore"
+        gitignore.write_text("custom\n")
+        store_session_meta(tmp_path, "main")
+        assert gitignore.read_text() == "custom\n"
 
 
 class TestReadSessionMeta:
     def test_reads_meta_file(self, tmp_path: Path) -> None:
-        meta_path = tmp_path / ".fujimoto-meta.json"
+        meta_dir = tmp_path / ".fujimoto"
+        meta_dir.mkdir()
+        meta_path = meta_dir / "meta.json"
         meta_path.write_text(json.dumps({"base_branch": "main"}))
         result = read_session_meta(tmp_path)
         assert result["base_branch"] == "main"
@@ -219,7 +235,9 @@ class TestReadSessionMeta:
         assert result == {}
 
     def test_returns_empty_on_invalid_json(self, tmp_path: Path) -> None:
-        meta_path = tmp_path / ".fujimoto-meta.json"
+        meta_dir = tmp_path / ".fujimoto"
+        meta_dir.mkdir()
+        meta_path = meta_dir / "meta.json"
         meta_path.write_text("not json")
         result = read_session_meta(tmp_path)
         assert result == {}
