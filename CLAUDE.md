@@ -33,6 +33,7 @@ src/fujimoto/
 ├── config.py     # Environment variable loading, path construction, session metadata
 ├── git.py        # Git subprocess wrappers (worktree lifecycle, branch operations)
 ├── terminal.py   # Open native terminal windows (iTerm2 with Terminal.app fallback)
+├── vscode.py     # Open directories in VS Code via the `code` CLI
 ├── tmux.py       # tmux session lifecycle (create, attach, kill, list, install)
 └── claude/
     ├── __init__.py      # Re-exports public API
@@ -104,6 +105,10 @@ src/fujimoto/
 - `_open_iterm(directory)` — AppleScript to create new iTerm2 window
 - `_open_terminal_app(directory)` — `open -a Terminal` fallback
 
+**`vscode.py`** — Open directories in VS Code:
+- `open_vscode(directory)` — runs `code <directory>`. Raises `OSError` if the `code` CLI is not on PATH.
+- `_has_vscode()` — checks for `code` on PATH via `shutil.which`
+
 **`tmux.py`** — tmux session management:
 - `is_tmux_installed()` / `install_tmux()` — detection and brew install
 - `list_all_sessions()` — lists all active tmux session names
@@ -132,7 +137,7 @@ src/fujimoto/
 - Views: home (sessions list), session actions submenu, finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), conflict resolution, project switcher (with autocomplete filter), tmux install, error
 - Home screen sections: actions ("New worktree session", "New session in X", "Ad hoc session"), active sessions (with Claude state indicators), inactive worktrees (with Claude state), previous Claude sessions (resumable, capped at 5), switch project
 - Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
-- Session actions submenu: Connect/Launch, Terminate, Resume (claude sessions), Rename, Open terminal, Finish (worktree only)
+- Session actions submenu: Connect/Launch, Terminate, Resume (claude sessions), Rename, Open terminal, Open in VS Code, Finish (worktree only)
 - Finish flow: Push & Create PR (background Claude), Cherry-pick to base, Discard & Delete
 - All view transitions are `async` — `await _clear_main()` then `await mount()`
 - Session data stored in `_session_map` dict keyed by ListItem ID

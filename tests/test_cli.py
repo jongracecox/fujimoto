@@ -612,6 +612,75 @@ class TestSessionAppOpenTerminal:
                     assert len(app.query("#home-list")) == 0
 
 
+class TestSessionAppOpenVscode:
+    @pytest.mark.asyncio
+    async def test_open_vscode_in_session_actions(self) -> None:
+        with _patch_git_info(sessions=["test-proj/direct-1"]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "ds-test-proj--direct-1":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                actions = app.query_one("#session-actions", ListView)
+                action_ids = [child.id for child in actions.children]
+                assert "sa-vscode" in action_ids
+
+    @pytest.mark.asyncio
+    async def test_open_vscode_calls_open_vscode(self) -> None:
+        with _patch_git_info(sessions=["test-proj/direct-1"]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "ds-test-proj--direct-1":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                actions = app.query_one("#session-actions", ListView)
+                for i, item in enumerate(actions.children):
+                    if item.id == "sa-vscode":
+                        actions.index = i
+                        break
+                with patch("fujimoto.cli.open_vscode") as mock_open:
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    mock_open.assert_called_once()
+                    # Should stay on session actions menu
+                    assert len(app.query("#session-actions")) > 0
+
+    @pytest.mark.asyncio
+    async def test_open_vscode_error_shows_error(self) -> None:
+        with _patch_git_info(sessions=["test-proj/direct-1"]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "ds-test-proj--direct-1":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                actions = app.query_one("#session-actions", ListView)
+                for i, item in enumerate(actions.children):
+                    if item.id == "sa-vscode":
+                        actions.index = i
+                        break
+                with patch(
+                    "fujimoto.cli.open_vscode",
+                    side_effect=OSError("'code' CLI not found"),
+                ):
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    # Error view: no session-actions, no home-list
+                    assert len(app.query("#session-actions")) == 0
+                    assert len(app.query("#home-list")) == 0
+
+
 class TestSessionAppRename:
     @pytest.mark.asyncio
     async def test_rename_shows_input(self, tmp_path: Path) -> None:

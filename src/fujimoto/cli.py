@@ -51,6 +51,7 @@ from fujimoto.git import (
     remove_worktree,
 )
 from fujimoto.terminal import open_terminal
+from fujimoto.vscode import open_vscode
 from fujimoto.tmux import (
     TmuxError,
     create_session_with_command,
@@ -754,6 +755,7 @@ class SessionApp(App):
             items.append(ListItem(Label("Rename"), id="sa-rename"))
 
         items.append(ListItem(Label("Open terminal"), id="sa-terminal"))
+        items.append(ListItem(Label("Open in VS Code"), id="sa-vscode"))
 
         if session.session_type == "worktree":
             items.append(ListItem(Label("Finish (cleanup/merge)"), id="sa-finish"))
@@ -1304,6 +1306,11 @@ class SessionApp(App):
         elif action == "sa-terminal":
             try:
                 open_terminal(session.path)
+            except OSError as e:
+                await self._show_error(str(e))
+        elif action == "sa-vscode":
+            try:
+                open_vscode(session.path)
             except OSError as e:
                 await self._show_error(str(e))
         elif action == "sa-rename":
