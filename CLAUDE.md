@@ -32,6 +32,7 @@ src/fujimoto/
 ├── cli.py        # Textual TUI app, entry point (main()), all UI screens and event handlers
 ├── config.py     # Environment variable loading, path construction, session metadata
 ├── git.py        # Git subprocess wrappers (worktree lifecycle, branch operations)
+├── monitor.py    # Background session monitor with macOS notifications
 ├── terminal.py   # Open native terminal windows (iTerm2 with Terminal.app fallback)
 ├── vscode.py     # Open directories in VS Code via the `code` CLI
 ├── tmux.py       # tmux session lifecycle (create, attach, kill, list, install)
@@ -98,6 +99,15 @@ src/fujimoto/
 - `push_branch(branch)` — `git push -u origin`
 - `delete_branch(branch, remote)` — `git branch -D`, optionally remote
 - `cherry_pick_branch(branch, onto)` — cherry-picks commit range onto target
+
+**`monitor.py`** — Background session monitor with macOS notifications:
+- `SessionMonitor` — background thread that polls Claude JSONL logs during tmux attachment
+- `_poll_once(paths, snapshot, attached_path)` — single poll cycle: detects state transitions, sends notifications
+- `_send_notification(title, message)` — macOS notification via `osascript`
+- `_state_display(state)` — human-readable label for session states
+- Monitors all project sessions while user is attached to a tmux session
+- Skips the currently-attached session (user can see it directly)
+- Notifies on `WAITING_FOR_TOOL_APPROVAL` transitions via macOS Notification Center
 
 **`terminal.py`** — Open native terminal windows in a session's directory:
 - `open_terminal(directory)` — opens iTerm2 if installed, otherwise Terminal.app. Raises `OSError` on non-macOS.
@@ -168,6 +178,7 @@ Three custom exception types, all caught in `main()`:
 - **Per-session tmux config**: Prefix remapped to Ctrl+A, status bar with shortcut hints — all set via `tmux set-option -t` so the user's global config is untouched.
 - **Global install via `uv tool`**: Requires `--force --reinstall` to rebuild the wheel from source. Plain `--force` reuses cached builds.
 - **Session metadata**: `.fujimoto-meta.json` stored in worktree directory records the base branch for cherry-pick targeting.
+- **Background session monitor**: While the user is attached to a tmux session, a `SessionMonitor` daemon thread polls all project session logs every 3 seconds. When a background session transitions to `WAITING_FOR_TOOL_APPROVAL`, a macOS notification is sent via `osascript`. The monitor builds an initial snapshot without notifying to avoid false alerts on startup, and skips the currently-attached session. The thread is started before `tmux attach` and stopped (via `Event.set()`) after detach.
 - **Background PR creation**: Uses `claude -p --allowedTools "Bash(git:*) Bash(gh:*)"` in a tmux session for unattended PR creation.
 - **Claude session integration**: The home screen fetches Claude session state from `~/.claude/projects/` JSONL logs via the log parser. Session states: 👀 awaiting input (`WAITING_FOR_USER`), 🛡️ approve tool (`WAITING_FOR_TOOL_APPROVAL`), ⚙ working (`WORKING`), 💤 idle (`IDLE`), no indicator (`UNKNOWN`). State logic: `last-prompt` marker → `IDLE` (session ended). For assistant entries: `stop_reason=tool_use` without a following `tool_result` → `WAITING_FOR_TOOL_APPROVAL` (pending user approval), `stop_reason=tool_use` with `tool_result` → `WORKING`, any other stop reason or no stop reason → `WAITING_FOR_USER`. Last entry is user → `WORKING`. Previous Claude sessions (from the project root, capped at 5) appear as resumable items. Resuming launches `claude --resume SESSION_ID` in a new tmux session. The latest Claude session per path is "claimed" by the corresponding tmux/worktree item to avoid duplication.
 - **Live polling**: The home screen uses `set_interval(3s)` to poll Claude JSONL logs for state changes. When a session's state changes, labels are updated in-place via `label.update()` — the screen is never cleared or rebuilt, which avoids blank-screen flicker. A snapshot dict (`path → (session_id, state)`) is compared each tick to detect changes efficiently. The timer is stopped when navigating away (`_clear_main` cancels it) and restarted by `_show_home`.

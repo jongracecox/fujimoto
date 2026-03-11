@@ -50,6 +50,7 @@ from fujimoto.git import (
     push_branch,
     remove_worktree,
 )
+from fujimoto.monitor import SessionMonitor
 from fujimoto.terminal import open_terminal
 from fujimoto.vscode import open_vscode
 from fujimoto.tmux import (
@@ -1663,13 +1664,30 @@ def main() -> None:
                     if resume_id
                     else _build_system_prompt(session_type, project_name, working_dir)
                 )
-                launch_claude_in_tmux(
-                    project_name,
-                    working_dir,
-                    tmux_name,
-                    system_prompt=system_prompt,
-                    resume_session_id=resume_id,
+
+                # Collect all paths to monitor for background notifications
+                monitor_paths: list[Path] = []
+                if app._project_root:
+                    monitor_paths.append(app._project_root)
+                monitor_paths.extend(app._existing_worktrees)
+                if working_dir not in monitor_paths:
+                    monitor_paths.append(working_dir)
+
+                monitor = SessionMonitor(
+                    paths=monitor_paths,
+                    attached_path=working_dir,
                 )
+                monitor.start()
+                try:
+                    launch_claude_in_tmux(
+                        project_name,
+                        working_dir,
+                        tmux_name,
+                        system_prompt=system_prompt,
+                        resume_session_id=resume_id,
+                    )
+                finally:
+                    monitor.stop()
             else:
                 break
         set_terminal_title("")

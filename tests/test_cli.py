@@ -147,6 +147,8 @@ class TestMain:
         # Second iteration: no target -> exit loop
         app1 = SessionApp.__new__(SessionApp)
         app1._launch_target = ("proj", Path("/tmp/test"), None, "worktree", None)
+        app1._project_root = Path("/tmp/repo")
+        app1._existing_worktrees = []
         app2 = SessionApp.__new__(SessionApp)
         app2._launch_target = None
 
@@ -158,6 +160,7 @@ class TestMain:
             patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
             patch("fujimoto.cli._build_system_prompt", return_value="test") as mock_sp,
             patch("fujimoto.cli._session_terminal_title", return_value="test-title"),
+            patch("fujimoto.cli.SessionMonitor"),
         ):
             main()
             mock_sp.assert_called_once_with("worktree", "proj", Path("/tmp/test"))
@@ -191,6 +194,8 @@ class TestMain:
             "direct",
             None,
         )
+        app1._project_root = Path("/tmp/repo")
+        app1._existing_worktrees = []
         app2 = SessionApp.__new__(SessionApp)
         app2._launch_target = None
 
@@ -202,6 +207,7 @@ class TestMain:
             patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
             patch("fujimoto.cli._build_system_prompt", return_value="test"),
             patch("fujimoto.cli._session_terminal_title", return_value="test-title"),
+            patch("fujimoto.cli.SessionMonitor"),
         ):
             main()
             mock_launch.assert_called_once_with(
@@ -2234,6 +2240,8 @@ class TestMainResume:
             "direct",
             "resume-session-id",
         )
+        app1._project_root = Path("/tmp/repo")
+        app1._existing_worktrees = []
         app2 = SessionApp.__new__(SessionApp)
         app2._launch_target = None
 
@@ -2243,6 +2251,7 @@ class TestMainResume:
             patch.object(app1, "run"),
             patch.object(app2, "run"),
             patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli.SessionMonitor"),
         ):
             main()
             mock_launch.assert_called_once_with(
