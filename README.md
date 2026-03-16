@@ -22,11 +22,19 @@ He carries himself with dignity, even in defeat. Your worktrees should too.
 
 ## Installation
 
+Install directly from GitHub:
+
+```sh
+uv tool install git+https://github.com/jongracecox/fujimoto.git
+```
+
+Or install from a local clone:
+
 ```sh
 uv tool install --force --reinstall /path/to/this/repo
 ```
 
-This installs the `fujimoto` command globally. Re-run after code changes to pick up updates.
+Re-run with `--force --reinstall` after local code changes to pick up updates.
 
 ## Configuration
 

@@ -3,7 +3,7 @@
 ## Getting Started
 
 ```sh
-git clone <repo-url>
+git clone https://github.com/jongracecox/fujimoto.git
 cd fujimoto
 uv sync
 ```
