@@ -13,6 +13,7 @@ from fujimoto.git import (
     create_worktree,
     delete_branch,
     fetch_and_rebase_branch,
+    fetch_branch,
     get_current_branch,
     get_default_branch,
     get_merge_base,
@@ -261,6 +262,36 @@ class TestDeleteBranch:
 
         with patch("fujimoto.git._run", side_effect=mock_run):
             delete_branch("my-branch", remote=True)  # Should not raise
+
+
+class TestFetchBranch:
+    def test_calls_fetch(self) -> None:
+        calls: list[list[str]] = []
+
+        def mock_run(args: list[str], **kwargs) -> str:  # type: ignore[no-untyped-def]
+            calls.append(args)
+            return ""
+
+        with patch("fujimoto.git._run", side_effect=mock_run):
+            fetch_branch("main")
+            assert len(calls) == 1
+            assert calls[0] == ["fetch", "origin", "main"]
+
+    def test_passes_cwd(self) -> None:
+        calls: list[tuple[list[str], Path]] = []
+
+        def mock_run(args: list[str], cwd: Path | None = None) -> str:
+            calls.append((args, cwd))
+            return ""
+
+        with patch("fujimoto.git._run", side_effect=mock_run):
+            fetch_branch("main", cwd=Path("/repo"))
+            assert calls[0] == (["fetch", "origin", "main"], Path("/repo"))
+
+    def test_raises_on_failure(self) -> None:
+        with patch("fujimoto.git._run", side_effect=GitError("no remote")):
+            with pytest.raises(GitError):
+                fetch_branch("main")
 
 
 class TestFetchAndRebaseBranch:

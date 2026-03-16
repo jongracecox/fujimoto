@@ -121,9 +121,14 @@ def delete_branch(
             pass  # Remote branch may not exist
 
 
+def fetch_branch(branch: str, cwd: Path | str | None = None) -> None:
+    """Fetch a branch from origin."""
+    _run(["fetch", "origin", branch], cwd=cwd)
+
+
 def fetch_and_rebase_branch(branch: str, cwd: Path | str | None = None) -> None:
     """Fetch from origin and rebase a local branch onto its remote counterpart."""
-    _run(["fetch", "origin", branch], cwd=cwd)
+    fetch_branch(branch, cwd=cwd)
     _run(["rebase", f"origin/{branch}", branch], cwd=cwd)
 
 

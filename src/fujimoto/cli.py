@@ -38,7 +38,7 @@ from fujimoto.git import (
     cherry_pick_branch,
     create_worktree,
     delete_branch,
-    fetch_and_rebase_branch,
+    fetch_branch,
     get_current_branch,
     get_default_branch,
     get_project_name,
@@ -364,6 +364,7 @@ class SessionApp(App):
         self._active_sessions: set[str] = set()
         self._title_value: str = ""
         self._base_branch: str = ""
+        self._start_point: str = ""
         self._worktree_path: Path | None = None
         self._launch_target: tuple[str, Path, str | None, str, str | None] | None = None
         self._project_root: Path | None = None
@@ -1044,7 +1045,7 @@ class SessionApp(App):
         try:
             create_worktree(
                 self._worktree_path,
-                self._base_branch,
+                self._start_point or self._base_branch,
                 new_branch,
                 cwd=self._project_cwd,
             )
@@ -1497,11 +1498,14 @@ class SessionApp(App):
     async def on_branch_selected(self, event: ListView.Selected) -> None:
         if event.item.id == "branch-current":
             self._base_branch = self._current_branch
+            self._start_point = ""
             await self._finalize_create()
         elif event.item.id == "branch-default":
             self._base_branch = self._default_branch
+            self._start_point = ""
             try:
-                fetch_and_rebase_branch(self._default_branch, cwd=self._project_cwd)
+                fetch_branch(self._default_branch, cwd=self._project_cwd)
+                self._start_point = f"origin/{self._default_branch}"
             except GitError:
                 pass  # Offline or no remote — proceed with local state
             await self._finalize_create()
