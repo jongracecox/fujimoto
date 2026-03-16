@@ -1146,7 +1146,7 @@ class TestSessionAppCreateFlow:
             ),
             patch("fujimoto.cli.create_worktree") as mock_create,
             patch("fujimoto.cli.store_session_meta"),
-            patch("fujimoto.cli.fetch_and_rebase_branch") as mock_fetch,
+            patch("fujimoto.cli.fetch_branch") as mock_fetch,
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -1159,7 +1159,10 @@ class TestSessionAppCreateFlow:
                 await pilot.pause()
                 mock_fetch.assert_called_once_with("main", cwd=None)
                 mock_create.assert_called_once()
+                # Worktree starts from origin/main, not local main
+                assert mock_create.call_args[0][1] == "origin/main"
                 assert app._base_branch == "main"
+                assert app._start_point == "origin/main"
 
     @pytest.mark.asyncio
     async def test_branch_select_default_fetch_failure_continues(
@@ -1174,7 +1177,7 @@ class TestSessionAppCreateFlow:
             patch("fujimoto.cli.create_worktree") as mock_create,
             patch("fujimoto.cli.store_session_meta"),
             patch(
-                "fujimoto.cli.fetch_and_rebase_branch",
+                "fujimoto.cli.fetch_branch",
                 side_effect=GitError("no remote"),
             ),
         ):
@@ -1187,8 +1190,10 @@ class TestSessionAppCreateFlow:
                 await pilot.pause()
                 await pilot.press("enter")  # Select default branch
                 await pilot.pause()
-                # Should still create despite fetch failure
+                # Should still create despite fetch failure, using local branch
                 mock_create.assert_called_once()
+                assert mock_create.call_args[0][1] == "main"
+                assert app._start_point == ""
 
     @pytest.mark.asyncio
     async def test_branch_select_current(self, tmp_path: Path) -> None:
@@ -1343,7 +1348,7 @@ class TestSessionAppCreateFlow:
             ),
             patch("fujimoto.cli.create_worktree"),
             patch("fujimoto.cli.store_session_meta") as mock_meta,
-            patch("fujimoto.cli.fetch_and_rebase_branch"),
+            patch("fujimoto.cli.fetch_branch"),
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -1365,7 +1370,7 @@ class TestSessionAppConflict:
         with (
             _patch_git_info(current="main", default="main"),
             patch("fujimoto.cli.build_worktree_path", return_value=existing),
-            patch("fujimoto.cli.fetch_and_rebase_branch"),
+            patch("fujimoto.cli.fetch_branch"),
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -1385,7 +1390,7 @@ class TestSessionAppConflict:
         with (
             _patch_git_info(current="main", default="main"),
             patch("fujimoto.cli.build_worktree_path", return_value=existing),
-            patch("fujimoto.cli.fetch_and_rebase_branch"),
+            patch("fujimoto.cli.fetch_branch"),
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -1410,7 +1415,7 @@ class TestSessionAppConflict:
             patch("fujimoto.cli.build_worktree_path", return_value=existing),
             patch("fujimoto.cli.create_worktree") as mock_create,
             patch("fujimoto.cli.store_session_meta"),
-            patch("fujimoto.cli.fetch_and_rebase_branch"),
+            patch("fujimoto.cli.fetch_branch"),
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -1465,7 +1470,7 @@ class TestSessionAppErrors:
                 "fujimoto.cli.build_worktree_path",
                 side_effect=ConfigError("FUJIMOTO_WORKTREE_ROOT is not set."),
             ),
-            patch("fujimoto.cli.fetch_and_rebase_branch"),
+            patch("fujimoto.cli.fetch_branch"),
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -1494,7 +1499,7 @@ class TestSessionAppErrors:
                 "fujimoto.cli.create_worktree",
                 side_effect=GitError("branch already exists"),
             ),
-            patch("fujimoto.cli.fetch_and_rebase_branch"),
+            patch("fujimoto.cli.fetch_branch"),
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -1830,7 +1835,7 @@ class TestSessionAppConflictSuffix:
             patch("fujimoto.cli.build_worktree_path", return_value=existing),
             patch("fujimoto.cli.create_worktree") as mock_create,
             patch("fujimoto.cli.store_session_meta"),
-            patch("fujimoto.cli.fetch_and_rebase_branch"),
+            patch("fujimoto.cli.fetch_branch"),
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
