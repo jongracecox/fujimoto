@@ -16,6 +16,7 @@ from fujimoto.cli import (
     ICON_SHIELD,
     SessionApp,
     _claude_state_label,
+    _format_prompt_lines,
     _get_claude_sessions,
     _relative_time,
     main,
@@ -478,7 +479,8 @@ class TestSessionAppSessionActions:
                         break
                 await pilot.press("enter")
                 await pilot.pause()
-                # "Terminate" is the second option
+                # "Terminate" is the third option (after Connect, Resume previous session)
+                await pilot.press("down")
                 await pilot.press("down")
                 await pilot.press("enter")
                 await pilot.pause()
@@ -519,6 +521,109 @@ class TestSessionAppSessionActions:
                 # Navigate to cancel (last item)
                 for _ in range(10):
                     await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#home-list")) > 0
+
+    @pytest.mark.asyncio
+    async def test_resume_picker_shown_for_active_worktree(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                actions = app.query_one("#session-actions", ListView)
+                action_ids = [child.id for child in actions.children]
+                assert "sa-resume-picker" in action_ids
+
+    @pytest.mark.asyncio
+    async def test_resume_picker_shown_for_inactive_worktree(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                actions = app.query_one("#session-actions", ListView)
+                action_ids = [child.id for child in actions.children]
+                assert "sa-resume-picker" in action_ids
+
+    @pytest.mark.asyncio
+    async def test_resume_picker_sets_launch_target(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        fake_session = ClaudeSession(
+            jsonl_path=wt / "session.jsonl",
+            session_id="abc12345-def6-7890-abcd-ef1234567890",
+            state=SessionState.IDLE,
+            last_entry_type=EntryType.ASSISTANT,
+            stop_reason=StopReason.END_TURN,
+            cwd=wt,
+            git_branch="worktree/20260309-test",
+            last_activity=datetime(2026, 3, 9, 12, 0, 0, tzinfo=timezone.utc),
+            title="My test session",
+            first_prompt="Add resume session picker to worktree menu",
+        )
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _path: [fake_session],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # "Resume previous session" is the second option (after Connect)
+                await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                # Should now show the resume picker
+                assert len(app.query("#resume-picker")) > 0
+                # Select the first session
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+                assert app._launch_target[4] == fake_session.session_id
+
+    @pytest.mark.asyncio
+    async def test_resume_picker_cancel_returns_home(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                # Shows empty state + cancel
+                assert len(app.query("#resume-picker")) > 0
+                # Navigate to cancel and press enter
+                await pilot.press("down")
                 await pilot.press("enter")
                 await pilot.pause()
                 assert len(app.query("#home-list")) > 0
@@ -1943,6 +2048,46 @@ class TestRelativeTime:
 
         dt = datetime.now(tz=timezone.utc) - timedelta(days=60)
         assert _relative_time(dt) == "2mo ago"
+
+
+class TestFormatPromptLines:
+    def test_single_line_unchanged(self) -> None:
+        assert _format_prompt_lines("hello world", 80) == ["hello world"]
+
+    def test_two_lines_returned_as_is(self) -> None:
+        assert _format_prompt_lines("line one\nline two", 80) == [
+            "line one",
+            "line two",
+        ]
+
+    def test_three_lines_all_shown(self) -> None:
+        result = _format_prompt_lines("a\nb\nc", 80)
+        assert result == ["a", "b", "…", "c"]
+
+    def test_four_lines_shows_first_two_ellipsis_last(self) -> None:
+        result = _format_prompt_lines("a\nb\nc\nd", 80)
+        assert result == ["a", "b", "…", "d"]
+
+    def test_long_single_line_word_wrapped(self) -> None:
+        # A long line with spaces should be word-wrapped into multiple display lines
+        words = " ".join(["word"] * 20)  # "word word word ..." — well over 20 chars
+        result = _format_prompt_lines(words, 20)
+        assert len(result) > 1
+        for ln in result:
+            assert len(ln) <= 20
+
+    def test_long_line_no_spaces_word_wrapped(self) -> None:
+        # textwrap breaks long words by default — 100 chars at width 20 → 5 chunks
+        result = _format_prompt_lines("a" * 100, 20)
+        # 5 chunks → first 2 + ellipsis + last
+        assert result == ["a" * 20, "a" * 20, "…", "a" * 20]
+
+    def test_empty_lines_skipped(self) -> None:
+        assert _format_prompt_lines("a\n\nb", 80) == ["a", "b"]
+
+    def test_exact_width_not_truncated(self) -> None:
+        text = "a" * 20
+        assert _format_prompt_lines(text, 20) == [text]
 
 
 class TestGetClaudeSessions:
