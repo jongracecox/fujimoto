@@ -137,7 +137,7 @@ src/fujimoto/
 - Views: home (sessions list), session actions submenu, finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), conflict resolution, project switcher (with autocomplete filter), tmux install, error
 - Home screen sections: actions ("New worktree session", "New session in X", "Ad hoc session"), active sessions (with Claude state indicators), inactive worktrees (with Claude state), previous Claude sessions (resumable, capped at 5), switch project
 - Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
-- Session actions submenu: Connect/Launch, Terminate, Resume (claude sessions), Rename, Open terminal, Open in VS Code, Finish (worktree only)
+- Session actions submenu: Connect/Launch, Resume previous session (worktree/direct), Terminate, Resume (claude sessions), Rename, Open terminal, Open in VS Code, Finish (worktree only)
 - Finish flow: Push & Create PR (background Claude), Cherry-pick to base, Discard & Delete
 - All view transitions are `async` — `await _clear_main()` then `await mount()`
 - Session data stored in `_session_map` dict keyed by ListItem ID
