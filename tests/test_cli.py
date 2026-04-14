@@ -603,6 +603,55 @@ class TestSessionAppSessionActions:
                 await pilot.pause()
                 assert app._launch_target is not None
                 assert app._launch_target[4] == fake_session.session_id
+                # Active worktree → direct-N name, not the worktree name
+                assert app._launch_target[2].startswith("test-proj/direct-")
+                # Working dir comes from cs.cwd, not session.path
+                assert app._launch_target[1] == fake_session.cwd
+
+    @pytest.mark.asyncio
+    async def test_resume_picker_inactive_worktree_uses_worktree_session_name(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        fake_session = ClaudeSession(
+            jsonl_path=wt / "session.jsonl",
+            session_id="abc12345-def6-7890-abcd-ef1234567890",
+            state=SessionState.IDLE,
+            last_entry_type=EntryType.ASSISTANT,
+            stop_reason=StopReason.END_TURN,
+            cwd=wt,
+            git_branch="worktree/20260309-test",
+            last_activity=datetime(2026, 3, 9, 12, 0, 0, tzinfo=timezone.utc),
+            title="My test session",
+            first_prompt="Fix the bug",
+        )
+        # No active sessions → worktree is inactive
+        with _patch_git_info(
+            worktrees=[wt],
+            claude_sessions_fn=lambda _path: [fake_session],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # "Resume previous session" is the second option (after Launch)
+                await pilot.press("down")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#resume-picker")) > 0
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+                assert app._launch_target[4] == fake_session.session_id
+                # Inactive worktree → reuse the worktree's session name
+                assert app._launch_target[2] == "test-proj/20260309-test"
+                # Working dir is cs.cwd
+                assert app._launch_target[1] == fake_session.cwd
 
     @pytest.mark.asyncio
     async def test_resume_picker_cancel_returns_home(self, tmp_path: Path) -> None:
