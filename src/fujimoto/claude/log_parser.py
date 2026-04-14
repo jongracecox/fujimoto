@@ -81,6 +81,8 @@ class ClaudeSession:
     cwd: Path
     git_branch: str | None
     last_activity: datetime
+    title: str | None = None
+    first_prompt: str | None = None
 
     @property
     def is_active(self) -> bool:
@@ -135,6 +137,8 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
     last_any: dict | None = None
     session_ended = False
     tool_result_after_last_tool_use = False
+    custom_title: str | None = None
+    first_prompt: str | None = None
 
     for line in text.splitlines():
         line = line.strip()
@@ -151,6 +155,10 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
             session_ended = True
             continue
 
+        if raw_type == "custom-title":
+            custom_title = entry.get("customTitle") or custom_title
+            continue
+
         entry_type = EntryType.from_raw(raw_type)
         if entry_type is None:
             # Unknown type — skip without crashing
@@ -160,6 +168,18 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
 
         if entry.get("isSidechain"):
             continue
+
+        if first_prompt is None and entry_type == EntryType.USER:
+            # Capture the first non-meta, non-command user message with string
+            # content. isMeta=true covers <local-command-caveat> injections.
+            # Content starting with "<" covers slash-command executions such as
+            # <command-name>/model</command-name> and any other XML-tagged
+            # injections Claude Code may add. Tool-result replies have array
+            # content, so the isinstance(str) check excludes them.
+            if not entry.get("isMeta"):
+                content = entry.get("message", {}).get("content")
+                if isinstance(content, str) and not content.lstrip().startswith("<"):
+                    first_prompt = content
 
         if entry_type in (EntryType.ASSISTANT, EntryType.USER):
             last_meaningful = entry
@@ -194,6 +214,8 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
             cwd=Path(last_any.get("cwd", "/")),
             git_branch=last_any.get("gitBranch"),
             last_activity=_parse_timestamp(last_any.get("timestamp", "")),
+            title=custom_title,
+            first_prompt=first_prompt,
         )
 
     entry_type = EntryType.from_raw(last_meaningful["type"])
@@ -231,6 +253,8 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
         cwd=Path(last_meaningful.get("cwd", "/")),
         git_branch=last_meaningful.get("gitBranch"),
         last_activity=_parse_timestamp(last_meaningful.get("timestamp", "")),
+        title=custom_title,
+        first_prompt=first_prompt,
     )
 
 
