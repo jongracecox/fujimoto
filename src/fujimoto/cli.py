@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -104,6 +105,29 @@ def _relative_time(dt: datetime) -> str:
     if minutes > 0:
         return f"{minutes}m ago"
     return "just now"
+
+
+def _format_prompt_lines(text: str, max_width: int) -> list[str]:
+    """Format a prompt for multi-line display in the resume picker.
+
+    Each raw line is word-wrapped at max_width, so long single-line prompts
+    produce multiple display lines.  Returns the first 2 display lines, then
+    (when there are more) a '…' marker and the last line.
+    """
+
+    def _trunc(line: str) -> str:
+        return line[: max_width - 1] + "…" if len(line) > max_width else line
+
+    display_lines: list[str] = []
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        display_lines.extend(textwrap.wrap(raw, max_width) or [raw])
+
+    lines = [_trunc(ln) for ln in display_lines]
+    if len(lines) <= 2:
+        return lines
+    return [lines[0], lines[1], "…", lines[-1]]
 
 
 def _get_claude_sessions(
@@ -377,6 +401,7 @@ class SessionApp(App):
         self._branch_picker_names: dict[str, str] = {}
         self._poll_timer: object | None = None
         self._claude_state_snapshot: dict[str, tuple[str, SessionState]] = {}
+        self._resume_sessions: list[ClaudeSession] = []
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -748,9 +773,15 @@ class SessionApp(App):
             items.append(ListItem(Label("Resume"), id="sa-resume"))
         elif session.is_active:
             items.append(ListItem(Label("Connect"), id="sa-connect"))
+            items.append(
+                ListItem(Label("Resume previous session"), id="sa-resume-picker")
+            )
             items.append(ListItem(Label("Terminate session"), id="sa-terminate"))
         else:
             items.append(ListItem(Label("Launch"), id="sa-launch"))
+            items.append(
+                ListItem(Label("Resume previous session"), id="sa-resume-picker")
+            )
 
         if session.session_type != "claude":
             items.append(ListItem(Label("Rename"), id="sa-rename"))
@@ -788,6 +819,58 @@ class SessionApp(App):
             )
         )
         self.query_one("#session-actions").focus()
+
+    # -- Resume session picker --
+
+    async def _show_resume_session_picker(self, session: SessionInfo) -> None:
+        self._selected_session = session
+        sessions = get_sessions_for_path(session.path)
+        self._resume_sessions = sessions
+
+        await self._clear_main()
+        main = self.query_one("#main")
+
+        # Reserve space for list padding (2 chars each side) + container margin
+        max_width = max(20, self.size.width - 8)
+
+        if not sessions:
+            items: list[ListItem] = [
+                ListItem(
+                    Label("[dim]No previous sessions found[/]", markup=True),
+                    id="rp-empty",
+                ),
+                ListItem(Label("[dim]Cancel[/]", markup=True), id="rp-cancel"),
+            ]
+        else:
+            items = []
+            for i, cs in enumerate(sessions):
+                time_text = _relative_time(cs.last_activity)
+                meta = (
+                    f"{cs.title}  [dim]{time_text}[/]"
+                    if cs.title
+                    else f"[dim]{time_text}[/]"
+                )
+                if cs.first_prompt:
+                    prompt_lines = _format_prompt_lines(cs.first_prompt, max_width)
+                    item = ListItem(
+                        *[Label(ln) for ln in prompt_lines],
+                        Label(meta, markup=True),
+                        id=f"rp-{i}",
+                    )
+                else:
+                    item = ListItem(Label(meta, markup=True), id=f"rp-{i}")
+                items.append(item)
+            items.append(ListItem(Label("[dim]Cancel[/]", markup=True), id="rp-cancel"))
+
+        await main.mount(
+            Container(
+                Label(session.name, classes="form-label"),
+                Static("Resume previous session", classes="session-info"),
+                ListView(*items, id="resume-picker"),
+                id="actions-panel",
+            )
+        )
+        self.query_one("#resume-picker").focus()
 
     # -- Rename flow --
 
@@ -1296,6 +1379,8 @@ class SessionApp(App):
                 session.claude_session_id,
             )
             self.exit()
+        elif action == "sa-resume-picker":
+            await self._show_resume_session_picker(session)
         elif action == "sa-terminate":
             try:
                 kill_session(session.tmux_session)
@@ -1349,6 +1434,30 @@ class SessionApp(App):
                 await self._show_home()
             except (ConfigError, GitError) as e:  # pragma: no cover
                 await self._show_error(str(e))
+
+    @on(ListView.Selected, "#resume-picker")
+    async def on_resume_picker_selected(self, event: ListView.Selected) -> None:
+        session = self._selected_session
+        if session is None:
+            return  # pragma: no cover
+        item_id = event.item.id
+        if item_id in ("rp-cancel", "rp-empty"):
+            try:
+                await self._show_home()
+            except (ConfigError, GitError) as e:  # pragma: no cover
+                await self._show_error(str(e))
+            return
+        idx = int(item_id.split("-", 1)[1])
+        cs = self._resume_sessions[idx]
+        tmux_name = get_next_direct_session_name(session.project, self._active_sessions)
+        self._launch_target = (
+            session.project,
+            session.path,
+            tmux_name,
+            session.session_type,
+            cs.session_id,
+        )
+        self.exit()
 
     @on(ListView.Selected, "#confirm-list")
     async def on_confirm_selected(self, event: ListView.Selected) -> None:
