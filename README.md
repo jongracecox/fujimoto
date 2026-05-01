@@ -1,7 +1,14 @@
 # fujimoto
 
-![Tests](https://github.com/jongracecox/fujimoto/actions/workflows/tests.yml/badge.svg)
-![Coverage](https://raw.githubusercontent.com/jongracecox/fujimoto/badges/coverage.svg)
+[![pypi package](https://badge.fury.io/py/fujimoto.svg)](https://pypi.org/project/fujimoto)
+[![release](https://github.com/jongracecox/fujimoto/actions/workflows/release.yml/badge.svg)](https://github.com/jongracecox/fujimoto/actions/workflows/release.yml)
+[![GitHub last commit](https://img.shields.io/github/last-commit/jongracecox/fujimoto.svg)](https://github.com/jongracecox/fujimoto/commits/main)
+[![GitHub](https://img.shields.io/github/license/jongracecox/fujimoto.svg)](https://github.com/jongracecox/fujimoto/blob/main/LICENSE)
+[![downloads](https://pepy.tech/badge/fujimoto)](https://pepy.tech/project/fujimoto)
+[![tests](https://github.com/jongracecox/fujimoto/actions/workflows/tests.yml/badge.svg)](https://github.com/jongracecox/fujimoto/actions/workflows/tests.yml)
+![coverage](https://raw.githubusercontent.com/jongracecox/fujimoto/badges/coverage.svg)
+[![GitHub stars](https://img.shields.io/github/stars/jongracecox/fujimoto.svg?style=social)](https://github.com/jongracecox/fujimoto/stargazers)
+
 
 A terminal UI for managing Claude Code sessions across git worktrees and repositories. Spin up isolated worktree sessions or launch Claude directly in an existing repo — all from an interactive TUI with tmux-powered detachable sessions.
 
