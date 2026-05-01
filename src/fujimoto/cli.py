@@ -1728,8 +1728,6 @@ def _build_system_prompt(session_type: str, project: str, working_dir: Path) -> 
         return (
             f"You are working in a fujimoto worktree session for project '{project}'. "
             f"This is an isolated git worktree branched from '{base_branch}'. "
-            "Do not push or create PRs directly — the user will finish this session "
-            "through fujimoto (push & PR, cherry-pick, or discard). "
             "Focus your work on this worktree's branch."
         )
     return (
