@@ -10,10 +10,11 @@ uv sync
 
 ## Running Locally
 
-You must be inside a git repository and have the environment variable set:
+You must be inside a git repository. `FUJIMOTO_WORKTREE_ROOT` is optional —
+when unset, worktrees are created at `<repo>/.fujimoto/worktrees/`:
 
 ```sh
-export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/
+export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/   # optional
 uv run fujimoto
 ```
 
@@ -117,5 +118,6 @@ The `claude/` subpackage parses Claude Code's JSONL session logs (`~/.claude/pro
 6. Test the Finish flow on a worktree with unpushed commits
 7. Test error cases:
    - Run outside a git repo
-   - Unset `FUJIMOTO_WORKTREE_ROOT`
    - Create a worktree with a name that already exists
+8. With `FUJIMOTO_WORKTREE_ROOT` unset: confirm worktrees land in
+   `<repo>/.fujimoto/worktrees/` and the directory is gitignored

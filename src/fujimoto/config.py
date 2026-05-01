@@ -34,15 +34,24 @@ def list_projects() -> list[Path]:
     )
 
 
-def get_worktree_root() -> Path:
+def get_worktree_root(project_root: Path | None = None) -> Path:
+    """Resolve the directory where worktrees should be created.
+
+    If FUJIMOTO_WORKTREE_ROOT is set, use it. Otherwise fall back to
+    `<project_root>/.fujimoto/worktrees/`, ensuring the `.fujimoto` directory
+    is gitignored. Raises ConfigError only if neither is available.
+    """
     raw = os.environ.get("FUJIMOTO_WORKTREE_ROOT")
-    if not raw:
+    if raw:
+        root = Path(raw).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+    if project_root is None:
         raise ConfigError(
-            "FUJIMOTO_WORKTREE_ROOT is not set.\n"
-            "Set it to the directory where worktrees should be created, e.g.:\n"
-            "  export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/"
+            "FUJIMOTO_WORKTREE_ROOT is not set and no project root was provided."
         )
-    root = Path(raw).expanduser().resolve()
+    _ensure_meta_dir(project_root)
+    root = project_root / META_DIR / "worktrees"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -70,15 +79,26 @@ def slugify(title: str) -> str:
     return slug
 
 
-def build_worktree_path(project_name: str, title: str) -> Path:
-    root = get_worktree_root()
+def build_worktree_path(
+    project_name: str, title: str, project_root: Path | None = None
+) -> Path:
     today = date.today().strftime("%Y%m%d")
     dir_name = f"{today}-{slugify(title)}"
-    return root / project_name / dir_name
+    return get_project_worktrees_dir(project_name, project_root) / dir_name
 
 
-def get_project_worktrees_dir(project_name: str) -> Path:
-    return get_worktree_root() / project_name
+def get_project_worktrees_dir(
+    project_name: str, project_root: Path | None = None
+) -> Path:
+    """Directory holding all worktrees for `project_name`.
+
+    With FUJIMOTO_WORKTREE_ROOT set: `{root}/{project_name}`.
+    With the in-project fallback: `<project_root>/.fujimoto/worktrees/`
+    (no extra project layer — the directory already lives inside the project).
+    """
+    if os.environ.get("FUJIMOTO_WORKTREE_ROOT"):
+        return get_worktree_root() / project_name
+    return get_worktree_root(project_root)
 
 
 META_DIR = ".fujimoto"

@@ -28,7 +28,6 @@ from fujimoto.config import (
     get_next_adhoc_session_name,
     get_next_direct_session_name,
     get_project_worktrees_dir,
-    get_worktree_root,
     list_projects,
     read_session_meta,
     slugify,
@@ -430,7 +429,9 @@ class SessionApp(App):
 
         self._existing_worktrees = []
         try:
-            project_dir = get_project_worktrees_dir(self._project_name)
+            project_dir = get_project_worktrees_dir(
+                self._project_name, self._project_root
+            )
             if project_dir.exists():
                 self._existing_worktrees = sorted(
                     [d for d in project_dir.iterdir() if d.is_dir()],
@@ -1085,7 +1086,7 @@ class SessionApp(App):
     async def _finalize_create(self) -> None:
         try:
             self._worktree_path = build_worktree_path(
-                self._project_name, self._title_value
+                self._project_name, self._title_value, self._project_root
             )
         except ConfigError as e:
             await self._show_error(str(e))
@@ -1698,11 +1699,6 @@ class SessionApp(App):
 def _check_prerequisites() -> list[str]:
     """Validate environment before launching the TUI. Returns a list of issues."""
     issues: list[str] = []
-
-    try:
-        get_worktree_root()
-    except ConfigError as e:
-        issues.append(str(e))
 
     try:
         get_repo_root()
