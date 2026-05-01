@@ -224,7 +224,7 @@ class TestBuildSystemPrompt:
         assert "worktree" in prompt
         assert "myproj" in prompt
         assert "main" in prompt
-        assert "Do not push" in prompt
+        assert "Focus your work on this worktree's branch" in prompt
 
     def test_worktree_prompt_without_meta(self, tmp_path: Path) -> None:
         from fujimoto.cli import _build_system_prompt
