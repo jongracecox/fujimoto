@@ -80,6 +80,10 @@ def _patch_git_info(
                 "fujimoto.cli.get_sessions_for_path",
                 side_effect=claude_sessions_fn or (lambda _path: []),
             ),
+            patch(
+                "fujimoto.cli.check_for_update",
+                return_value=(None, False),
+            ),
         ):
             yield
 
@@ -2451,3 +2455,63 @@ class TestMainResume:
                 system_prompt=None,
                 resume_session_id="resume-session-id",
             )
+
+
+# -- Update banner tests --
+
+
+class TestUpdateBanner:
+    @pytest.mark.asyncio
+    async def test_banner_shows_when_update_version_set(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                app._update_banner_version = "9.9.9"
+                await app._show_home()
+                await pilot.pause()
+                banner = app.query("#update-banner")
+                assert len(banner) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_banner_when_version_not_set(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test():
+                assert app._update_banner_version is None
+                assert len(app.query("#update-banner")) == 0
+
+    @pytest.mark.asyncio
+    async def test_dismiss_clears_banner_and_persists(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                app._update_banner_version = "9.9.9"
+                await app._show_home()
+                await pilot.pause()
+                with patch("fujimoto.cli.dismiss_update_version") as mock_dismiss:
+                    await app.action_dismiss_update()
+                    await pilot.pause()
+                    mock_dismiss.assert_called_once_with("9.9.9")
+                assert app._update_banner_version is None
+                assert len(app.query("#update-banner")) == 0
+
+    @pytest.mark.asyncio
+    async def test_dismiss_noop_when_not_on_home(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test():
+                app._update_banner_version = "9.9.9"
+                app._on_home = False
+                with patch("fujimoto.cli.dismiss_update_version") as mock_dismiss:
+                    await app.action_dismiss_update()
+                    mock_dismiss.assert_not_called()
+                assert app._update_banner_version == "9.9.9"
+
+    @pytest.mark.asyncio
+    async def test_version_label_rendered(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test():
+                label = app.query_one("#version-label")
+                rendered = str(label.render())
+                assert rendered.startswith("fujimoto v")

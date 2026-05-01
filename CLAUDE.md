@@ -40,6 +40,8 @@ src/fujimoto/
 ├── terminal.py   # Open native terminal windows (iTerm2 with Terminal.app fallback)
 ├── vscode.py     # Open directories in VS Code via the `code` CLI
 ├── tmux.py       # tmux session lifecycle (create, attach, kill, list, install)
+├── version.py    # importlib.metadata wrapper for the running fujimoto version
+├── version_check.py  # daily PyPI update check, dismissal cache (~/.cache/fujimoto/)
 └── claude/
     ├── __init__.py      # Re-exports public API
     └── log_parser.py    # Parse Claude JSONL session logs (state, metadata, session lookup)
@@ -49,7 +51,7 @@ src/fujimoto/
 
 ### Entry Point
 
-`cli.py:main()` is the package entry point (`pyproject.toml` `[project.scripts]`). It:
+`cli.py:main()` is the package entry point (`pyproject.toml` `[project.scripts]`). It parses CLI args (`--version`/`-V` prints `fujimoto {version}` and exits) and otherwise:
 1. Runs the Textual `SessionApp` in a loop
 2. After the TUI exits, calls `launch_claude_in_tmux()` if the user selected a session
 3. When the tmux session is detached, the loop restarts and the TUI reappears
