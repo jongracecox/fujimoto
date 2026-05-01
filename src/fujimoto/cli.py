@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import sys
 import tempfile
 import textwrap
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,7 +12,7 @@ from pathlib import Path
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, VerticalScroll
+from textual.containers import Container, Vertical, VerticalScroll
 from textual.widgets import (
     Footer,
     Header,
@@ -51,6 +53,8 @@ from fujimoto.git import (
     remove_worktree,
 )
 from fujimoto.terminal import open_terminal
+from fujimoto.version import get_version
+from fujimoto.version_check import check_for_update, dismiss as dismiss_update_version
 from fujimoto.vscode import open_vscode
 from fujimoto.tmux import (
     TmuxError,
@@ -353,6 +357,37 @@ Screen {
 #project-list:focus > ListItem.--highlight {
     background: $accent;
 }
+
+#bottom-bar {
+    dock: bottom;
+    height: 2;
+}
+
+#version-label {
+    height: 1;
+    padding: 0 2;
+    text-align: right;
+    color: $text-muted;
+    background: $surface;
+}
+
+#bottom-bar Footer {
+    dock: initial;
+    height: 1;
+}
+
+#update-banner {
+    height: auto;
+    padding: 0 2;
+    margin-bottom: 1;
+    background: $accent;
+    color: $text;
+}
+
+#update-banner .hint {
+    color: $text-muted;
+    margin-top: 0;
+}
 """
 
 
@@ -376,6 +411,7 @@ class SessionApp(App):
         Binding("q", "quit", "Quit"),
         Binding("ctrl+c", "quit", "Quit", show=False),
         Binding("escape", "go_back", "Back", show=True),
+        Binding("d", "dismiss_update", "Dismiss update", show=False),
     ]
 
     def __init__(self) -> None:
@@ -401,11 +437,17 @@ class SessionApp(App):
         self._poll_timer: object | None = None
         self._claude_state_snapshot: dict[str, tuple[str, SessionState]] = {}
         self._resume_sessions: list[ClaudeSession] = []
+        self._update_banner_version: str | None = None
+        self._on_home: bool = False
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield VerticalScroll(id="main")
-        yield Footer()
+        yield Vertical(
+            Static(f"fujimoto v{get_version()}", id="version-label"),
+            Footer(),
+            id="bottom-bar",
+        )
 
     async def on_mount(self) -> None:
         try:
@@ -413,9 +455,33 @@ class SessionApp(App):
                 await self._show_tmux_install()
                 return
             self._init_git_info()
+            self._start_update_check()
             await self._show_home()
         except (ConfigError, GitError) as e:
             await self._show_error(str(e))
+
+    def _start_update_check(self) -> None:
+        def _run() -> None:
+            try:
+                latest, notify = check_for_update(get_version())
+            except Exception:  # noqa: BLE001
+                return
+            if notify and latest is not None:
+                self.call_from_thread(self._on_update_available, latest)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_update_available(self, latest: str) -> None:
+        self._update_banner_version = latest
+        if self._on_home:
+            self.run_worker(self._show_home(), exclusive=True)
+
+    async def action_dismiss_update(self) -> None:
+        if not self._update_banner_version or not self._on_home:
+            return
+        dismiss_update_version(self._update_banner_version)
+        self._update_banner_version = None
+        await self._show_home()
 
     def _init_git_info(self) -> None:
         cwd = self._project_cwd
@@ -443,6 +509,7 @@ class SessionApp(App):
 
     async def _clear_main(self) -> None:
         self._stop_polling()
+        self._on_home = False
         main = self.query_one("#main")
         await main.remove_children()
 
@@ -480,7 +547,21 @@ class SessionApp(App):
 
     async def _show_home(self) -> None:
         await self._clear_main()
+        self._on_home = True
         main = self.query_one("#main")
+
+        if self._update_banner_version is not None:
+            current = get_version()
+            await main.mount(
+                Container(
+                    Label(
+                        f"📦 fujimoto v{self._update_banner_version} is available "
+                        f"(current v{current})",
+                    ),
+                    Label("press d to dismiss", classes="hint"),
+                    id="update-banner",
+                )
+            )
 
         # Fetch Claude session data for state indicators
         path_to_latest, root_claude_sessions = _get_claude_sessions(
@@ -1757,6 +1838,15 @@ def _session_terminal_title(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(prog="fujimoto", add_help=True)
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"fujimoto {get_version()}",
+    )
+    parser.parse_args()
+
     try:
         issues = _check_prerequisites()
         if issues:
