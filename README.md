@@ -31,7 +31,21 @@ He carries himself with dignity, even in defeat. Your worktrees should too.
 
 ## Installation
 
-Install directly from GitHub:
+Install the latest release from PyPI (recommended):
+
+```sh
+uv tool install fujimoto
+```
+
+Upgrade to the latest release:
+
+```sh
+uv tool upgrade fujimoto
+```
+
+### Installing from source
+
+To pick up unreleased changes, install directly from GitHub:
 
 ```sh
 uv tool install git+https://github.com/jongracecox/fujimoto.git
