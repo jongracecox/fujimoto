@@ -11,6 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -18,21 +22,24 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
+      - name: Install Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --python ${{ matrix.python-version }}
 
       - name: Run tests
-        run: uv run pytest --cov-report=json:coverage.json
+        run: uv run --python ${{ matrix.python-version }} nox -s tests-${{ matrix.python-version }} -- --cov-report=json:coverage.json
 
       - name: Generate coverage badge
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && matrix.python-version == '3.13'
         run: |
           COVERAGE=$(uv run python -c "import json; print(int(json.load(open('coverage.json'))['totals']['percent_covered_display']))")
           uvx anybadge --value="$COVERAGE" --suffix="%" --file=coverage.svg --label=coverage \
             --overwrite 50=red 60=orange 70=yellow 80=green 90=brightgreen
 
       - name: Publish badge
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && matrix.python-version == '3.13'
         run: |
           cp coverage.svg /tmp/coverage.svg
           git config user.name "github-actions[bot]"

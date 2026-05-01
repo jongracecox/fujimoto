@@ -8,6 +8,9 @@ CLI/TUI tool for managing Claude Code sessions in git worktrees and repositories
 uv sync                                        # Install dependencies
 uv run fujimoto                          # Run locally (must be inside a git repo)
 uv run pytest                                  # Run tests with coverage
+uv run nox                                     # Run tests across all supported Python versions
+uv run nox -s tests-3.14                       # Run tests against a single Python version
+uv run nox -s tests_textual                    # Run dependency-pin matrix (textual)
 uv tool install --force --reinstall .          # Install globally (re-run after code changes)
 ```
 
@@ -30,7 +33,7 @@ switcher is silently hidden.
 
 ## Prerequisites
 
-- Python 3.11+
+- Python 3.11, 3.12, 3.13, or 3.14 (CI tests all four)
 - tmux (auto-installs via brew if missing)
 - git
 
@@ -196,6 +199,18 @@ uv run pytest
 ```
 
 Coverage is reported automatically (configured in `pyproject.toml`).
+
+### Matrix testing with nox
+
+`noxfile.py` defines sessions that run the test suite across Python versions and pinned dependency versions, using uv as the venv backend (`nox.options.default_venv_backend = "uv"`).
+
+- `uv run nox` — default session: `tests` against every supported Python (3.11–3.14). Each session runs `uv sync --active --group=dev` into the nox-managed venv, then `pytest`.
+- `uv run nox -s tests-3.14` — single Python version.
+- `uv run nox -s tests_textual` — parametrized over `TEXTUAL_VERSIONS` (currently 8.0.2 and 9.0.0). Add new versions to the constant in `noxfile.py` to extend the matrix.
+
+To add a new Python version: append it to `PYTHON_VERSIONS` in `noxfile.py`, add the classifier to `pyproject.toml`, and add the version to the CI matrix in `.github/workflows/tests.yml`. To add a dependency-pin matrix for a new package, follow the `tests_textual` pattern: define a `*_VERSIONS` list and parametrize a session with `@nox.parametrize`.
+
+CI runs the per-Python `tests` session as a GitHub Actions matrix; the coverage badge is generated only on the 3.13 job to avoid races.
 
 **Maximize test coverage.** Write tests for all new code — unit tests for logic, async TUI tests using Textual's `app.run_test()` pilot for UI flows. Only skip coverage for lines that are genuinely impractical to test (e.g. defensive error handlers in deeply nested async TUI paths that can't be triggered through the pilot). Use `# pragma: no cover` sparingly and only with justification.
 
