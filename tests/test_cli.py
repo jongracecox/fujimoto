@@ -93,6 +93,11 @@ def _patch_git_info(
 # -- main() tests --
 
 
+@pytest.fixture(autouse=True)
+def _clean_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("sys.argv", ["fujimoto"])
+
+
 class TestMain:
     def test_exits_on_config_error(self) -> None:
         with (
