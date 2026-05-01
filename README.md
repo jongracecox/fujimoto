@@ -26,7 +26,7 @@ He carries himself with dignity, even in defeat. Your worktrees should too.
 
 - Python 3.11+
 - git
-- tmux (the tool will offer to install it via brew if missing)
+- tmux (the tool will offer to install it via brew on macOS, or print the install command for your distro on Linux)
 - [uv](https://docs.astral.sh/uv/) package manager
 
 ## Installation
@@ -47,11 +47,12 @@ Re-run with `--force --reinstall` after local code changes to pick up updates.
 
 ## Configuration
 
-Both environment variables are optional:
+All environment variables are optional:
 
 ```sh
-export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/   # Optional: where worktrees are created
-export FUJIMOTO_GIT_ROOT=~/git/                  # Optional: enables project switching
+export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/   # Where worktrees are created
+export FUJIMOTO_GIT_ROOT=~/git/                  # Enables project switching
+export FUJIMOTO_TERMINAL="alacritty --working-directory {dir}"  # Linux-only: terminal command
 ```
 
 If `FUJIMOTO_WORKTREE_ROOT` is unset, worktrees are created inside the current
@@ -59,6 +60,13 @@ project at `<repo>/.fujimoto/worktrees/` (the `.fujimoto/` directory is
 auto-gitignored). If `FUJIMOTO_GIT_ROOT` is unset, the project switcher is
 hidden. Add these to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.) to
 persist them.
+
+### Platform support
+
+Fujimoto runs on macOS and Linux.
+
+- **macOS**: "Open terminal" uses iTerm2 if installed, otherwise Terminal.app. tmux is auto-installable via brew.
+- **Linux**: "Open terminal" uses `FUJIMOTO_TERMINAL` if set, otherwise auto-detects a common terminal emulator (gnome-terminal, konsole, kitty, alacritty, wezterm, foot, xfce4-terminal, tilix, terminator, xterm). `FUJIMOTO_TERMINAL` accepts a `{dir}` placeholder for the working directory; if absent, the directory is appended as the final argument. tmux must be installed manually — fujimoto will print the right command for your distro (apt-get / dnf / pacman / zypper / apk).
 
 ## Usage
 

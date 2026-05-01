@@ -26,8 +26,33 @@ def is_tmux_installed() -> bool:
     return shutil.which("tmux") is not None
 
 
+_LINUX_TMUX_HINTS: list[tuple[str, str]] = [
+    ("apt-get", "sudo apt-get install -y tmux"),
+    ("dnf", "sudo dnf install -y tmux"),
+    ("pacman", "sudo pacman -S --noconfirm tmux"),
+    ("zypper", "sudo zypper install -y tmux"),
+    ("apk", "sudo apk add tmux"),
+]
+
+
+def _linux_install_hint() -> str:
+    for binary, command in _LINUX_TMUX_HINTS:
+        if shutil.which(binary):
+            return command
+    return "your distribution's package manager"
+
+
 def install_tmux() -> None:
-    """Install tmux via brew. Raises TmuxError on failure."""
+    """Install tmux. Raises TmuxError on failure.
+
+    macOS: installs via brew. Linux: cannot install automatically (would
+    require sudo); instead raises a TmuxError with a distro-appropriate
+    install command for the user to run.
+    """
+    if sys.platform.startswith("linux"):
+        hint = _linux_install_hint()
+        raise TmuxError(f"tmux is not installed. Run: {hint}")
+
     if not shutil.which("brew"):
         raise TmuxError("brew is not installed. Install tmux manually.")
     result = subprocess.run(["brew", "install", "tmux"])

@@ -43,7 +43,10 @@ class TestIsTmuxInstalled:
 
 class TestInstallTmux:
     def test_raises_when_brew_missing(self) -> None:
-        with patch("fujimoto.tmux.shutil.which", return_value=None):
+        with (
+            patch("fujimoto.tmux.sys.platform", "darwin"),
+            patch("fujimoto.tmux.shutil.which", return_value=None),
+        ):
             with pytest.raises(TmuxError, match="brew is not installed"):
                 install_tmux()
 
@@ -54,6 +57,7 @@ class TestInstallTmux:
             return None
 
         with (
+            patch("fujimoto.tmux.sys.platform", "darwin"),
             patch("fujimoto.tmux.shutil.which", side_effect=which_side_effect),
             patch(
                 "fujimoto.tmux.subprocess.run",
@@ -76,6 +80,7 @@ class TestInstallTmux:
             return None  # Still not found after install
 
         with (
+            patch("fujimoto.tmux.sys.platform", "darwin"),
             patch("fujimoto.tmux.shutil.which", side_effect=which_side_effect),
             patch(
                 "fujimoto.tmux.subprocess.run",
@@ -83,6 +88,36 @@ class TestInstallTmux:
             ),
         ):
             with pytest.raises(TmuxError, match="not found on PATH"):
+                install_tmux()
+
+    def test_linux_raises_with_apt_hint(self) -> None:
+        def which_side_effect(cmd: str) -> str | None:
+            return "/usr/bin/apt-get" if cmd == "apt-get" else None
+
+        with (
+            patch("fujimoto.tmux.sys.platform", "linux"),
+            patch("fujimoto.tmux.shutil.which", side_effect=which_side_effect),
+        ):
+            with pytest.raises(TmuxError, match="apt-get install"):
+                install_tmux()
+
+    def test_linux_raises_with_pacman_hint(self) -> None:
+        def which_side_effect(cmd: str) -> str | None:
+            return "/usr/bin/pacman" if cmd == "pacman" else None
+
+        with (
+            patch("fujimoto.tmux.sys.platform", "linux"),
+            patch("fujimoto.tmux.shutil.which", side_effect=which_side_effect),
+        ):
+            with pytest.raises(TmuxError, match="pacman -S"):
+                install_tmux()
+
+    def test_linux_raises_with_generic_hint_when_no_pkg_manager(self) -> None:
+        with (
+            patch("fujimoto.tmux.sys.platform", "linux"),
+            patch("fujimoto.tmux.shutil.which", return_value=None),
+        ):
+            with pytest.raises(TmuxError, match="package manager"):
                 install_tmux()
 
 

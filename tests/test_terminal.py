@@ -9,8 +9,10 @@ import pytest
 
 from fujimoto.terminal import (
     _applescript_quote,
+    _format_args,
     _has_iterm,
     _open_iterm,
+    _open_linux_terminal,
     _open_terminal_app,
     open_terminal,
 )
@@ -63,29 +65,105 @@ class TestOpenTerminalApp:
         )
 
 
-class TestOpenTerminal:
-    @patch("fujimoto.terminal.shutil.which", return_value=None)
-    def test_raises_on_non_macos(self, _mock: object) -> None:
-        with pytest.raises(OSError, match="osascript not found"):
-            open_terminal(Path("/tmp/test"))
+class TestFormatArgs:
+    def test_substitutes_placeholder(self) -> None:
+        assert _format_args(["--cwd", "{dir}"], Path("/tmp/x")) == ["--cwd", "/tmp/x"]
 
+    def test_substitutes_inline(self) -> None:
+        assert _format_args(["--working-directory={dir}"], Path("/tmp/x")) == [
+            "--working-directory=/tmp/x"
+        ]
+
+    def test_appends_when_no_placeholder(self) -> None:
+        assert _format_args(["-e", "bash"], Path("/tmp/x")) == ["-e", "bash", "/tmp/x"]
+
+
+class TestOpenTerminalMacOS:
+    @patch("fujimoto.terminal.sys.platform", "darwin")
     @patch("fujimoto.terminal.subprocess.run")
     @patch("fujimoto.terminal._has_iterm", return_value=True)
-    @patch("fujimoto.terminal.shutil.which", return_value="/usr/bin/osascript")
-    def test_uses_iterm_when_available(
-        self, _which: object, _has: object, mock_run: object
-    ) -> None:
+    def test_uses_iterm_when_available(self, _has: object, mock_run: object) -> None:
         open_terminal(Path("/tmp/test"))
         args = mock_run.call_args  # type: ignore[union-attr]
         assert args[0][0][0] == "osascript"
 
+    @patch("fujimoto.terminal.sys.platform", "darwin")
     @patch("fujimoto.terminal.subprocess.run")
     @patch("fujimoto.terminal._has_iterm", return_value=False)
-    @patch("fujimoto.terminal.shutil.which", return_value="/usr/bin/osascript")
-    def test_falls_back_to_terminal_app(
-        self, _which: object, _has: object, mock_run: object
-    ) -> None:
+    def test_falls_back_to_terminal_app(self, _has: object, mock_run: object) -> None:
         open_terminal(Path("/tmp/test"))
         mock_run.assert_called_once_with(  # type: ignore[union-attr]
             ["open", "-a", "Terminal", "/tmp/test"], check=True
         )
+
+
+class TestOpenLinuxTerminal:
+    @patch("fujimoto.terminal.subprocess.Popen")
+    @patch("fujimoto.terminal.shutil.which")
+    def test_uses_first_found_terminal(
+        self, mock_which: object, mock_popen: object
+    ) -> None:
+        # Only gnome-terminal is on PATH (after x-terminal-emulator misses)
+        def which(cmd: str) -> str | None:
+            return "/usr/bin/gnome-terminal" if cmd == "gnome-terminal" else None
+
+        mock_which.side_effect = which  # type: ignore[union-attr]
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+
+            os.environ.pop("FUJIMOTO_TERMINAL", None)
+            _open_linux_terminal(Path("/tmp/x"))
+
+        cmd = mock_popen.call_args[0][0]  # type: ignore[union-attr]
+        assert cmd[0] == "gnome-terminal"
+        assert "--working-directory=/tmp/x" in cmd
+
+    @patch("fujimoto.terminal.subprocess.Popen")
+    @patch("fujimoto.terminal.shutil.which", return_value="/usr/bin/alacritty")
+    def test_uses_custom_env_var(self, _which: object, mock_popen: object) -> None:
+        with patch.dict(
+            "os.environ",
+            {"FUJIMOTO_TERMINAL": "alacritty --working-directory {dir}"},
+        ):
+            _open_linux_terminal(Path("/tmp/x"))
+
+        cmd = mock_popen.call_args[0][0]  # type: ignore[union-attr]
+        assert cmd == ["alacritty", "--working-directory", "/tmp/x"]
+
+    @patch("fujimoto.terminal.subprocess.Popen")
+    @patch("fujimoto.terminal.shutil.which", return_value="/usr/bin/myterm")
+    def test_env_var_appends_dir_without_placeholder(
+        self, _which: object, mock_popen: object
+    ) -> None:
+        with patch.dict("os.environ", {"FUJIMOTO_TERMINAL": "myterm -e bash"}):
+            _open_linux_terminal(Path("/tmp/x"))
+
+        cmd = mock_popen.call_args[0][0]  # type: ignore[union-attr]
+        assert cmd == ["myterm", "-e", "bash", "/tmp/x"]
+
+    @patch("fujimoto.terminal.shutil.which", return_value=None)
+    def test_env_var_missing_executable_raises(self, _which: object) -> None:
+        with patch.dict("os.environ", {"FUJIMOTO_TERMINAL": "nope --foo"}):
+            with pytest.raises(OSError, match="not on PATH"):
+                _open_linux_terminal(Path("/tmp/x"))
+
+    @patch("fujimoto.terminal.shutil.which", return_value=None)
+    def test_no_terminal_found_raises(self, _which: object) -> None:
+        import os
+
+        os.environ.pop("FUJIMOTO_TERMINAL", None)
+        with pytest.raises(OSError, match="No supported terminal"):
+            _open_linux_terminal(Path("/tmp/x"))
+
+
+class TestOpenTerminalDispatch:
+    @patch("fujimoto.terminal.sys.platform", "linux")
+    @patch("fujimoto.terminal._open_linux_terminal")
+    def test_linux_dispatches_to_linux_handler(self, mock_handler: object) -> None:
+        open_terminal(Path("/tmp/x"))
+        mock_handler.assert_called_once_with(Path("/tmp/x"))  # type: ignore[union-attr]
+
+    @patch("fujimoto.terminal.sys.platform", "win32")
+    def test_unsupported_platform_raises(self) -> None:
+        with pytest.raises(OSError, match="not supported on platform"):
+            open_terminal(Path("/tmp/x"))
