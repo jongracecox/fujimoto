@@ -219,6 +219,15 @@ Things discovered during development that are easy to forget:
 - **Claude log entry types evolve** — real logs contain `last-prompt`, `queue-operation`, `progress` and other types beyond `assistant`/`user`/`system`/`file-history-snapshot`. The parser skips unrecognized types gracefully. `last-prompt` signals session end → `IDLE` state. `stop_reason=None` on assistant entries means interrupted/canceled (Esc) → `WAITING_FOR_USER`. Always smoke-test against real `~/.claude/projects/` data after changes.
 - **Shift+Enter in tmux requires `extended-keys always` globally** — tmux strips modifier info by default, making Shift+Enter identical to Enter. The fix requires two server/global-level settings: `set-option -g extended-keys always` and `set-option -s -a terminal-features xterm*:extkeys`. Per-session (`-t`) doesn't work. `extended-keys on` (vs `always`) doesn't work because Claude Code doesn't send the kitty keyboard protocol activation sequence. Requires tmux 3.2+. See `_ensure_extended_keys()` in `tmux.py`.
 
+## Releases
+
+Releases are published to PyPI by `.github/workflows/release.yml` on `v*`
+tag push. The package version is **derived from the git tag** by `hatch-vcs`
+(`dynamic = ["version"]` in `pyproject.toml`) — do not add a static `version`
+field, do not edit a version string when cutting a release. The release flow,
+recovery procedures, and one-time setup are documented in
+[CONTRIBUTING.md](CONTRIBUTING.md#releasing).
+
 ## Git Commits and PRs
 
 Do not mention Claude or AI when authoring git commits or pull requests. No co-authored-by lines referencing Claude.
