@@ -18,7 +18,12 @@ def open_vscode(directory: Path) -> None:
     Raises ``OSError`` if the ``code`` CLI is not found.
     """
     if not _has_vscode():
-        msg = "'code' CLI not found — install it from VS Code: Cmd+Shift+P → 'Shell Command: Install code command in PATH'"
+        msg = (
+            "'code' CLI not found on PATH. On macOS, install it from VS Code: "
+            "Cmd+Shift+P → 'Shell Command: Install code command in PATH'. "
+            "On Linux, install VS Code via your package manager (the 'code' "
+            "command is included)."
+        )
         raise OSError(msg)
 
     subprocess.run(["code", str(directory)], check=True)

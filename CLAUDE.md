@@ -16,7 +16,12 @@ uv tool install --force --reinstall .          # Install globally (re-run after 
 ```sh
 export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/   # Optional: where worktrees are created
 export FUJIMOTO_GIT_ROOT=~/git/                  # Optional: enables project switching
+export FUJIMOTO_TERMINAL="alacritty --working-directory {dir}"  # Optional (Linux): terminal command
 ```
+
+`FUJIMOTO_TERMINAL` only applies on Linux. Use `{dir}` as a placeholder for the
+working directory; if absent, the directory is appended as the final argument.
+If unset, fujimoto auto-detects a common terminal emulator on PATH.
 
 If `FUJIMOTO_WORKTREE_ROOT` is unset, worktrees are created at
 `<repo_root>/.fujimoto/worktrees/` (the `.fujimoto/` directory is auto-gitignored
@@ -107,17 +112,19 @@ src/fujimoto/
 - `cherry_pick_branch(branch, onto)` — cherry-picks commit range onto target
 
 **`terminal.py`** — Open native terminal windows in a session's directory:
-- `open_terminal(directory)` — opens iTerm2 if installed, otherwise Terminal.app. Raises `OSError` on non-macOS.
+- `open_terminal(directory)` — platform dispatch. macOS: iTerm2 (if installed) → Terminal.app. Linux: `FUJIMOTO_TERMINAL` env var → auto-detected emulator. Raises `OSError` on unsupported platforms or when no terminal is found.
 - `_has_iterm()` — checks for `/Applications/iTerm.app`
 - `_open_iterm(directory)` — AppleScript to create new iTerm2 window
 - `_open_terminal_app(directory)` — `open -a Terminal` fallback
+- `_open_linux_terminal(directory)` — uses `FUJIMOTO_TERMINAL` if set; otherwise probes `_LINUX_TERMINALS` (gnome-terminal, konsole, kitty, alacritty, wezterm, foot, xfce4-terminal, tilix, terminator, xterm) and spawns the first one found via `subprocess.Popen` with `start_new_session=True` so it survives parent exit.
+- `_format_args(args, directory)` — substitutes `{dir}` placeholder; appends directory if no placeholder present.
 
 **`vscode.py`** — Open directories in VS Code:
 - `open_vscode(directory)` — runs `code <directory>`. Raises `OSError` if the `code` CLI is not on PATH.
 - `_has_vscode()` — checks for `code` on PATH via `shutil.which`
 
 **`tmux.py`** — tmux session management:
-- `is_tmux_installed()` / `install_tmux()` — detection and brew install
+- `is_tmux_installed()` / `install_tmux()` — detection and install. macOS: brew install. Linux: raises `TmuxError` with a distro-appropriate install command (apt-get/dnf/pacman/zypper/apk) — does not invoke sudo automatically.
 - `list_all_sessions()` — lists all active tmux session names
 - `list_project_sessions(project)` — lists active tmux sessions for a project
 - `session_name(project, dir)` — naming convention: `{project}/{dir}`

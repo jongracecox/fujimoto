@@ -534,7 +534,14 @@ class SessionApp(App):
                 Static("tmux is required to manage sessions."),
                 Static(""),
                 ListView(
-                    ListItem(Label("Install with brew"), id="install-tmux"),
+                    ListItem(
+                        Label(
+                            "Install with brew"
+                            if sys.platform == "darwin"
+                            else "Show install command"
+                        ),
+                        id="install-tmux",
+                    ),
                     ListItem(Label("Quit"), id="quit-app"),
                     id="tmux-install-list",
                 ),
