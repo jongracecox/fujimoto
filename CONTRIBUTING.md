@@ -108,6 +108,62 @@ The `claude/` subpackage parses Claude Code's JSONL session logs (`~/.claude/pro
 - Path encoding matches Claude's convention: `str(path).replace("/", "-")`
 - Test with `tmp_path` fixtures — never access real `~/.claude/` in tests
 
+## Releasing
+
+Releases are published to PyPI automatically by `.github/workflows/release.yml`
+when a tag matching `v*` is pushed.
+
+### Versioning
+
+The package version is derived from git tags by `hatch-vcs` — there is **no**
+`version` field in `pyproject.toml` to maintain. The version of a built
+artifact is whatever git tag points at the build commit (e.g. tag `v0.1.1` →
+package version `0.1.1`). Builds from untagged commits get a dev version like
+`0.1.1.dev3`.
+
+### Cutting a release
+
+```sh
+git checkout main
+git pull
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+The workflow will then:
+
+1. **Build** sdist + wheel with `uv build` (single artifact reused by both
+   publish jobs).
+2. **Publish to TestPyPI** — waits for manual approval in the `testpypi`
+   GitHub environment. After approval, uploads via OIDC trusted publishing.
+3. **Publish to PyPI** — waits for a second manual approval in the `pypi`
+   environment, then uploads.
+
+Approve in **Actions → release run → Review deployments**. Between the two
+approvals, sanity-check the upload at https://test.pypi.org/project/fujimoto/.
+
+### Recovering from a bad release
+
+PyPI/TestPyPI versions are immutable — you cannot re-upload `v0.1.1` once
+published. To fix issues:
+
+- **Caught at TestPyPI stage**: reject the PyPI deployment in Actions, fix
+  the problem, push a new tag (e.g. `v0.1.2`).
+- **Caught after PyPI publish**: yank the broken version on pypi.org
+  (Manage → Yank), then push a fix tag.
+
+Never delete and re-push a tag — the immutability rule still applies on the
+registry side.
+
+### One-time setup (already done)
+
+- TestPyPI and PyPI projects exist with pending trusted publishers configured
+  for this repo, workflow `release.yml`, environments `testpypi` and `pypi`.
+- GitHub `testpypi` and `pypi` environments exist with required reviewers.
+
+If these need to be reconfigured, see PyPA's Trusted Publishing docs:
+https://docs.pypi.org/trusted-publishers/
+
 ## Testing Manually
 
 1. Run `fujimoto` from a git repo
