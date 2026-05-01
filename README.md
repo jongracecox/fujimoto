@@ -38,12 +38,18 @@ Re-run with `--force --reinstall` after local code changes to pick up updates.
 
 ## Configuration
 
+Both environment variables are optional:
+
 ```sh
-export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/   # Where worktrees are created
-export FUJIMOTO_GIT_ROOT=~/git/                   # Optional: enables project switching
+export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/   # Optional: where worktrees are created
+export FUJIMOTO_GIT_ROOT=~/git/                  # Optional: enables project switching
 ```
 
-Add these to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.) to persist them.
+If `FUJIMOTO_WORKTREE_ROOT` is unset, worktrees are created inside the current
+project at `<repo>/.fujimoto/worktrees/` (the `.fujimoto/` directory is
+auto-gitignored). If `FUJIMOTO_GIT_ROOT` is unset, the project switcher is
+hidden. Add these to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.) to
+persist them.
 
 ## Usage
 

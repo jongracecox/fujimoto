@@ -67,15 +67,26 @@ class TestGetWorktreeRoot:
             assert result == new_dir
             assert result.is_dir()
 
-    def test_raises_when_unset(self) -> None:
+    def test_raises_when_unset_and_no_project_root(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
             with pytest.raises(ConfigError, match="FUJIMOTO_WORKTREE_ROOT"):
                 get_worktree_root()
 
-    def test_raises_when_empty(self) -> None:
-        with patch.dict("os.environ", {"FUJIMOTO_WORKTREE_ROOT": ""}):
-            with pytest.raises(ConfigError):
-                get_worktree_root()
+    def test_falls_back_to_project_root_when_unset(self, tmp_path: Path) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            result = get_worktree_root(tmp_path)
+            assert result == tmp_path / ".fujimoto" / "worktrees"
+            assert result.is_dir()
+            gitignore = tmp_path / ".fujimoto" / ".gitignore"
+            assert gitignore.read_text() == "*\n"
+
+    def test_env_var_takes_precedence_over_project_root(self, tmp_path: Path) -> None:
+        env_root = tmp_path / "env-root"
+        proj_root = tmp_path / "proj"
+        proj_root.mkdir()
+        with patch.dict("os.environ", {"FUJIMOTO_WORKTREE_ROOT": str(env_root)}):
+            result = get_worktree_root(proj_root)
+            assert result == env_root
 
     def test_expands_tilde(self) -> None:
         with patch.dict(
@@ -190,6 +201,25 @@ class TestGetProjectWorktreesDir:
         ):
             result = get_project_worktrees_dir("my-project")
             assert result == tmp_path / "my-project"
+
+    def test_uses_in_project_fallback_when_env_unset(self, tmp_path: Path) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            result = get_project_worktrees_dir("my-project", tmp_path)
+            assert result == tmp_path / ".fujimoto" / "worktrees"
+
+
+class TestBuildWorktreePathFallback:
+    def test_in_project_layout_when_env_unset(self, tmp_path: Path) -> None:
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("fujimoto.config.date") as mock_date,
+        ):
+            mock_date.today.return_value.strftime.return_value = "20260309"
+            result = build_worktree_path("my-project", "fix unit tests", tmp_path)
+            assert (
+                result
+                == tmp_path / ".fujimoto" / "worktrees" / "20260309-fix-unit-tests"
+            )
 
 
 class TestStoreSessionMeta:

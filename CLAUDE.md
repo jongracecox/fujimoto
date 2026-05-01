@@ -11,12 +11,17 @@ uv run pytest                                  # Run tests with coverage
 uv tool install --force --reinstall .          # Install globally (re-run after code changes)
 ```
 
-## Required Environment Variables
+## Environment Variables (all optional)
 
 ```sh
-export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/   # Where worktrees are created
+export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/   # Optional: where worktrees are created
 export FUJIMOTO_GIT_ROOT=~/git/                  # Optional: enables project switching
 ```
+
+If `FUJIMOTO_WORKTREE_ROOT` is unset, worktrees are created at
+`<repo_root>/.fujimoto/worktrees/` (the `.fujimoto/` directory is auto-gitignored
+via a `.gitignore` containing `*`). If `FUJIMOTO_GIT_ROOT` is unset, the project
+switcher is silently hidden.
 
 ## Prerequisites
 
@@ -71,12 +76,12 @@ src/fujimoto/
 ### Module Responsibilities
 
 **`config.py`** — Pure functions, no side effects except directory creation:
-- `get_worktree_root()` — reads `FUJIMOTO_WORKTREE_ROOT`, raises `ConfigError` if unset
+- `get_worktree_root(project_root=None)` — returns `FUJIMOTO_WORKTREE_ROOT` if set, else falls back to `<project_root>/.fujimoto/worktrees/` (ensures `.fujimoto/.gitignore` exists). Raises `ConfigError` only if both are missing.
 - `get_git_projects_root()` — reads `FUJIMOTO_GIT_ROOT`, returns `None` if unset
 - `list_projects()` — scans git root for directories containing `.git`
 - `slugify(title)` — lowercase, replace non-alphanumeric with hyphens, strip/collapse
-- `build_worktree_path(project, title)` — `{root}/{project}/{YYYYMMDD}-{slug}`
-- `get_project_worktrees_dir(project)` — `{root}/{project}`
+- `build_worktree_path(project, title, project_root=None)` — with env var: `{root}/{project}/{YYYYMMDD}-{slug}`; with fallback: `<project_root>/.fujimoto/worktrees/{YYYYMMDD}-{slug}`
+- `get_project_worktrees_dir(project, project_root=None)` — with env var: `{root}/{project}`; with fallback: `<project_root>/.fujimoto/worktrees/`
 - `store_session_meta(path, base_branch)` / `read_session_meta(path)` — JSON metadata
 - `get_next_direct_session_name(project, sessions)` — computes `{project}/direct-N`
 - `get_next_adhoc_session_name(sessions)` — computes `adhoc-N`
