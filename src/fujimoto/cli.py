@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -427,7 +428,6 @@ class SessionApp(App):
         self._start_point: str = ""
         self._worktree_path: Path | None = None
         self._launch_target: tuple[str, Path, str | None, str, str | None] | None = None
-        self._shell_target: Path | None = None
         self._project_root: Path | None = None
         self._existing_worktrees: list[Path] = []
         self._session_map: dict[str, SessionInfo] = {}
@@ -867,18 +867,20 @@ class SessionApp(App):
             items.append(
                 ListItem(Label("Resume previous session"), id="sa-resume-picker")
             )
-            items.append(ListItem(Label("Terminate session"), id="sa-terminate"))
         else:
             items.append(ListItem(Label("Launch"), id="sa-launch"))
             items.append(
                 ListItem(Label("Resume previous session"), id="sa-resume-picker")
             )
 
+        items.append(ListItem(Label("Open terminal"), id="sa-terminal"))
+        items.append(ListItem(Label("Open in VS Code"), id="sa-vscode"))
+
         if session.session_type != "claude":
             items.append(ListItem(Label("Rename"), id="sa-rename"))
 
-        items.append(ListItem(Label("Open terminal"), id="sa-terminal"))
-        items.append(ListItem(Label("Open in VS Code"), id="sa-vscode"))
+        if session.session_type != "claude" and session.is_active:
+            items.append(ListItem(Label("Terminate session"), id="sa-terminate"))
 
         if session.session_type == "worktree":
             items.append(ListItem(Label("Finish (cleanup/merge)"), id="sa-finish"))
@@ -1064,8 +1066,8 @@ class SessionApp(App):
         main = self.query_one("#main")
 
         items = [
-            ListItem(Label("New window"), id="term-window"),
             ListItem(Label("This window (drop into shell)"), id="term-this"),
+            ListItem(Label("New window"), id="term-window"),
             ListItem(Label("[dim]Cancel[/]", markup=True), id="term-cancel"),
         ]
 
@@ -1097,8 +1099,14 @@ class SessionApp(App):
             except (ConfigError, GitError) as e:  # pragma: no cover
                 await self._show_error(str(e))
         elif action == "term-this":
-            self._shell_target = session.path
-            self.exit()
+            shell = os.environ.get("SHELL", "/bin/sh")
+            try:
+                with self.suspend():
+                    subprocess.run([shell], cwd=session.path, check=False)
+            except OSError as e:
+                await self._show_error(f"Failed to launch shell {shell!r}: {e}")
+                return
+            await self._show_session_actions(session)
         elif action == "term-cancel":
             await self._show_session_actions(session)
 
@@ -1924,24 +1932,6 @@ def _session_terminal_title(
     return f"{prefix} - {suffix}"
 
 
-def _exec_shell_in(directory: Path) -> None:
-    """Replace the current fujimoto process with an interactive shell in ``directory``.
-
-    Uses ``os.execvp`` so when the user runs ``exit`` they return directly to
-    whatever shell originally launched fujimoto — there is no nested process.
-    """
-    shell = os.environ.get("SHELL", "/bin/sh")
-    try:
-        os.chdir(directory)
-    except OSError as e:  # pragma: no cover - directory existed in TUI
-        print(f"fujimoto: cannot enter {directory}: {e}", file=sys.stderr)
-        sys.exit(1)
-    try:
-        os.execvp(shell, [shell])
-    except OSError:  # pragma: no cover - $SHELL unusable
-        os.execvp("/bin/sh", ["/bin/sh"])
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(prog="fujimoto", add_help=True)
     parser.add_argument(
@@ -1964,12 +1954,6 @@ def main() -> None:
             set_terminal_title(f"{ICON_WIZARD} fujimoto")
             app = SessionApp()
             app.run()
-
-            shell_target = getattr(app, "_shell_target", None)
-            if shell_target:
-                set_terminal_title("")
-                _exec_shell_in(shell_target)
-                return  # pragma: no cover
 
             if app._launch_target:
                 project_name, working_dir, tmux_name, session_type, resume_id = (
