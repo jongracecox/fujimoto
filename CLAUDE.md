@@ -156,7 +156,7 @@ Otherwise it:
 - `create_session(name, dir, system_prompt, resume_session_id)` — creates detached session, sets prefix to Ctrl+A, runs `claude` (with optional `--resume`)
 - `create_session_with_command(name, dir, command)` — like `create_session` but with custom command
 - `kill_session(name)` — `tmux kill-session -t`
-- `attach_session(name)` — prints shortcut banner, then `subprocess.run` tmux attach (returns on detach)
+- `attach_session(name)` — `subprocess.run` tmux attach (returns on detach). Shortcut hints live in the per-session tmux status bar, not in a pre-attach banner.
 - `launch_claude_in_tmux(project, path, tmux_name, system_prompt, resume_session_id)` — orchestrates create-or-attach, supports resuming previous Claude sessions
 - `get_session_path(name)` — returns the start directory of a tmux session via `display-message -p '#{session_path}'`, used by the `fujimoto pane` subcommand
 - `display_message(name, message)` — surface a transient message in the session's status bar, used to report errors from `fujimoto pane` back into the session
@@ -209,7 +209,7 @@ Three custom exception types, all caught in `main()`:
 ### Key Design Decisions
 
 - **TUI loop with tmux detach**: The TUI runs in a `while True` loop. After tmux detach (subprocess.run returns), the loop restarts and the TUI reappears. The loop breaks when the user quits without selecting a session.
-- **Per-session tmux config**: Prefix remapped to Ctrl+A, status bar with shortcut hints — all set via `tmux set-option -t` so the user's global config is untouched.
+- **Per-session tmux config**: Prefix remapped to Ctrl+A, status bar with shortcut hints — all set via `tmux set-option -t` so the user's global config is untouched. The attach flow is silent (no pre-attach banner) to reduce noise when launching sessions repeatedly.
 - **Global install via `uv tool`**: Requires `--force --reinstall` to rebuild the wheel from source. Plain `--force` reuses cached builds.
 - **Session metadata**: `.fujimoto/meta.json` stored in worktree directory records the base branch for cherry-pick targeting. The `.fujimoto/` directory contains a `.gitignore` with `*` so its contents are automatically ignored by git.
 - **Background PR creation**: Uses `claude -p --allowedTools "Bash(git:*) Bash(gh:*)"` in a tmux session for unattended PR creation.
