@@ -9,10 +9,18 @@ from pathlib import Path
 META_KEY_ENV = "FUJIMOTO_META_KEY"
 DEFAULT_META_KEY = "C-f"
 
+QUICK_TERMINAL_KEY_ENV = "FUJIMOTO_QUICK_TERMINAL_KEY"
+DEFAULT_QUICK_TERMINAL_KEY = "C-`"
+
 
 def _meta_key() -> str:
     """Return the configured fujimoto meta key, or empty string if disabled."""
     return os.environ.get(META_KEY_ENV, DEFAULT_META_KEY)
+
+
+def quick_terminal_key() -> str:
+    """Return the configured quick-terminal key, or empty string if disabled."""
+    return os.environ.get(QUICK_TERMINAL_KEY_ENV, DEFAULT_QUICK_TERMINAL_KEY)
 
 
 def _meta_key_label(key: str) -> str:
@@ -188,6 +196,55 @@ def _ensure_extended_keys() -> None:
         )
 
 
+def _apply_quick_terminal_setting() -> None:
+    """Re-apply the quick-terminal binding if the user has enabled it.
+
+    Called on every session create so the binding survives a tmux server
+    restart. Imported lazily to avoid a circular dependency at module load.
+    """
+    from fujimoto.settings import load_settings
+
+    if load_settings().quick_terminal_enabled:
+        enable_quick_terminal_binding()
+
+
+def enable_quick_terminal_binding() -> None:
+    """Install the server-global Ctrl-` (or configured key) quick-terminal toggle.
+
+    First press splits a 30% bottom pane in the current pane's working
+    directory; subsequent presses cycle focus between the two panes.
+    No-op when the key env override is empty or no tmux server is running.
+    """
+    key = quick_terminal_key()
+    if not key:
+        return
+    subprocess.run(
+        [
+            "tmux",
+            "bind-key",
+            "-n",
+            key,
+            "if-shell",
+            "-F",
+            "#{==:#{window_panes},1}",
+            'split-window -v -l 30% -c "#{pane_current_path}"',
+            "select-pane -t :.+",
+        ],
+        capture_output=True,
+    )
+
+
+def disable_quick_terminal_binding() -> None:
+    """Remove the server-global quick-terminal binding, if present."""
+    key = quick_terminal_key()
+    if not key:
+        return
+    subprocess.run(
+        ["tmux", "unbind-key", "-n", key],
+        capture_output=True,
+    )
+
+
 def _configure_session(name: str) -> None:
     """Apply standard tmux configuration to a session."""
     meta_key = _meta_key()
@@ -308,6 +365,7 @@ def create_session(
     )
     _configure_session(name)
     _ensure_extended_keys()
+    _apply_quick_terminal_setting()
 
 
 def create_session_with_command(name: str, working_dir: Path, command: str) -> None:
@@ -327,6 +385,7 @@ def create_session_with_command(name: str, working_dir: Path, command: str) -> N
     )
     _configure_session(name)
     _ensure_extended_keys()
+    _apply_quick_terminal_setting()
 
 
 def attach_session(name: str) -> None:

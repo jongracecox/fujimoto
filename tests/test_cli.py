@@ -17,6 +17,7 @@ from fujimoto.cli import (
     SessionApp,
     _claude_state_label,
     _format_prompt_lines,
+    _friendly_key_label,
     _get_claude_sessions,
     _relative_time,
     main,
@@ -83,6 +84,12 @@ def _patch_git_info(
             patch(
                 "fujimoto.cli.check_for_update",
                 return_value=(None, False),
+            ),
+            patch(
+                "fujimoto.cli.load_settings",
+                return_value=__import__(
+                    "fujimoto.settings", fromlist=["Settings"]
+                ).Settings(quick_terminal_enabled=False),
             ),
         ):
             yield
@@ -2842,3 +2849,230 @@ class TestUpdateBanner:
                 label = app.query_one("#version-label")
                 rendered = str(label.render())
                 assert rendered.startswith("fujimoto v")
+
+
+class TestQuickTerminalPromptAndToggle:
+    @pytest.mark.asyncio
+    async def test_first_launch_shows_modal_when_setting_unset(self) -> None:
+        from fujimoto.cli import QuickTerminalPrompt
+        from fujimoto.settings import Settings
+
+        with (
+            _patch_git_info(),
+            patch(
+                "fujimoto.cli.load_settings",
+                return_value=Settings(quick_terminal_enabled=None),
+            ),
+            patch("fujimoto.cli.quick_terminal_key", return_value="C-`"),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert isinstance(app.screen, QuickTerminalPrompt)
+                # Home is rendered underneath so the toggle row exists.
+                assert len(app.query("#home-list")) == 1
+
+    @pytest.mark.asyncio
+    async def test_first_launch_skips_modal_when_env_disables_key(self) -> None:
+        from fujimoto.cli import QuickTerminalPrompt
+        from fujimoto.settings import Settings
+
+        with (
+            _patch_git_info(),
+            patch(
+                "fujimoto.cli.load_settings",
+                return_value=Settings(quick_terminal_enabled=None),
+            ),
+            patch("fujimoto.cli.quick_terminal_key", return_value=""),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert not isinstance(app.screen, QuickTerminalPrompt)
+                assert len(app.query("#home-list")) == 1
+
+    @pytest.mark.asyncio
+    async def test_modal_yes_saves_true_and_enables_binding(self) -> None:
+        from fujimoto.settings import Settings
+
+        with (
+            _patch_git_info(),
+            patch(
+                "fujimoto.cli.load_settings",
+                return_value=Settings(quick_terminal_enabled=None),
+            ),
+            patch("fujimoto.cli.quick_terminal_key", return_value="C-`"),
+            patch("fujimoto.cli.save_settings") as mock_save,
+            patch("fujimoto.cli.enable_quick_terminal_binding") as mock_enable,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("y")
+                await pilot.pause()
+                mock_save.assert_called_once_with(Settings(quick_terminal_enabled=True))
+                mock_enable.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_modal_no_saves_false_and_skips_binding(self) -> None:
+        from fujimoto.settings import Settings
+
+        with (
+            _patch_git_info(),
+            patch(
+                "fujimoto.cli.load_settings",
+                return_value=Settings(quick_terminal_enabled=None),
+            ),
+            patch("fujimoto.cli.quick_terminal_key", return_value="C-`"),
+            patch("fujimoto.cli.save_settings") as mock_save,
+            patch("fujimoto.cli.enable_quick_terminal_binding") as mock_enable,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("n")
+                await pilot.pause()
+                mock_save.assert_called_once_with(
+                    Settings(quick_terminal_enabled=False)
+                )
+                mock_enable.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_modal_escape_saves_false(self) -> None:
+        from fujimoto.settings import Settings
+
+        with (
+            _patch_git_info(),
+            patch(
+                "fujimoto.cli.load_settings",
+                return_value=Settings(quick_terminal_enabled=None),
+            ),
+            patch("fujimoto.cli.quick_terminal_key", return_value="C-`"),
+            patch("fujimoto.cli.save_settings") as mock_save,
+            patch("fujimoto.cli.enable_quick_terminal_binding") as mock_enable,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("escape")
+                await pilot.pause()
+                mock_save.assert_called_once_with(
+                    Settings(quick_terminal_enabled=False)
+                )
+                mock_enable.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_home_toggle_off_to_on(self) -> None:
+        from fujimoto.settings import Settings
+
+        load_calls: list[Settings] = []
+
+        def fake_load() -> Settings:
+            # First call: in on_mount → False (skip prompt).
+            # Subsequent: reflect current toggle state.
+            if not load_calls:
+                load_calls.append(Settings(quick_terminal_enabled=False))
+                return load_calls[-1]
+            return load_calls[-1]
+
+        with (
+            _patch_git_info(),
+            patch("fujimoto.cli.load_settings", side_effect=fake_load),
+            patch("fujimoto.cli.quick_terminal_key", return_value="C-`"),
+            patch("fujimoto.cli.save_settings") as mock_save,
+            patch("fujimoto.cli.enable_quick_terminal_binding") as mock_enable,
+            patch("fujimoto.cli.disable_quick_terminal_binding") as mock_disable,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await app._toggle_quick_terminal()
+                await pilot.pause()
+                mock_save.assert_called_once_with(Settings(quick_terminal_enabled=True))
+                mock_enable.assert_called_once()
+                mock_disable.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_home_toggle_on_to_off(self) -> None:
+        from fujimoto.settings import Settings
+
+        with (
+            _patch_git_info(),
+            patch(
+                "fujimoto.cli.load_settings",
+                return_value=Settings(quick_terminal_enabled=True),
+            ),
+            patch("fujimoto.cli.quick_terminal_key", return_value="C-`"),
+            patch("fujimoto.cli.save_settings") as mock_save,
+            patch("fujimoto.cli.enable_quick_terminal_binding") as mock_enable,
+            patch("fujimoto.cli.disable_quick_terminal_binding") as mock_disable,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await app._toggle_quick_terminal()
+                await pilot.pause()
+                mock_save.assert_called_once_with(
+                    Settings(quick_terminal_enabled=False)
+                )
+                mock_disable.assert_called_once()
+                mock_enable.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_home_toggle_noop_when_env_disables(self) -> None:
+        from fujimoto.settings import Settings
+
+        with (
+            _patch_git_info(),
+            patch(
+                "fujimoto.cli.load_settings",
+                return_value=Settings(quick_terminal_enabled=None),
+            ),
+            patch("fujimoto.cli.quick_terminal_key", return_value=""),
+            patch("fujimoto.cli.save_settings") as mock_save,
+            patch("fujimoto.cli.enable_quick_terminal_binding") as mock_enable,
+            patch("fujimoto.cli.disable_quick_terminal_binding") as mock_disable,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await app._toggle_quick_terminal()
+                mock_save.assert_not_called()
+                mock_enable.assert_not_called()
+                mock_disable.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_home_renders_settings_row(self) -> None:
+        from fujimoto.settings import Settings
+
+        with (
+            _patch_git_info(),
+            patch(
+                "fujimoto.cli.load_settings",
+                return_value=Settings(quick_terminal_enabled=True),
+            ),
+            patch("fujimoto.cli.quick_terminal_key", return_value="C-`"),
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                assert len(app.query("#action-toggle-quick-terminal")) == 1
+
+
+class TestFriendlyKeyLabel:
+    def test_ctrl_backtick(self) -> None:
+        assert _friendly_key_label("C-`") == "Ctrl+`"
+
+    def test_ctrl_letter_preserves_case(self) -> None:
+        assert _friendly_key_label("C-f") == "Ctrl+f"
+
+    def test_meta_alt(self) -> None:
+        assert _friendly_key_label("M-x") == "Alt+x"
+
+    def test_shift(self) -> None:
+        assert _friendly_key_label("S-Tab") == "Shift+Tab"
+
+    def test_combination(self) -> None:
+        assert _friendly_key_label("C-M-x") == "Ctrl+Alt+x"
+
+    def test_no_prefix_returned_as_is(self) -> None:
+        assert _friendly_key_label("Space") == "Space"

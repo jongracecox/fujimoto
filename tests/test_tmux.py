@@ -476,3 +476,102 @@ class TestSetTerminalTitle:
         with patch("fujimoto.tmux.sys.stdout") as mock_stdout:
             set_terminal_title("")
             mock_stdout.write.assert_called_once_with("\033]0;\007")
+
+
+class TestQuickTerminalBinding:
+    def test_quick_terminal_key_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fujimoto.tmux import quick_terminal_key
+
+        monkeypatch.delenv("FUJIMOTO_QUICK_TERMINAL_KEY", raising=False)
+        assert quick_terminal_key() == "C-`"
+
+    def test_quick_terminal_key_env_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fujimoto.tmux import quick_terminal_key
+
+        monkeypatch.setenv("FUJIMOTO_QUICK_TERMINAL_KEY", "C-Space")
+        assert quick_terminal_key() == "C-Space"
+
+    def test_quick_terminal_key_empty_disables(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fujimoto.tmux import quick_terminal_key
+
+        monkeypatch.setenv("FUJIMOTO_QUICK_TERMINAL_KEY", "")
+        assert quick_terminal_key() == ""
+
+    def test_enable_runs_bind_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fujimoto.tmux import enable_quick_terminal_binding
+
+        monkeypatch.delenv("FUJIMOTO_QUICK_TERMINAL_KEY", raising=False)
+        with patch(
+            "fujimoto.tmux.subprocess.run", return_value=MagicMock(returncode=0)
+        ) as mock_run:
+            enable_quick_terminal_binding()
+            args = mock_run.call_args[0][0]
+            assert args[:4] == ["tmux", "bind-key", "-n", "C-`"]
+            assert "if-shell" in args
+            assert any("split-window -v -l 30%" in a for a in args)
+            assert any("select-pane -t :.+" in a for a in args)
+
+    def test_enable_noop_when_key_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fujimoto.tmux import enable_quick_terminal_binding
+
+        monkeypatch.setenv("FUJIMOTO_QUICK_TERMINAL_KEY", "")
+        with patch("fujimoto.tmux.subprocess.run") as mock_run:
+            enable_quick_terminal_binding()
+            mock_run.assert_not_called()
+
+    def test_disable_runs_unbind(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fujimoto.tmux import disable_quick_terminal_binding
+
+        monkeypatch.delenv("FUJIMOTO_QUICK_TERMINAL_KEY", raising=False)
+        with patch(
+            "fujimoto.tmux.subprocess.run", return_value=MagicMock(returncode=0)
+        ) as mock_run:
+            disable_quick_terminal_binding()
+            mock_run.assert_called_once_with(
+                ["tmux", "unbind-key", "-n", "C-`"], capture_output=True
+            )
+
+    def test_disable_noop_when_key_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fujimoto.tmux import disable_quick_terminal_binding
+
+        monkeypatch.setenv("FUJIMOTO_QUICK_TERMINAL_KEY", "")
+        with patch("fujimoto.tmux.subprocess.run") as mock_run:
+            disable_quick_terminal_binding()
+            mock_run.assert_not_called()
+
+    def test_apply_quick_terminal_setting_when_enabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fujimoto.settings import Settings
+        from fujimoto.tmux import _apply_quick_terminal_setting
+
+        monkeypatch.delenv("FUJIMOTO_QUICK_TERMINAL_KEY", raising=False)
+        with (
+            patch(
+                "fujimoto.settings.load_settings",
+                return_value=Settings(quick_terminal_enabled=True),
+            ),
+            patch(
+                "fujimoto.tmux.subprocess.run", return_value=MagicMock(returncode=0)
+            ) as mock_run,
+        ):
+            _apply_quick_terminal_setting()
+            assert mock_run.called
+
+    def test_apply_quick_terminal_setting_when_disabled(self) -> None:
+        from fujimoto.settings import Settings
+        from fujimoto.tmux import _apply_quick_terminal_setting
+
+        with (
+            patch(
+                "fujimoto.settings.load_settings",
+                return_value=Settings(quick_terminal_enabled=False),
+            ),
+            patch("fujimoto.tmux.subprocess.run") as mock_run,
+        ):
+            _apply_quick_terminal_setting()
+            mock_run.assert_not_called()

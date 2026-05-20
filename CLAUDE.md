@@ -22,6 +22,7 @@ export FUJIMOTO_GIT_ROOT=~/git/                  # Optional: enables project swi
 export FUJIMOTO_TERMINAL="alacritty --working-directory {dir}"  # Optional (Linux): terminal command
 export FUJIMOTO_WINDOW_TITLE="{git_project} - {worktree_name}"   # Optional: terminal window title template
 export FUJIMOTO_META_KEY="C-f"                                   # Optional: in-session fujimoto chord (blank to disable)
+export FUJIMOTO_QUICK_TERMINAL_KEY="C-\`"                        # Optional: global quick-terminal toggle key (blank to disable)
 ```
 
 `FUJIMOTO_TERMINAL` only applies on Linux. Use `{dir}` as a placeholder for the
@@ -34,6 +35,25 @@ If unset, fujimoto auto-detects a common terminal emulator on PATH.
 `{worktree_name}`, `{worktree_path}`, `{git_project_dir}`, `{branch}`,
 `{session_type}`, `{tmux_name}`. Unknown placeholders render as empty strings.
 Empty string suppresses the suffix.
+
+`FUJIMOTO_QUICK_TERMINAL_KEY` (default `` C-` ``) configures the **server-global**
+one-press quick-terminal toggle. First press splits a 30% bottom pane in the
+current pane's working directory; subsequent presses cycle focus between the
+panes. Unlike `FUJIMOTO_META_KEY` (which is per-session), this is a `tmux
+bind-key -n` at the root table — installed once, applies to all tmux sessions
+on the machine. On first launch the TUI asks whether to enable it; the answer
+is persisted to `~/.cache/fujimoto/settings.json` (`quick_terminal_enabled`).
+A toggle on the home screen (under the trailing dividers) flips the value at
+runtime, calling `enable_/disable_quick_terminal_binding()` in `tmux.py`.
+Setting the env var to empty disables the feature entirely (the toggle then
+renders as `disabled (env)` and the first-launch prompt is skipped).
+
+Because the binding lives on the tmux server, deleting `settings.json` does
+not remove an already-installed binding. Removal paths: the home-screen
+toggle (calls `disable_quick_terminal_binding()`), `tmux unbind-key -n <key>`
+manually, or `tmux kill-server`. With the preference still `on`, fujimoto
+re-installs the binding on every session create — so toggle it off first if
+you want the removal to persist.
 
 `FUJIMOTO_META_KEY` (default `C-f`) configures the in-session "fujimoto mode"
 chord. Pressing it inside an attached tmux session enters a one-shot key table
@@ -68,6 +88,7 @@ src/fujimoto/
 ├── tmux.py       # tmux session lifecycle (create, attach, kill, list, install)
 ├── version.py    # importlib.metadata wrapper for the running fujimoto version
 ├── version_check.py  # daily PyPI update check, dismissal cache (~/.cache/fujimoto/)
+├── settings.py   # persistent user settings (~/.cache/fujimoto/settings.json)
 └── claude/
     ├── __init__.py      # Re-exports public API
     └── log_parser.py    # Parse Claude JSONL session logs (state, metadata, session lookup)
@@ -148,6 +169,13 @@ Otherwise it:
 - `open_vscode(directory)` — runs `code <directory>`. Raises `OSError` if the `code` CLI is not on PATH.
 - `_has_vscode()` — checks for `code` on PATH via `shutil.which`
 
+**`settings.py`** — Persistent user settings stored as JSON in
+`~/.cache/fujimoto/settings.json`:
+- `Settings` dataclass: `quick_terminal_enabled: bool | None` (None = never asked)
+- `load_settings()` / `save_settings()` — graceful read/write, swallow OS errors
+  and corrupt JSON (returns defaults). Mirrors the `version_check.py` cache
+  pattern.
+
 **`tmux.py`** — tmux session management:
 - `is_tmux_installed()` / `install_tmux()` — detection and install. macOS: brew install. Linux: raises `TmuxError` with a distro-appropriate install command (apt-get/dnf/pacman/zypper/apk) — does not invoke sudo automatically.
 - `list_all_sessions()` — lists all active tmux session names
@@ -161,6 +189,9 @@ Otherwise it:
 - `get_session_path(name)` — returns the start directory of a tmux session via `display-message -p '#{session_path}'`, used by the `fujimoto pane` subcommand
 - `display_message(name, message)` — surface a transient message in the session's status bar, used to report errors from `fujimoto pane` back into the session
 - `_configure_session(name)` — applies the C-a prefix, status bar, and (if `FUJIMOTO_META_KEY` is non-empty) the fujimoto key table via `_configure_fujimoto_key_table`
+- `quick_terminal_key()` — returns the configured `FUJIMOTO_QUICK_TERMINAL_KEY` (default `` C-` ``)
+- `enable_quick_terminal_binding()` / `disable_quick_terminal_binding()` — install/remove the **server-global** root-table binding (`bind-key -n <key>`) that toggles a 30% bottom pane. The bound command uses `if-shell -F '#{==:#{window_panes},1}'` to split on the first press and cycle focus on subsequent presses. Both are no-ops when the env var is empty. Idempotent.
+- `_apply_quick_terminal_setting()` — called from `create_session` / `create_session_with_command` after `_ensure_extended_keys()`. Re-applies the binding when `Settings.quick_terminal_enabled` is True, so the feature survives `tmux kill-server`. Lazily imports `settings` to avoid a circular import.
 - `_configure_fujimoto_key_table(name, meta_key)` — installs the one-shot key table: `t`/`T` (`if-shell` guard ensuring a single extra pane; falls back to `select-pane :.+`), `v`/`w` (dispatch to `fujimoto pane <action> --session #{session_name}` via `run-shell`), `?` (cheatsheet). Root-level `bind-key -n <meta_key> switch-client -T fujimoto` arms the chord.
 
 **`claude/log_parser.py`** — Parse Claude Code's JSONL session logs:
