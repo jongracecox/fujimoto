@@ -181,6 +181,7 @@ Otherwise it:
 - Home screen sections: actions ("New worktree session", "New session in X", "Ad hoc session"), active sessions (with Claude state indicators), inactive worktrees (with Claude state), previous Claude sessions (resumable, capped at 5), switch project
 - Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
 - Session actions submenu (in order): for active sessions, Connect → Resume previous session; for inactive worktrees, Resume previous session → Launch (resume is the more common action when picking an idle worktree). Then: Open terminal, Open in VS Code, Rename, Terminate session (active only), Finish (worktree only), Cancel. Claude-session items show just "Resume" + Open terminal/VS Code + Cancel.
+- "Resume previous session" auto-launches the sole candidate when only one previous Claude session exists for the path, skipping the picker. Two or more sessions still show the picker.
 - Finish flow: Push & Create PR (background Claude), Cherry-pick to base, Discard & Delete
 - Open terminal flow: sub-menu with "This window" (default; uses Textual's `App.suspend()` to pause the TUI, then runs `subprocess.run([$SHELL], cwd=session.path)` as a child process — when the user types `exit`, the TUI resumes on the session actions menu) and "New window" (spawns a new iTerm/Terminal/Linux emulator window via `open_terminal()`)
 - All view transitions are `async` — `await _clear_main()` then `await mount()`
