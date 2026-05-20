@@ -252,18 +252,17 @@ class TestConfigureSession:
                 for c in cmds
                 if c[:3] == ["tmux", "set-option", "-t"] and c[4] == "status-right"
             )
-            assert "^F=fujimoto" in status_cmd[5]
-            # fujimoto-table bindings present
+            assert "Fujimoto: ^F t/T/w/v" in status_cmd[5]
+            assert "^F t toggles" in status_cmd[5]
+            assert "help: ^F ?" in status_cmd[5]
+            # fujimoto-table bindings present (server-global, no -t)
             table_keys = [
-                c[6]
-                for c in cmds
-                if c[:2] == ["tmux", "bind-key"] and c[4:6] == ["-T", "fujimoto"]
+                c[4] for c in cmds if c[:4] == ["tmux", "bind-key", "-T", "fujimoto"]
             ]
             assert set(table_keys) == {"t", "T", "v", "w", "?"}
-            # Root C-f switches to fujimoto table
+            # Root C-f switches to fujimoto table (server-global, no -t)
             assert any(
-                c[:7]
-                == ["tmux", "bind-key", "-t", "proj/test", "-n", "C-f", "switch-client"]
+                c[:5] == ["tmux", "bind-key", "-n", "C-f", "switch-client"]
                 for c in cmds
             )
 
@@ -277,7 +276,12 @@ class TestConfigureSession:
             _configure_session("proj/test")
 
             cmds = [c.args[0] for c in mock_run.call_args_list]
-            assert not any(c[:2] == ["tmux", "bind-key"] and "-T" in c for c in cmds)
+            assert not any(
+                c[:4] == ["tmux", "bind-key", "-T", "fujimoto"] for c in cmds
+            )
+            assert not any(
+                c[:2] == ["tmux", "bind-key"] and "switch-client" in c for c in cmds
+            )
             # Status hint omits the chord prefix
             status_cmd = next(
                 c
@@ -295,8 +299,7 @@ class TestConfigureSession:
 
             cmds = [c.args[0] for c in mock_run.call_args_list]
             assert any(
-                c[:7]
-                == ["tmux", "bind-key", "-t", "proj/test", "-n", "M-f", "switch-client"]
+                c[:5] == ["tmux", "bind-key", "-n", "M-f", "switch-client"]
                 for c in cmds
             )
 
