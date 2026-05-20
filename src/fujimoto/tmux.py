@@ -1,9 +1,25 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+META_KEY_ENV = "FUJIMOTO_META_KEY"
+DEFAULT_META_KEY = "C-f"
+
+
+def _meta_key() -> str:
+    """Return the configured fujimoto meta key, or empty string if disabled."""
+    return os.environ.get(META_KEY_ENV, DEFAULT_META_KEY)
+
+
+def _meta_key_label(key: str) -> str:
+    """Render a tmux key spec like 'C-f' as a status-bar label like '^F'."""
+    if key.startswith("C-") and len(key) == 3:
+        return f"^{key[2].upper()}"
+    return key
 
 
 class TmuxError(Exception):
@@ -89,6 +105,34 @@ def session_name(project_name: str, worktree_dir_name: str) -> str:
     return f"{project_name}/{worktree_dir_name}"
 
 
+def get_session_path(name: str) -> Path | None:
+    """Return the start directory of the named tmux session, or None."""
+    result = subprocess.run(
+        [
+            "tmux",
+            "display-message",
+            "-p",
+            "-t",
+            name,
+            "#{session_path}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    out = result.stdout.strip()
+    return Path(out) if out else None
+
+
+def display_message(name: str, message: str) -> None:
+    """Show a transient message in the named tmux session's status line."""
+    subprocess.run(
+        ["tmux", "display-message", "-t", name, message],
+        capture_output=True,
+    )
+
+
 def session_exists(name: str) -> bool:
     result = subprocess.run(
         ["tmux", "has-session", "-t", name],
@@ -146,11 +190,20 @@ def _ensure_extended_keys() -> None:
 
 def _configure_session(name: str) -> None:
     """Apply standard tmux configuration to a session."""
+    meta_key = _meta_key()
+    if meta_key:
+        label = _meta_key_label(meta_key)
+        status_right = f'"{label}=fujimoto | Detach: ^A D | Scroll: ^A [ | Kill: ^A X"'
+        status_len = "80"
+    else:
+        status_right = '"Detach: ^A D | Scroll: ^A [ | Kill: ^A X"'
+        status_len = "60"
+
     options: dict[str, str] = {
         "prefix": "C-a",
-        "status-right": '"Detach: ^A D | Scroll: ^A [ | Kill: ^A X"',
+        "status-right": status_right,
         "status-style": "bg=colour235,fg=colour248",
-        "status-right-length": "60",
+        "status-right-length": status_len,
     }
     for key, value in options.items():
         subprocess.run(
@@ -164,6 +217,55 @@ def _configure_session(name: str) -> None:
     subprocess.run(
         ["tmux", "bind-key", "-t", name, "C-a", "send-prefix"],
         capture_output=True,
+    )
+
+    if meta_key:
+        _configure_fujimoto_key_table(name, meta_key)
+
+
+def _configure_fujimoto_key_table(name: str, meta_key: str) -> None:
+    """Install the one-shot fujimoto-mode key table on the session."""
+    fujimoto_bindings: list[list[str]] = [
+        [
+            "t",
+            "if-shell",
+            "[ #{session_panes} -lt 2 ]",
+            'split-window -v -l 30% -c "#{session_path}"',
+            "select-pane -t :.+",
+        ],
+        [
+            "T",
+            "if-shell",
+            "[ #{session_panes} -lt 2 ]",
+            'split-window -h -l 40% -c "#{session_path}"',
+            "select-pane -t :.+",
+        ],
+        ["v", "run-shell", "fujimoto pane vscode --session #{session_name}"],
+        ["w", "run-shell", "fujimoto pane terminal --session #{session_name}"],
+        [
+            "?",
+            "display-message",
+            "F-mode: t=term  T=side  v=code  w=window  ?=help",
+        ],
+    ]
+    for key, *cmd in fujimoto_bindings:
+        subprocess.run(
+            ["tmux", "bind-key", "-t", name, "-T", "fujimoto", key, *cmd],
+            check=True,
+        )
+    subprocess.run(
+        [
+            "tmux",
+            "bind-key",
+            "-t",
+            name,
+            "-n",
+            meta_key,
+            "switch-client",
+            "-T",
+            "fujimoto",
+        ],
+        check=True,
     )
 
 

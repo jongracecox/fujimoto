@@ -7,10 +7,14 @@ import pytest
 
 from fujimoto.tmux import (
     TmuxError,
+    _configure_session,
     _ensure_extended_keys,
+    _meta_key_label,
     attach_session,
     create_session,
     create_session_with_command,
+    display_message,
+    get_session_path,
     install_tmux,
     is_tmux_installed,
     kill_session,
@@ -228,6 +232,106 @@ class TestCreateSession:
                     "claude --append-system-prompt 'You are in a worktree'",
                 ],
                 check=True,
+            )
+
+
+class TestConfigureSession:
+    def test_installs_fujimoto_key_table_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("FUJIMOTO_META_KEY", raising=False)
+        with patch(
+            "fujimoto.tmux.subprocess.run", return_value=MagicMock(returncode=0)
+        ) as mock_run:
+            _configure_session("proj/test")
+
+            cmds = [c.args[0] for c in mock_run.call_args_list]
+            # Status hint mentions fujimoto chord
+            status_cmd = next(
+                c
+                for c in cmds
+                if c[:3] == ["tmux", "set-option", "-t"] and c[4] == "status-right"
+            )
+            assert "^F=fujimoto" in status_cmd[5]
+            # fujimoto-table bindings present
+            table_keys = [
+                c[6]
+                for c in cmds
+                if c[:2] == ["tmux", "bind-key"] and c[4:6] == ["-T", "fujimoto"]
+            ]
+            assert set(table_keys) == {"t", "T", "v", "w", "?"}
+            # Root C-f switches to fujimoto table
+            assert any(
+                c[:7]
+                == ["tmux", "bind-key", "-t", "proj/test", "-n", "C-f", "switch-client"]
+                for c in cmds
+            )
+
+    def test_disabled_when_meta_key_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FUJIMOTO_META_KEY", "")
+        with patch(
+            "fujimoto.tmux.subprocess.run", return_value=MagicMock(returncode=0)
+        ) as mock_run:
+            _configure_session("proj/test")
+
+            cmds = [c.args[0] for c in mock_run.call_args_list]
+            assert not any(c[:2] == ["tmux", "bind-key"] and "-T" in c for c in cmds)
+            # Status hint omits the chord prefix
+            status_cmd = next(
+                c
+                for c in cmds
+                if c[:3] == ["tmux", "set-option", "-t"] and c[4] == "status-right"
+            )
+            assert "fujimoto" not in status_cmd[5]
+
+    def test_custom_meta_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("FUJIMOTO_META_KEY", "M-f")
+        with patch(
+            "fujimoto.tmux.subprocess.run", return_value=MagicMock(returncode=0)
+        ) as mock_run:
+            _configure_session("proj/test")
+
+            cmds = [c.args[0] for c in mock_run.call_args_list]
+            assert any(
+                c[:7]
+                == ["tmux", "bind-key", "-t", "proj/test", "-n", "M-f", "switch-client"]
+                for c in cmds
+            )
+
+
+class TestMetaKeyLabel:
+    def test_ctrl_key(self) -> None:
+        assert _meta_key_label("C-f") == "^F"
+
+    def test_other_key(self) -> None:
+        assert _meta_key_label("M-f") == "M-f"
+
+
+class TestGetSessionPath:
+    def test_returns_path_on_success(self) -> None:
+        with patch(
+            "fujimoto.tmux.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="/tmp/abc\n"),
+        ):
+            assert get_session_path("proj/test") == Path("/tmp/abc")
+
+    def test_returns_none_on_failure(self) -> None:
+        with patch(
+            "fujimoto.tmux.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout=""),
+        ):
+            assert get_session_path("proj/test") is None
+
+
+class TestDisplayMessage:
+    def test_invokes_tmux_display_message(self) -> None:
+        with patch("fujimoto.tmux.subprocess.run") as mock_run:
+            display_message("proj/test", "hello")
+            mock_run.assert_called_once_with(
+                ["tmux", "display-message", "-t", "proj/test", "hello"],
+                capture_output=True,
             )
 
 

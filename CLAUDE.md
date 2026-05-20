@@ -21,6 +21,7 @@ export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/   # Optional: where worktrees are
 export FUJIMOTO_GIT_ROOT=~/git/                  # Optional: enables project switching
 export FUJIMOTO_TERMINAL="alacritty --working-directory {dir}"  # Optional (Linux): terminal command
 export FUJIMOTO_WINDOW_TITLE="{git_project} - {worktree_name}"   # Optional: terminal window title template
+export FUJIMOTO_META_KEY="C-f"                                   # Optional: in-session fujimoto chord (blank to disable)
 ```
 
 `FUJIMOTO_TERMINAL` only applies on Linux. Use `{dir}` as a placeholder for the
@@ -33,6 +34,15 @@ If unset, fujimoto auto-detects a common terminal emulator on PATH.
 `{worktree_name}`, `{worktree_path}`, `{git_project_dir}`, `{branch}`,
 `{session_type}`, `{tmux_name}`. Unknown placeholders render as empty strings.
 Empty string suppresses the suffix.
+
+`FUJIMOTO_META_KEY` (default `C-f`) configures the in-session "fujimoto mode"
+chord. Pressing it inside an attached tmux session enters a one-shot key table
+where `t`/`T` split a terminal pane (single-pane guard via `if-shell` on
+`#{session_panes}`), `v` opens VS Code, `w` opens a native terminal window, and
+`?` flashes a cheatsheet via `display-message`. `v`/`w` dispatch to the
+`fujimoto pane <action> --session <name>` CLI subcommand which reuses the
+existing launchers in `vscode.py` / `terminal.py`. Set to the empty string to
+disable; the bindings and the status-bar hint are then both omitted.
 
 If `FUJIMOTO_WORKTREE_ROOT` is unset, worktrees are created at
 `<repo_root>/.fujimoto/worktrees/` (the `.fujimoto/` directory is auto-gitignored
@@ -67,7 +77,11 @@ src/fujimoto/
 
 ### Entry Point
 
-`cli.py:main()` is the package entry point (`pyproject.toml` `[project.scripts]`). It parses CLI args (`--version`/`-V` prints `fujimoto {version}` and exits) and otherwise:
+`cli.py:main()` is the package entry point (`pyproject.toml` `[project.scripts]`). It parses CLI args:
+- `--version`/`-V` prints `fujimoto {version}` and exits
+- `fujimoto pane <vscode|terminal> --session <name>` dispatches to `_run_pane_command`, used by the in-session tmux key table (`Ctrl-F v` / `Ctrl-F w`). Resolves the session's working directory via `tmux display-message -p '#{session_path}'` and calls the existing `open_vscode` / `open_terminal` helpers; errors are surfaced via `tmux display-message` so they appear in the session's status bar.
+
+Otherwise it:
 1. Runs the Textual `SessionApp` in a loop
 2. After the TUI exits, calls `launch_claude_in_tmux()` if the user selected a session
 3. When the tmux session is detached, the loop restarts and the TUI reappears
@@ -144,6 +158,10 @@ src/fujimoto/
 - `kill_session(name)` — `tmux kill-session -t`
 - `attach_session(name)` — prints shortcut banner, then `subprocess.run` tmux attach (returns on detach)
 - `launch_claude_in_tmux(project, path, tmux_name, system_prompt, resume_session_id)` — orchestrates create-or-attach, supports resuming previous Claude sessions
+- `get_session_path(name)` — returns the start directory of a tmux session via `display-message -p '#{session_path}'`, used by the `fujimoto pane` subcommand
+- `display_message(name, message)` — surface a transient message in the session's status bar, used to report errors from `fujimoto pane` back into the session
+- `_configure_session(name)` — applies the C-a prefix, status bar, and (if `FUJIMOTO_META_KEY` is non-empty) the fujimoto key table via `_configure_fujimoto_key_table`
+- `_configure_fujimoto_key_table(name, meta_key)` — installs the one-shot key table: `t`/`T` (`if-shell` guard ensuring a single extra pane; falls back to `select-pane :.+`), `v`/`w` (dispatch to `fujimoto pane <action> --session #{session_name}` via `run-shell`), `?` (cheatsheet). Root-level `bind-key -n <meta_key> switch-client -T fujimoto` arms the chord.
 
 **`claude/log_parser.py`** — Parse Claude Code's JSONL session logs:
 - `ClaudeLogError` — raised on empty/unreadable logs

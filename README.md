@@ -68,6 +68,7 @@ export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/   # Where worktrees are created
 export FUJIMOTO_GIT_ROOT=~/git/                  # Enables project switching
 export FUJIMOTO_TERMINAL="alacritty --working-directory {dir}"  # Linux-only: terminal command
 export FUJIMOTO_WINDOW_TITLE="{git_project} - {worktree_name}"   # Terminal window title template
+export FUJIMOTO_META_KEY="C-f"                                   # In-session fujimoto chord (blank to disable)
 ```
 
 If `FUJIMOTO_WORKTREE_ROOT` is unset, worktrees are created inside the current
@@ -97,6 +98,22 @@ Supported placeholders:
 | `{tmux_name}` | tmux session name |
 
 Unknown placeholders render as empty strings.
+
+### In-session shortcuts
+
+When attached to a fujimoto-managed tmux session, press `Ctrl-F` (configurable
+via `FUJIMOTO_META_KEY`) to enter a one-shot "fujimoto mode", then:
+
+| Key | Action |
+|---|---|
+| `t` | Split a terminal pane below claude (30% height). Pressing again focuses the existing pane — only one extra pane at a time. Run `exit` in the pane to close it. |
+| `T` | Open a full-height side pane on the right. Same single-pane behavior as `t`. |
+| `v` | Open VS Code at the session's working directory. |
+| `w` | Open a native terminal window at the session's working directory. |
+| `?` | Flash the binding cheatsheet in the status bar. |
+
+Set `FUJIMOTO_META_KEY=""` to disable the chord entirely, or to an alternative
+tmux key spec (e.g. `M-f`, `C-Space`) to remap.
 
 ### Platform support
 
