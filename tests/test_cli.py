@@ -846,7 +846,9 @@ class TestSessionAppOpenTerminal:
         await pilot.pause()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
-    async def test_term_window_calls_open_terminal_and_returns_home(self) -> None:
+    async def test_term_window_calls_open_terminal_and_returns_to_actions(
+        self,
+    ) -> None:
         with _patch_git_info(sessions=["test-proj/direct-1"]):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -860,8 +862,9 @@ class TestSessionAppOpenTerminal:
                     await pilot.press("enter")
                     await pilot.pause()
                     mock_open.assert_called_once()
-                    # Returned to home view
-                    assert len(app.query("#home-list")) > 0
+                    # Returned to the session actions menu, not home.
+                    assert len(app.query("#session-actions")) > 0
+                    assert len(app.query("#terminal-mode-list")) == 0
 
     @pytest.mark.asyncio
     async def test_term_window_error_shows_error(self) -> None:
