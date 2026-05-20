@@ -20,11 +20,19 @@ uv tool install --force --reinstall .          # Install globally (re-run after 
 export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/   # Optional: where worktrees are created
 export FUJIMOTO_GIT_ROOT=~/git/                  # Optional: enables project switching
 export FUJIMOTO_TERMINAL="alacritty --working-directory {dir}"  # Optional (Linux): terminal command
+export FUJIMOTO_WINDOW_TITLE="{git_project} - {worktree_name}"   # Optional: terminal window title template
 ```
 
 `FUJIMOTO_TERMINAL` only applies on Linux. Use `{dir}` as a placeholder for the
 working directory; if absent, the directory is appended as the final argument.
 If unset, fujimoto auto-detects a common terminal emulator on PATH.
+
+`FUJIMOTO_WINDOW_TITLE` is the suffix appended to the hard-coded
+`🧙🏽‍♂️ fujimoto` prefix when a Claude session is attached. Default:
+`{git_project} - {worktree_name}`. Supported placeholders: `{git_project}`,
+`{worktree_name}`, `{worktree_path}`, `{git_project_dir}`, `{branch}`,
+`{session_type}`, `{tmux_name}`. Unknown placeholders render as empty strings.
+Empty string suppresses the suffix.
 
 If `FUJIMOTO_WORKTREE_ROOT` is unset, worktrees are created at
 `<repo_root>/.fujimoto/worktrees/` (the `.fujimoto/` directory is auto-gitignored

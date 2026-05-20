@@ -67,6 +67,7 @@ All environment variables are optional:
 export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/   # Where worktrees are created
 export FUJIMOTO_GIT_ROOT=~/git/                  # Enables project switching
 export FUJIMOTO_TERMINAL="alacritty --working-directory {dir}"  # Linux-only: terminal command
+export FUJIMOTO_WINDOW_TITLE="{git_project} - {worktree_name}"   # Terminal window title template
 ```
 
 If `FUJIMOTO_WORKTREE_ROOT` is unset, worktrees are created inside the current
@@ -74,6 +75,28 @@ project at `<repo>/.fujimoto/worktrees/` (the `.fujimoto/` directory is
 auto-gitignored). If `FUJIMOTO_GIT_ROOT` is unset, the project switcher is
 hidden. Add these to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.) to
 persist them.
+
+### Window title template
+
+When a Claude session is attached, fujimoto sets the terminal window title to
+`🧙🏽‍♂️ fujimoto - <rendered template>`. The `🧙🏽‍♂️ fujimoto` prefix is always
+present; `FUJIMOTO_WINDOW_TITLE` controls the suffix. Default:
+`{git_project} - {worktree_name}`. Set it to an empty string to suppress the
+suffix entirely.
+
+Supported placeholders:
+
+| Placeholder | Value |
+|---|---|
+| `{git_project}` | Project (repo) name |
+| `{worktree_name}` | Worktree directory basename |
+| `{worktree_path}` | Absolute path to the working directory |
+| `{git_project_dir}` | Absolute path to the main project directory |
+| `{branch}` | Current git branch (empty outside a repo) |
+| `{session_type}` | `worktree`, `direct`, or `adhoc` |
+| `{tmux_name}` | tmux session name |
+
+Unknown placeholders render as empty strings.
 
 ### Platform support
 
