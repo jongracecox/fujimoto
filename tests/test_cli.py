@@ -223,6 +223,87 @@ class TestMain:
             )
 
 
+class TestSessionTerminalTitle:
+    def test_default_template_worktree(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fujimoto.cli import ICON_WIZARD, _session_terminal_title
+
+        monkeypatch.delenv("FUJIMOTO_WINDOW_TITLE", raising=False)
+        with patch("fujimoto.cli.get_current_branch", return_value="main"):
+            title = _session_terminal_title(
+                "myproj", None, Path("/tmp/myproj/20260101-foo"), "worktree"
+            )
+        assert title == f"{ICON_WIZARD} fujimoto - myproj - 20260101-foo"
+
+    def test_custom_template(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fujimoto.cli import ICON_WIZARD, _session_terminal_title
+
+        monkeypatch.setenv("FUJIMOTO_WINDOW_TITLE", "{session_type}:{branch}")
+        with patch("fujimoto.cli.get_current_branch", return_value="feature-x"):
+            title = _session_terminal_title("proj", None, Path("/tmp/wt"), "worktree")
+        assert title == f"{ICON_WIZARD} fujimoto - worktree:feature-x"
+
+    def test_empty_template_returns_prefix_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fujimoto.cli import ICON_WIZARD, _session_terminal_title
+
+        monkeypatch.setenv("FUJIMOTO_WINDOW_TITLE", "")
+        with patch("fujimoto.cli.get_current_branch", return_value=""):
+            title = _session_terminal_title("proj", None, Path("/tmp/wt"), "worktree")
+        assert title == f"{ICON_WIZARD} fujimoto"
+
+    def test_unknown_placeholder_renders_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fujimoto.cli import ICON_WIZARD, _session_terminal_title
+
+        monkeypatch.setenv("FUJIMOTO_WINDOW_TITLE", "{nonexistent}{git_project}")
+        with patch("fujimoto.cli.get_current_branch", return_value=""):
+            title = _session_terminal_title("proj", None, Path("/tmp/wt"), "worktree")
+        assert title == f"{ICON_WIZARD} fujimoto - proj"
+
+    def test_branch_empty_on_git_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fujimoto.cli import ICON_WIZARD, _session_terminal_title
+
+        monkeypatch.setenv("FUJIMOTO_WINDOW_TITLE", "branch={branch}")
+        with patch("fujimoto.cli.get_current_branch", side_effect=GitError("no repo")):
+            title = _session_terminal_title("proj", None, Path("/tmp/wt"), "adhoc")
+        assert title == f"{ICON_WIZARD} fujimoto - branch="
+
+    def test_adhoc_session(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fujimoto.cli import ICON_WIZARD, _session_terminal_title
+
+        monkeypatch.setenv(
+            "FUJIMOTO_WINDOW_TITLE",
+            "{session_type} {worktree_name} {git_project_dir}",
+        )
+        with patch("fujimoto.cli.get_current_branch", side_effect=GitError("no")):
+            title = _session_terminal_title(
+                "", "adhoc-1", Path("/tmp/fujimoto-adhoc-xyz"), "adhoc"
+            )
+        assert title == f"{ICON_WIZARD} fujimoto - adhoc fujimoto-adhoc-xyz"
+
+    def test_direct_session_git_project_dir(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fujimoto.cli import ICON_WIZARD, _session_terminal_title
+
+        monkeypatch.setenv("FUJIMOTO_WINDOW_TITLE", "{git_project_dir}")
+        with patch("fujimoto.cli.get_current_branch", return_value="main"):
+            title = _session_terminal_title("proj", None, Path("/repos/proj"), "direct")
+        assert title == f"{ICON_WIZARD} fujimoto - /repos/proj"
+
+    def test_tmux_name_falls_back_to_derived(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fujimoto.cli import ICON_WIZARD, _session_terminal_title
+
+        monkeypatch.setenv("FUJIMOTO_WINDOW_TITLE", "{tmux_name}")
+        with patch("fujimoto.cli.get_current_branch", return_value=""):
+            title = _session_terminal_title("proj", None, Path("/tmp/wt"), "worktree")
+        assert title == f"{ICON_WIZARD} fujimoto - proj/wt"
+
+
 class TestBuildSystemPrompt:
     def test_worktree_prompt_includes_base_branch(self, tmp_path: Path) -> None:
         from fujimoto.cli import _build_system_prompt

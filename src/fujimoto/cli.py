@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import tempfile
 import textwrap
@@ -1821,27 +1822,62 @@ def _build_system_prompt(session_type: str, project: str, working_dir: Path) -> 
     )
 
 
+DEFAULT_WINDOW_TITLE_TEMPLATE = "{git_project} - {worktree_name}"
+
+
+class _DefaultFormatDict(dict[str, str]):
+    def __missing__(self, key: str) -> str:
+        return ""
+
+
 def _session_terminal_title(
     project: str, tmux_name: str | None, working_dir: Path, session_type: str
 ) -> str:
-    """Build a terminal title string for a session."""
-    wizard = ICON_WIZARD
-    if session_type == "adhoc":
-        name = tmux_name or "adhoc"
-        return f"{wizard} fujimoto — {name}"
+    """Build a terminal title string for a Claude session.
+
+    The "<icon> fujimoto" prefix is always hard-coded. The suffix is rendered
+    from the `FUJIMOTO_WINDOW_TITLE` env var (default: "{git_project} -
+    {worktree_name}"). Unknown placeholders render as empty strings.
+    """
+    prefix = f"{ICON_WIZARD} fujimoto"
+    template = os.environ.get("FUJIMOTO_WINDOW_TITLE", DEFAULT_WINDOW_TITLE_TEMPLATE)
+    if not template.strip():
+        return prefix
+
+    try:
+        branch = get_current_branch(working_dir)
+    except GitError:
+        branch = ""
+
     if session_type == "worktree":
-        # e.g. fujimoto/20260309-fix-tests
-        relative = f"{project}/{working_dir.name}"
-        return f"{wizard} fujimoto — {relative}"
+        git_project_dir = str(working_dir.parent)
+    elif session_type == "direct":
+        git_project_dir = str(working_dir)
     else:
-        try:
-            branch = get_current_branch(working_dir)
-        except GitError:
-            branch = ""
-        title = f"{wizard} fujimoto — {project}"
-        if branch:
-            title += f" + {branch}"
-        return title
+        git_project_dir = ""
+
+    derived_tmux = tmux_name or (
+        session_name(project, working_dir.name) if project else working_dir.name
+    )
+
+    vars = _DefaultFormatDict(
+        git_project=project,
+        worktree_name=working_dir.name,
+        worktree_path=str(working_dir),
+        git_project_dir=git_project_dir,
+        branch=branch,
+        session_type=session_type,
+        tmux_name=derived_tmux,
+    )
+
+    try:
+        suffix = template.format_map(vars).strip()
+    except (ValueError, IndexError):
+        suffix = ""
+
+    if not suffix:
+        return prefix
+    return f"{prefix} - {suffix}"
 
 
 def main() -> None:
@@ -1875,6 +1911,11 @@ def main() -> None:
                     None
                     if resume_id
                     else _build_system_prompt(session_type, project_name, working_dir)
+                )
+                set_terminal_title(
+                    _session_terminal_title(
+                        project_name, tmux_name, working_dir, session_type
+                    )
                 )
                 launch_claude_in_tmux(
                     project_name,
