@@ -652,8 +652,7 @@ class TestSessionAppSessionActions:
                 await pilot.press("enter")
                 await pilot.pause()
                 assert len(app.query("#session-actions")) > 0
-                # Inactive order: Resume previous, Launch — pick Launch
-                await pilot.press("down")
+                # No previous sessions → Resume hidden, Launch is first
                 await pilot.press("enter")
                 await pilot.pause()
                 assert app._launch_target is not None
@@ -683,7 +682,23 @@ class TestSessionAppSessionActions:
         self, tmp_path: Path
     ) -> None:
         wt = tmp_path / "20260309-test"
-        with _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]):
+        fake_session = ClaudeSession(
+            jsonl_path=wt / "session.jsonl",
+            session_id="abc12345-def6-7890-abcd-ef1234567890",
+            state=SessionState.IDLE,
+            last_entry_type=EntryType.ASSISTANT,
+            stop_reason=StopReason.END_TURN,
+            cwd=wt,
+            git_branch="worktree/20260309-test",
+            last_activity=datetime(2026, 3, 9, 12, 0, 0, tzinfo=timezone.utc),
+            title=None,
+            first_prompt=None,
+        )
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _path: [fake_session],
+        ):
             app = SessionApp()
             async with app.run_test() as pilot:
                 home_list = app.query_one("#home-list", ListView)
@@ -702,7 +717,22 @@ class TestSessionAppSessionActions:
         self, tmp_path: Path
     ) -> None:
         wt = tmp_path / "20260309-test"
-        with _patch_git_info(worktrees=[wt]):
+        fake_session = ClaudeSession(
+            jsonl_path=wt / "session.jsonl",
+            session_id="abc12345-def6-7890-abcd-ef1234567890",
+            state=SessionState.IDLE,
+            last_entry_type=EntryType.ASSISTANT,
+            stop_reason=StopReason.END_TURN,
+            cwd=wt,
+            git_branch="worktree/20260309-test",
+            last_activity=datetime(2026, 3, 9, 12, 0, 0, tzinfo=timezone.utc),
+            title=None,
+            first_prompt=None,
+        )
+        with _patch_git_info(
+            worktrees=[wt],
+            claude_sessions_fn=lambda _path: [fake_session],
+        ):
             app = SessionApp()
             async with app.run_test() as pilot:
                 home_list = app.query_one("#home-list", ListView)
@@ -715,6 +745,25 @@ class TestSessionAppSessionActions:
                 actions = app.query_one("#session-actions", ListView)
                 action_ids = [child.id for child in actions.children]
                 assert "sa-resume-picker" in action_ids
+
+    @pytest.mark.asyncio
+    async def test_resume_picker_hidden_when_no_previous_sessions(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                actions = app.query_one("#session-actions", ListView)
+                action_ids = [child.id for child in actions.children]
+                assert "sa-resume-picker" not in action_ids
 
     @pytest.mark.asyncio
     async def test_resume_picker_sets_launch_target(self, tmp_path: Path) -> None:
@@ -808,7 +857,23 @@ class TestSessionAppSessionActions:
     @pytest.mark.asyncio
     async def test_resume_picker_cancel_returns_home(self, tmp_path: Path) -> None:
         wt = tmp_path / "20260309-test"
-        with _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]):
+        fake_session = ClaudeSession(
+            jsonl_path=wt / "session.jsonl",
+            session_id="abc12345-def6-7890-abcd-ef1234567890",
+            state=SessionState.IDLE,
+            last_entry_type=EntryType.ASSISTANT,
+            stop_reason=StopReason.END_TURN,
+            cwd=wt,
+            git_branch="worktree/20260309-test",
+            last_activity=datetime(2026, 3, 9, 12, 0, 0, tzinfo=timezone.utc),
+            title=None,
+            first_prompt=None,
+        )
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _path: [fake_session],
+        ):
             app = SessionApp()
             async with app.run_test() as pilot:
                 home_list = app.query_one("#home-list", ListView)
