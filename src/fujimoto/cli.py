@@ -864,16 +864,24 @@ class SessionApp(App):
 
         if session.session_type == "claude":
             items.append(ListItem(Label("Resume"), id="sa-resume"))
-        elif session.is_active:
-            items.append(ListItem(Label("Connect"), id="sa-connect"))
-            items.append(
-                ListItem(Label("Resume previous session"), id="sa-resume-picker")
-            )
         else:
-            items.append(
-                ListItem(Label("Resume previous session"), id="sa-resume-picker")
-            )
-            items.append(ListItem(Label("Launch"), id="sa-launch"))
+            has_previous = bool(get_sessions_for_path(session.path))
+            if session.is_active:
+                items.append(ListItem(Label("Connect"), id="sa-connect"))
+                if has_previous:
+                    items.append(
+                        ListItem(
+                            Label("Resume previous session"), id="sa-resume-picker"
+                        )
+                    )
+            else:
+                if has_previous:
+                    items.append(
+                        ListItem(
+                            Label("Resume previous session"), id="sa-resume-picker"
+                        )
+                    )
+                items.append(ListItem(Label("Launch"), id="sa-launch"))
 
         items.append(ListItem(Label("Open terminal"), id="sa-terminal"))
         items.append(ListItem(Label("Open in VS Code"), id="sa-vscode"))
