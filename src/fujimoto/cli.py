@@ -925,10 +925,34 @@ class SessionApp(App):
 
     # -- Resume session picker --
 
+    def _launch_resume(self, session: SessionInfo, cs: ClaudeSession) -> None:
+        # For inactive worktrees, reuse the worktree's session name so the resumed
+        # session stays identified as a worktree item on the next TUI view (correct
+        # path and session lookup). For active worktrees the session name is in use,
+        # so a new direct-N name is needed.
+        if session.session_type == "worktree" and not session.is_active:
+            tmux_name = session.tmux_session
+        else:
+            tmux_name = get_next_direct_session_name(
+                session.project, self._active_sessions
+            )
+        self._launch_target = (
+            session.project,
+            cs.cwd,  # authoritative original directory from the session log
+            tmux_name,
+            session.session_type,
+            cs.session_id,
+        )
+        self.exit()
+
     async def _show_resume_session_picker(self, session: SessionInfo) -> None:
         self._selected_session = session
         sessions = get_sessions_for_path(session.path)
         self._resume_sessions = sessions
+
+        if len(sessions) == 1:
+            self._launch_resume(session, sessions[0])
+            return
 
         await self._clear_main()
         main = self.query_one("#main")
@@ -1598,24 +1622,7 @@ class SessionApp(App):
             return
         idx = int(item_id.split("-", 1)[1])
         cs = self._resume_sessions[idx]
-        # For inactive worktrees, reuse the worktree's session name so the resumed
-        # session stays identified as a worktree item on the next TUI view (correct
-        # path and session lookup). For active worktrees the session name is in use,
-        # so a new direct-N name is needed.
-        if session.session_type == "worktree" and not session.is_active:
-            tmux_name = session.tmux_session
-        else:
-            tmux_name = get_next_direct_session_name(
-                session.project, self._active_sessions
-            )
-        self._launch_target = (
-            session.project,
-            cs.cwd,  # authoritative original directory from the session log
-            tmux_name,
-            session.session_type,
-            cs.session_id,
-        )
-        self.exit()
+        self._launch_resume(session, cs)
 
     @on(ListView.Selected, "#confirm-list")
     async def on_confirm_selected(self, event: ListView.Selected) -> None:

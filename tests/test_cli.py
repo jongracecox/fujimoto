@@ -794,13 +794,10 @@ class TestSessionAppSessionActions:
                         break
                 await pilot.press("enter")
                 await pilot.pause()
-                # "Resume previous session" is the second option (after Connect)
+                # "Resume previous session" is the second option (after Connect).
+                # With a single previous session, the picker is skipped and the
+                # session launches directly.
                 await pilot.press("down")
-                await pilot.press("enter")
-                await pilot.pause()
-                # Should now show the resume picker
-                assert len(app.query("#resume-picker")) > 0
-                # Select the first session
                 await pilot.press("enter")
                 await pilot.pause()
                 assert app._launch_target is not None
@@ -841,10 +838,8 @@ class TestSessionAppSessionActions:
                         break
                 await pilot.press("enter")
                 await pilot.pause()
-                # "Resume previous session" is the first option for inactive worktrees
-                await pilot.press("enter")
-                await pilot.pause()
-                assert len(app.query("#resume-picker")) > 0
+                # "Resume previous session" is the first option for inactive worktrees.
+                # Single previous session → auto-launch, no picker.
                 await pilot.press("enter")
                 await pilot.pause()
                 assert app._launch_target is not None
@@ -869,10 +864,22 @@ class TestSessionAppSessionActions:
             title=None,
             first_prompt=None,
         )
+        fake_session_2 = ClaudeSession(
+            jsonl_path=wt / "session-2.jsonl",
+            session_id="bcd23456-ef78-9012-bcde-f23456789012",
+            state=SessionState.IDLE,
+            last_entry_type=EntryType.ASSISTANT,
+            stop_reason=StopReason.END_TURN,
+            cwd=wt,
+            git_branch="worktree/20260309-test",
+            last_activity=datetime(2026, 3, 8, 12, 0, 0, tzinfo=timezone.utc),
+            title=None,
+            first_prompt=None,
+        )
         with _patch_git_info(
             sessions=["test-proj/20260309-test"],
             worktrees=[wt],
-            claude_sessions_fn=lambda _path: [fake_session],
+            claude_sessions_fn=lambda _path: [fake_session, fake_session_2],
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -886,10 +893,14 @@ class TestSessionAppSessionActions:
                 await pilot.press("down")
                 await pilot.press("enter")
                 await pilot.pause()
-                # Shows empty state + cancel
+                # Two sessions → picker shown
                 assert len(app.query("#resume-picker")) > 0
-                # Navigate to cancel and press enter
-                await pilot.press("down")
+                # Navigate to cancel (past both sessions) and press enter
+                picker = app.query_one("#resume-picker", ListView)
+                for i, item in enumerate(picker.children):
+                    if item.id == "rp-cancel":
+                        picker.index = i
+                        break
                 await pilot.press("enter")
                 await pilot.pause()
                 assert len(app.query("#home-list")) > 0
