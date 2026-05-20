@@ -106,8 +106,8 @@ via `FUJIMOTO_META_KEY`) to enter a one-shot "fujimoto mode", then:
 
 | Key | Action |
 |---|---|
-| `t` | Split a terminal pane below claude (30% height). Pressing again focuses the existing pane — only one extra pane at a time. Run `exit` in the pane to close it. |
-| `T` | Open a full-height side pane on the right. Same single-pane behavior as `t`. |
+| `t` | Split a terminal pane below claude (30% height). Press again to toggle focus between claude and the terminal — only one extra pane at a time. Run `exit` in the pane to close it. |
+| `T` | Open a full-height side pane on the right. Same behavior as `t`: press again to toggle focus. |
 | `v` | Open VS Code at the session's working directory. |
 | `w` | Open a native terminal window at the session's working directory. |
 | `?` | Flash the binding cheatsheet in the status bar. |

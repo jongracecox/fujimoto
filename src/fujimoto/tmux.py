@@ -193,8 +193,11 @@ def _configure_session(name: str) -> None:
     meta_key = _meta_key()
     if meta_key:
         label = _meta_key_label(meta_key)
-        status_right = f'"{label}=fujimoto | Detach: ^A D | Scroll: ^A [ | Kill: ^A X"'
-        status_len = "80"
+        status_right = (
+            f'"Fujimoto: {label} t/T/w/v ({label} t toggles) | '
+            f'help: {label} ? | ^A D=detach"'
+        )
+        status_len = "120"
     else:
         status_right = '"Detach: ^A D | Scroll: ^A [ | Kill: ^A X"'
         status_len = "60"
@@ -224,19 +227,28 @@ def _configure_session(name: str) -> None:
 
 
 def _configure_fujimoto_key_table(name: str, meta_key: str) -> None:
-    """Install the one-shot fujimoto-mode key table on the session."""
+    """Install the one-shot fujimoto-mode key table.
+
+    tmux key bindings are server-global, not session-scoped — there is no
+    `-t <session>` flag on `bind-key`. The key table is installed once per
+    tmux server and shared across all sessions; the `name` argument is kept
+    for symmetry with `_configure_session` but not threaded into the commands.
+    """
+    del name  # bind-key has no per-session scope
     fujimoto_bindings: list[list[str]] = [
         [
             "t",
             "if-shell",
-            "[ #{session_panes} -lt 2 ]",
+            "-F",
+            "#{==:#{window_panes},1}",
             'split-window -v -l 30% -c "#{session_path}"',
             "select-pane -t :.+",
         ],
         [
             "T",
             "if-shell",
-            "[ #{session_panes} -lt 2 ]",
+            "-F",
+            "#{==:#{window_panes},1}",
             'split-window -h -l 40% -c "#{session_path}"',
             "select-pane -t :.+",
         ],
@@ -245,20 +257,20 @@ def _configure_fujimoto_key_table(name: str, meta_key: str) -> None:
         [
             "?",
             "display-message",
-            "F-mode: t=term  T=side  v=code  w=window  ?=help",
+            "-d",
+            "5000",
+            "F-mode: t/T=split or toggle focus  v=code  w=window  ?=help",
         ],
     ]
     for key, *cmd in fujimoto_bindings:
         subprocess.run(
-            ["tmux", "bind-key", "-t", name, "-T", "fujimoto", key, *cmd],
+            ["tmux", "bind-key", "-T", "fujimoto", key, *cmd],
             check=True,
         )
     subprocess.run(
         [
             "tmux",
             "bind-key",
-            "-t",
-            name,
             "-n",
             meta_key,
             "switch-client",
