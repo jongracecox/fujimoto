@@ -71,6 +71,7 @@ export FUJIMOTO_GIT_ROOT=~/git/                  # Enables project switching
 export FUJIMOTO_TERMINAL="alacritty --working-directory {dir}"  # Linux-only: terminal command
 export FUJIMOTO_WINDOW_TITLE="{git_project} - {worktree_name}"   # Terminal window title template
 export FUJIMOTO_META_KEY="C-f"                                   # In-session fujimoto chord (blank to disable)
+export FUJIMOTO_QUICK_TERMINAL_KEY="C-\`"                        # Global quick-terminal toggle key (blank to disable)
 ```
 
 If `FUJIMOTO_WORKTREE_ROOT` is unset, worktrees are created inside the current
@@ -116,6 +117,44 @@ via `FUJIMOTO_META_KEY`) to enter a one-shot "fujimoto mode", then:
 
 Set `FUJIMOTO_META_KEY=""` to disable the chord entirely, or to an alternative
 tmux key spec (e.g. `M-f`, `C-Space`) to remap.
+
+### Quick terminal shortcut (global)
+
+Fujimoto can install a **one-press** global tmux binding that toggles a 30%
+bottom terminal pane: press `` Ctrl-` `` once to open the pane in the current
+working directory; press again to cycle focus between the panes. The first
+time you launch fujimoto you'll be asked whether to enable it — the choice is
+remembered in `~/.cache/fujimoto/settings.json` and a toggle on the home
+screen lets you flip it later.
+
+This is a tmux *root-table* binding (`bind-key -n`), which means it's
+**server-global** — installing it affects every tmux session on the machine,
+not just the ones fujimoto created. Re-applied on every fujimoto session
+create so it survives a `tmux kill-server`.
+
+Override the key with `FUJIMOTO_QUICK_TERMINAL_KEY` (defaults to `` C-` ``).
+Set it to an empty string to disable the feature regardless of the saved
+preference; the home-screen toggle then shows `disabled (env)`.
+
+**Removing the binding.** Because it lives on the tmux server, deleting
+`~/.cache/fujimoto/settings.json` does *not* clear an already-installed
+binding. To remove it:
+
+- Toggle it off from the fujimoto home screen (preferred — runs
+  `tmux unbind-key -n` for you), **or**
+- Run `tmux unbind-key -n 'C-`'` (substitute your configured key) for a
+  one-off removal that survives until the next fujimoto session create, **or**
+- Run `tmux kill-server` to wipe all tmux state including this binding.
+
+Note: when the saved preference is `on`, fujimoto re-applies the binding on
+every session create (so it survives a `tmux kill-server`). Toggle it off
+first if you want the removal to stick across launches.
+
+> **Terminal caveat**: many terminals swallow or remap `` Ctrl-` `` (iTerm2,
+> Ghostty, Alacritty and others use it for a "quake-mode" toggle, and most
+> terminals don't send a distinguishable code for ``Ctrl`` plus a non-letter
+> key by default). If the binding doesn't fire, either remap your terminal
+> to forward `` Ctrl-` `` to tmux, or pick a different key via the env var.
 
 ### Platform support
 

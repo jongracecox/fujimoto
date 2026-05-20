@@ -14,8 +14,10 @@ from pathlib import Path
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Vertical, VerticalScroll
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
 from textual.widgets import (
+    Button,
     Footer,
     Header,
     Input,
@@ -58,10 +60,13 @@ from fujimoto.terminal import open_terminal
 from fujimoto.version import get_version
 from fujimoto.version_check import check_for_update, dismiss as dismiss_update_version
 from fujimoto.vscode import open_vscode
+from fujimoto.settings import Settings, load_settings, save_settings
 from fujimoto.tmux import (
     TmuxError,
     create_session_with_command,
+    disable_quick_terminal_binding,
     display_message,
+    enable_quick_terminal_binding,
     get_session_path,
     install_tmux,
     is_tmux_installed,
@@ -69,6 +74,7 @@ from fujimoto.tmux import (
     launch_claude_in_tmux,
     list_all_sessions,
     list_project_sessions,
+    quick_terminal_key,
     rename_session,
     session_name,
     set_terminal_title,
@@ -83,6 +89,19 @@ ICON_GREEN_CIRCLE = "\U0001f7e2"
 ICON_BLACK_CIRCLE = "\u26ab"
 ICON_HLINE = "\u2500"
 ICON_WIZARD = "\U0001f9d9\U0001f3fd\u200d\u2642\ufe0f"
+
+
+_KEY_PREFIX_LABELS = {"C-": "Ctrl+", "M-": "Alt+", "S-": "Shift+"}
+
+
+def _friendly_key_label(key: str) -> str:
+    """Render a tmux key spec like 'C-`' as a user-friendly 'Ctrl+`'."""
+    parts: list[str] = []
+    remaining = key
+    while len(remaining) >= 2 and remaining[:2] in _KEY_PREFIX_LABELS:
+        parts.append(_KEY_PREFIX_LABELS[remaining[:2]])
+        remaining = remaining[2:]
+    return "".join(parts) + remaining
 
 
 def _claude_state_label(state: SessionState) -> str:
@@ -392,7 +411,77 @@ Screen {
     color: $text-muted;
     margin-top: 0;
 }
+
+QuickTerminalPrompt {
+    align: center middle;
+}
+
+QuickTerminalPrompt > #qt-dialog {
+    width: 60;
+    height: auto;
+    padding: 1 2;
+    border: round $primary;
+    background: $surface;
+}
+
+QuickTerminalPrompt #qt-buttons {
+    height: auto;
+    align: center middle;
+    margin-top: 1;
+}
+
+QuickTerminalPrompt Button {
+    margin: 0 1;
+}
 """
+
+
+class QuickTerminalPrompt(ModalScreen[bool]):
+    BINDINGS = [
+        Binding("escape", "answer_no", show=False),
+        Binding("y", "answer_yes", show=False),
+        Binding("n", "answer_no", show=False),
+    ]
+
+    def __init__(self, key: str) -> None:
+        super().__init__()
+        self._key = key
+        self._key_label = _friendly_key_label(key)
+
+    def compose(self) -> ComposeResult:
+        yield Container(
+            Label("Enable quick terminal shortcut?", classes="form-label"),
+            Static(""),
+            Static(
+                f"Press {self._key_label} in any tmux session to toggle a 30% "
+                "bottom terminal pane. This installs a global tmux binding "
+                "that applies to every tmux session on this machine. You "
+                "can change this later from the home screen.",
+            ),
+            Horizontal(
+                Button(f"Yes ({self._key_label})", id="qt-yes", variant="primary"),
+                Button("No thanks", id="qt-no"),
+                id="qt-buttons",
+            ),
+            id="qt-dialog",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#qt-yes", Button).focus()
+
+    @on(Button.Pressed, "#qt-yes")
+    def _yes(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#qt-no")
+    def _no(self) -> None:
+        self.dismiss(False)
+
+    def action_answer_yes(self) -> None:
+        self.dismiss(True)
+
+    def action_answer_no(self) -> None:
+        self.dismiss(False)
 
 
 @dataclass
@@ -461,6 +550,8 @@ class SessionApp(App):
             self._init_git_info()
             self._start_update_check()
             await self._show_home()
+            if load_settings().quick_terminal_enabled is None and quick_terminal_key():
+                self._prompt_quick_terminal()
         except (ConfigError, GitError) as e:
             await self._show_error(str(e))
 
@@ -528,6 +619,22 @@ class SessionApp(App):
         await main.mount(
             Static(f"[bold red]Error:[/] {message}", markup=True),
         )
+
+    def _prompt_quick_terminal(self) -> None:
+        def _handle(answer: bool | None) -> None:
+            if answer is None:
+                return
+            save_settings(Settings(quick_terminal_enabled=answer))
+            if answer:
+                enable_quick_terminal_binding()
+            self.run_worker(self._refresh_home_settings_row(), exclusive=False)
+
+        self.push_screen(QuickTerminalPrompt(quick_terminal_key()), _handle)
+
+    async def _refresh_home_settings_row(self) -> None:
+        """Re-render the home screen so the Settings row reflects the new value."""
+        if self._on_home:
+            await self._show_home()
 
     async def _show_tmux_install(self) -> None:
         await self._clear_main()
@@ -765,7 +872,8 @@ class SessionApp(App):
                 )
                 items.append(ListItem(Label(label_text, markup=True), id=item_id))
 
-        if self._available_projects:
+        settings_items = self._build_settings_items()
+        if self._available_projects or settings_items:
             items.append(
                 ListItem(
                     Static(
@@ -775,15 +883,17 @@ class SessionApp(App):
                     disabled=True,
                 ),
             )
-            items.append(
-                ListItem(
-                    Label(
-                        f"[dim]Switch project (current: {self._project_name})[/]",
-                        markup=True,
+            items.extend(settings_items)
+            if self._available_projects:
+                items.append(
+                    ListItem(
+                        Label(
+                            f"[dim]Switch project (current: {self._project_name})[/]",
+                            markup=True,
+                        ),
+                        id="action-switch-project",
                     ),
-                    id="action-switch-project",
-                ),
-            )
+                )
 
         await main.mount(
             Container(
@@ -793,6 +903,24 @@ class SessionApp(App):
         )
         self.query_one("#home-list").focus()
         self._poll_timer = self.set_interval(3, self._poll_session_states)
+
+    def _build_settings_items(self) -> list[ListItem]:
+        key = quick_terminal_key()
+        if not key:
+            label_text = "[dim]Quick terminal shortcut: disabled (env)[/]"
+        else:
+            enabled = load_settings().quick_terminal_enabled is True
+            state = "on" if enabled else "off"
+            label_text = (
+                f"[dim]Quick terminal shortcut: {state}  "
+                f"({_friendly_key_label(key)})[/]"
+            )
+        return [
+            ListItem(
+                Label(label_text, markup=True),
+                id="action-toggle-quick-terminal",
+            )
+        ]
 
     async def _poll_session_states(self) -> None:
         """Poll for Claude session state changes and update labels in-place."""
@@ -1476,8 +1604,22 @@ class SessionApp(App):
             self._launch_adhoc_session()
         elif item_id == "action-switch-project":
             await self._show_project_select()
+        elif item_id == "action-toggle-quick-terminal":
+            await self._toggle_quick_terminal()
         elif item_id and item_id in self._session_map:
             await self._show_session_actions(self._session_map[item_id])
+
+    async def _toggle_quick_terminal(self) -> None:
+        if not quick_terminal_key():
+            return
+        current = load_settings().quick_terminal_enabled is True
+        new_value = not current
+        save_settings(Settings(quick_terminal_enabled=new_value))
+        if new_value:
+            enable_quick_terminal_binding()
+        else:
+            disable_quick_terminal_binding()
+        await self._show_home()
 
     def _launch_adhoc_session(self) -> None:
         all_sessions = set(list_all_sessions())
