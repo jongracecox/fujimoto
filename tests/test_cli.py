@@ -652,7 +652,8 @@ class TestSessionAppSessionActions:
                 await pilot.press("enter")
                 await pilot.pause()
                 assert len(app.query("#session-actions")) > 0
-                # First option for inactive is "Launch"
+                # Inactive order: Resume previous, Launch — pick Launch
+                await pilot.press("down")
                 await pilot.press("enter")
                 await pilot.pause()
                 assert app._launch_target is not None
@@ -791,8 +792,7 @@ class TestSessionAppSessionActions:
                         break
                 await pilot.press("enter")
                 await pilot.pause()
-                # "Resume previous session" is the second option (after Launch)
-                await pilot.press("down")
+                # "Resume previous session" is the first option for inactive worktrees
                 await pilot.press("enter")
                 await pilot.pause()
                 assert len(app.query("#resume-picker")) > 0

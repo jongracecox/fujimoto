@@ -870,10 +870,10 @@ class SessionApp(App):
                 ListItem(Label("Resume previous session"), id="sa-resume-picker")
             )
         else:
-            items.append(ListItem(Label("Launch"), id="sa-launch"))
             items.append(
                 ListItem(Label("Resume previous session"), id="sa-resume-picker")
             )
+            items.append(ListItem(Label("Launch"), id="sa-launch"))
 
         items.append(ListItem(Label("Open terminal"), id="sa-terminal"))
         items.append(ListItem(Label("Open in VS Code"), id="sa-vscode"))
