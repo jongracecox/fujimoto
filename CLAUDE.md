@@ -21,7 +21,8 @@ export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/   # Optional: where worktrees are
 export FUJIMOTO_GIT_ROOT=~/git/                  # Optional: enables project switching
 export FUJIMOTO_TERMINAL="alacritty --working-directory {dir}"  # Optional (Linux): terminal command
 export FUJIMOTO_WINDOW_TITLE="{git_project} - {worktree_name}"   # Optional: terminal window title template
-export FUJIMOTO_META_KEY="C-f"                                   # Optional: in-session fujimoto chord (blank to disable)
+export FUJIMOTO_META_KEY="C-a"                                   # Optional: in-session fujimoto chord (blank to disable)
+export FUJIMOTO_TMUX_PREFIX="C-b"                                # Optional: tmux prefix key (default: C-b)
 export FUJIMOTO_QUICK_TERMINAL_KEY="C-\`"                        # Optional: global quick-terminal toggle key (blank to disable)
 ```
 
@@ -55,14 +56,24 @@ manually, or `tmux kill-server`. With the preference still `on`, fujimoto
 re-installs the binding on every session create — so toggle it off first if
 you want the removal to persist.
 
-`FUJIMOTO_META_KEY` (default `C-f`) configures the in-session "fujimoto mode"
+`FUJIMOTO_META_KEY` (default `C-a`) configures the in-session "fujimoto mode"
 chord. Pressing it inside an attached tmux session enters a one-shot key table
 where `t`/`T` split a terminal pane (single-pane guard via `if-shell` on
-`#{session_panes}`), `v` opens VS Code, `w` opens a native terminal window, and
-`?` flashes a cheatsheet via `display-message`. `v`/`w` dispatch to the
-`fujimoto pane <action> --session <name>` CLI subcommand which reuses the
-existing launchers in `vscode.py` / `terminal.py`. Set to the empty string to
-disable; the bindings and the status-bar hint are then both omitted.
+`#{session_panes}`), `v` opens VS Code, `w` opens a native terminal window,
+`d` detaches the session, `x` kills the current pane (via `confirm-before`),
+`[` enters copy mode, and `?` flashes a cheatsheet via `display-message`.
+`v`/`w` dispatch to the `fujimoto pane <action> --session <name>` CLI
+subcommand which reuses the existing launchers in `vscode.py` / `terminal.py`.
+Set to the empty string to disable; the bindings and the status-bar hint are
+then both omitted.
+
+`FUJIMOTO_TMUX_PREFIX` (default `C-b`, tmux's standard default) configures the
+tmux prefix key. Fujimoto raises `TmuxError` if `FUJIMOTO_META_KEY` and
+`FUJIMOTO_TMUX_PREFIX` are set to the same value. Pre-`v?` versions of
+fujimoto used `C-f` for the meta key and `C-a` for the prefix; the defaults
+were swapped so the fujimoto chord lives on the more ergonomic `C-a` slot. To
+restore the old layout, set `FUJIMOTO_META_KEY=C-f` and
+`FUJIMOTO_TMUX_PREFIX=C-a`.
 
 If `FUJIMOTO_WORKTREE_ROOT` is unset, worktrees are created at
 `<repo_root>/.fujimoto/worktrees/` (the `.fujimoto/` directory is auto-gitignored
@@ -188,11 +199,11 @@ Otherwise it:
 - `launch_claude_in_tmux(project, path, tmux_name, system_prompt, resume_session_id)` — orchestrates create-or-attach, supports resuming previous Claude sessions
 - `get_session_path(name)` — returns the start directory of a tmux session via `display-message -p '#{session_path}'`, used by the `fujimoto pane` subcommand
 - `display_message(name, message)` — surface a transient message in the session's status bar, used to report errors from `fujimoto pane` back into the session
-- `_configure_session(name)` — applies the C-a prefix, status bar, and (if `FUJIMOTO_META_KEY` is non-empty) the fujimoto key table via `_configure_fujimoto_key_table`
+- `_configure_session(name)` — applies the configured prefix (default `C-b`), status bar, and (if `FUJIMOTO_META_KEY` is non-empty) the fujimoto key table via `_configure_fujimoto_key_table`. Raises `TmuxError` if the meta and prefix keys collide. The `unbind-key C-b` step only runs when the prefix has been moved off `C-b` (otherwise it would unbind the new prefix).
 - `quick_terminal_key()` — returns the configured `FUJIMOTO_QUICK_TERMINAL_KEY` (default `` C-` ``)
 - `enable_quick_terminal_binding()` / `disable_quick_terminal_binding()` — install/remove the **server-global** root-table binding (`bind-key -n <key>`) that toggles a 30% bottom pane. The bound command uses `if-shell -F '#{==:#{window_panes},1}'` to split on the first press and cycle focus on subsequent presses. Both are no-ops when the env var is empty. Idempotent.
 - `_apply_quick_terminal_setting()` — called from `create_session` / `create_session_with_command` after `_ensure_extended_keys()`. Re-applies the binding when `Settings.quick_terminal_enabled` is True, so the feature survives `tmux kill-server`. Lazily imports `settings` to avoid a circular import.
-- `_configure_fujimoto_key_table(name, meta_key)` — installs the one-shot key table: `t`/`T` (`if-shell` guard ensuring a single extra pane; falls back to `select-pane :.+`), `v`/`w` (dispatch to `fujimoto pane <action> --session #{session_name}` via `run-shell`), `?` (cheatsheet). Root-level `bind-key -n <meta_key> switch-client -T fujimoto` arms the chord.
+- `_configure_fujimoto_key_table(name, meta_key)` — installs the one-shot key table: `t`/`T` (`if-shell` guard ensuring a single extra pane; falls back to `select-pane :.+`), `v`/`w` (dispatch to `fujimoto pane <action> --session #{session_name}` via `run-shell`), `d` (detach-client), `x` (`confirm-before` kill-pane), `[` (copy-mode), `?` (cheatsheet). Root-level `bind-key -n <meta_key> switch-client -T fujimoto` arms the chord.
 
 **`claude/log_parser.py`** — Parse Claude Code's JSONL session logs:
 - `ClaudeLogError` — raised on empty/unreadable logs
@@ -241,7 +252,7 @@ Three custom exception types, all caught in `main()`:
 ### Key Design Decisions
 
 - **TUI loop with tmux detach**: The TUI runs in a `while True` loop. After tmux detach (subprocess.run returns), the loop restarts and the TUI reappears. The loop breaks when the user quits without selecting a session.
-- **Per-session tmux config**: Prefix remapped to Ctrl+A, status bar with shortcut hints — all set via `tmux set-option -t` so the user's global config is untouched. The attach flow is silent (no pre-attach banner) to reduce noise when launching sessions repeatedly.
+- **Per-session tmux config**: Prefix defaults to `Ctrl-B` (tmux's standard default; configurable via `FUJIMOTO_TMUX_PREFIX`), status bar with shortcut hints — all set via `tmux set-option -t` so the user's global config is untouched. The attach flow is silent (no pre-attach banner) to reduce noise when launching sessions repeatedly.
 - **Global install via `uv tool`**: Requires `--force --reinstall` to rebuild the wheel from source. Plain `--force` reuses cached builds.
 - **Session metadata**: `.fujimoto/meta.json` stored in worktree directory records the base branch for cherry-pick targeting. The `.fujimoto/` directory contains a `.gitignore` with `*` so its contents are automatically ignored by git.
 - **Background PR creation**: Uses `claude -p --allowedTools "Bash(git:*) Bash(gh:*)"` in a tmux session for unattended PR creation.

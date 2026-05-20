@@ -240,36 +240,101 @@ class TestConfigureSession:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("FUJIMOTO_META_KEY", raising=False)
+        monkeypatch.delenv("FUJIMOTO_TMUX_PREFIX", raising=False)
         with patch(
             "fujimoto.tmux.subprocess.run", return_value=MagicMock(returncode=0)
         ) as mock_run:
             _configure_session("proj/test")
 
             cmds = [c.args[0] for c in mock_run.call_args_list]
-            # Status hint mentions fujimoto chord
+            # Status hint mentions fujimoto chord with new default ^A
             status_cmd = next(
                 c
                 for c in cmds
                 if c[:3] == ["tmux", "set-option", "-t"] and c[4] == "status-right"
             )
-            assert "Fujimoto: ^F t/T/w/v" in status_cmd[5]
-            assert "^F t toggles" in status_cmd[5]
-            assert "help: ^F ?" in status_cmd[5]
+            assert "Fujimoto: ^A t/T/w/v/d/x/[" in status_cmd[5]
+            assert "^A t toggles" in status_cmd[5]
+            assert "help: ^A ?" in status_cmd[5]
             # fujimoto-table bindings present (server-global, no -t)
             table_keys = [
                 c[4] for c in cmds if c[:4] == ["tmux", "bind-key", "-T", "fujimoto"]
             ]
-            assert set(table_keys) == {"t", "T", "v", "w", "?"}
-            # Root C-f switches to fujimoto table (server-global, no -t)
+            assert set(table_keys) == {"t", "T", "v", "w", "d", "x", "[", "?"}
+            # Root C-a switches to fujimoto table (server-global, no -t)
             assert any(
-                c[:5] == ["tmux", "bind-key", "-n", "C-f", "switch-client"]
+                c[:5] == ["tmux", "bind-key", "-n", "C-a", "switch-client"]
                 for c in cmds
             )
+
+    def test_default_prefix_is_c_b(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("FUJIMOTO_META_KEY", raising=False)
+        monkeypatch.delenv("FUJIMOTO_TMUX_PREFIX", raising=False)
+        with patch(
+            "fujimoto.tmux.subprocess.run", return_value=MagicMock(returncode=0)
+        ) as mock_run:
+            _configure_session("proj/test")
+            cmds = [c.args[0] for c in mock_run.call_args_list]
+            # prefix is set to C-b
+            assert any(
+                c[:3] == ["tmux", "set-option", "-t"]
+                and c[4] == "prefix"
+                and c[5] == "C-b"
+                for c in cmds
+            )
+            # send-prefix bound to C-b
+            assert any(
+                c[:5] == ["tmux", "bind-key", "-t", "proj/test", "C-b"]
+                and c[5] == "send-prefix"
+                for c in cmds
+            )
+            # default prefix matches DEFAULT_PREFIX_KEY -> no unbind C-b
+            assert not any(
+                c[:3] == ["tmux", "unbind-key", "-t"] and c[4] == "C-b" for c in cmds
+            )
+
+    def test_custom_prefix_unbinds_default_c_b(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FUJIMOTO_META_KEY", "C-f")
+        monkeypatch.setenv("FUJIMOTO_TMUX_PREFIX", "C-a")
+        with patch(
+            "fujimoto.tmux.subprocess.run", return_value=MagicMock(returncode=0)
+        ) as mock_run:
+            _configure_session("proj/test")
+            cmds = [c.args[0] for c in mock_run.call_args_list]
+            # prefix set to C-a
+            assert any(
+                c[:3] == ["tmux", "set-option", "-t"]
+                and c[4] == "prefix"
+                and c[5] == "C-a"
+                for c in cmds
+            )
+            # Old C-b prefix unbound
+            assert any(
+                c[:3] == ["tmux", "unbind-key", "-t"] and c[4] == "C-b" for c in cmds
+            )
+            # send-prefix bound on C-a
+            assert any(
+                c[:5] == ["tmux", "bind-key", "-t", "proj/test", "C-a"]
+                and c[5] == "send-prefix"
+                for c in cmds
+            )
+
+    def test_collision_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("FUJIMOTO_META_KEY", "C-a")
+        monkeypatch.setenv("FUJIMOTO_TMUX_PREFIX", "C-a")
+        with patch(
+            "fujimoto.tmux.subprocess.run", return_value=MagicMock(returncode=0)
+        ):
+            with pytest.raises(TmuxError, match="both set to 'C-a'"):
+                _configure_session("proj/test")
 
     def test_disabled_when_meta_key_empty(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("FUJIMOTO_META_KEY", "")
+        monkeypatch.delenv("FUJIMOTO_TMUX_PREFIX", raising=False)
         with patch(
             "fujimoto.tmux.subprocess.run", return_value=MagicMock(returncode=0)
         ) as mock_run:
@@ -282,16 +347,18 @@ class TestConfigureSession:
             assert not any(
                 c[:2] == ["tmux", "bind-key"] and "switch-client" in c for c in cmds
             )
-            # Status hint omits the chord prefix
+            # Status hint omits the chord prefix and uses configured prefix label
             status_cmd = next(
                 c
                 for c in cmds
                 if c[:3] == ["tmux", "set-option", "-t"] and c[4] == "status-right"
             )
-            assert "fujimoto" not in status_cmd[5]
+            assert "Fujimoto" not in status_cmd[5]
+            assert "^B D" in status_cmd[5]
 
     def test_custom_meta_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("FUJIMOTO_META_KEY", "M-f")
+        monkeypatch.delenv("FUJIMOTO_TMUX_PREFIX", raising=False)
         with patch(
             "fujimoto.tmux.subprocess.run", return_value=MagicMock(returncode=0)
         ) as mock_run:

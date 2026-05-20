@@ -7,7 +7,9 @@ import sys
 from pathlib import Path
 
 META_KEY_ENV = "FUJIMOTO_META_KEY"
-DEFAULT_META_KEY = "C-f"
+DEFAULT_META_KEY = "C-a"
+PREFIX_KEY_ENV = "FUJIMOTO_TMUX_PREFIX"
+DEFAULT_PREFIX_KEY = "C-b"
 
 QUICK_TERMINAL_KEY_ENV = "FUJIMOTO_QUICK_TERMINAL_KEY"
 DEFAULT_QUICK_TERMINAL_KEY = "C-`"
@@ -16,6 +18,11 @@ DEFAULT_QUICK_TERMINAL_KEY = "C-`"
 def _meta_key() -> str:
     """Return the configured fujimoto meta key, or empty string if disabled."""
     return os.environ.get(META_KEY_ENV, DEFAULT_META_KEY)
+
+
+def _prefix_key() -> str:
+    """Return the configured tmux prefix key."""
+    return os.environ.get(PREFIX_KEY_ENV, DEFAULT_PREFIX_KEY)
 
 
 def quick_terminal_key() -> str:
@@ -248,19 +255,30 @@ def disable_quick_terminal_binding() -> None:
 def _configure_session(name: str) -> None:
     """Apply standard tmux configuration to a session."""
     meta_key = _meta_key()
+    prefix_key = _prefix_key()
+    if meta_key and prefix_key and meta_key == prefix_key:
+        raise TmuxError(
+            f"FUJIMOTO_META_KEY and FUJIMOTO_TMUX_PREFIX both set to {meta_key!r}; "
+            "they must differ."
+        )
+
+    prefix_label = _meta_key_label(prefix_key)
     if meta_key:
-        label = _meta_key_label(meta_key)
+        meta_label = _meta_key_label(meta_key)
         status_right = (
-            f'"Fujimoto: {label} t/T/w/v ({label} t toggles) | '
-            f'help: {label} ? | ^A D=detach"'
+            f'"Fujimoto: {meta_label} t/T/w/v/d/x/[ ({meta_label} t toggles) | '
+            f'help: {meta_label} ?"'
         )
         status_len = "120"
     else:
-        status_right = '"Detach: ^A D | Scroll: ^A [ | Kill: ^A X"'
+        status_right = (
+            f'"Detach: {prefix_label} D | Scroll: {prefix_label} [ | '
+            f'Kill: {prefix_label} X"'
+        )
         status_len = "60"
 
     options: dict[str, str] = {
-        "prefix": "C-a",
+        "prefix": prefix_key,
         "status-right": status_right,
         "status-style": "bg=colour235,fg=colour248",
         "status-right-length": status_len,
@@ -270,12 +288,15 @@ def _configure_session(name: str) -> None:
             ["tmux", "set-option", "-t", name, key, value],
             check=True,
         )
+    # Default tmux prefix is C-b; only unbind it if we've moved the prefix
+    # elsewhere, otherwise we'd unbind the user's chosen prefix.
+    if prefix_key != "C-b":
+        subprocess.run(
+            ["tmux", "unbind-key", "-t", name, "C-b"],
+            capture_output=True,
+        )
     subprocess.run(
-        ["tmux", "unbind-key", "-t", name, "C-b"],
-        capture_output=True,
-    )
-    subprocess.run(
-        ["tmux", "bind-key", "-t", name, "C-a", "send-prefix"],
+        ["tmux", "bind-key", "-t", name, prefix_key, "send-prefix"],
         capture_output=True,
     )
 
@@ -311,12 +332,15 @@ def _configure_fujimoto_key_table(name: str, meta_key: str) -> None:
         ],
         ["v", "run-shell", "fujimoto pane vscode --session #{session_name}"],
         ["w", "run-shell", "fujimoto pane terminal --session #{session_name}"],
+        ["d", "detach-client"],
+        ["x", "confirm-before", "-p", "kill pane #P? (y/n)", "kill-pane"],
+        ["[", "copy-mode"],
         [
             "?",
             "display-message",
             "-d",
             "5000",
-            "F-mode: t/T=split or toggle focus  v=code  w=window  ?=help",
+            "F-mode: t/T=split  v=code  w=window  d=detach  x=kill  [=copy  ?=help",
         ],
     ]
     for key, *cmd in fujimoto_bindings:
