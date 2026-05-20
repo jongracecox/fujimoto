@@ -70,9 +70,19 @@ export FUJIMOTO_WORKTREE_ROOT=~/git/worktrees/   # Where worktrees are created
 export FUJIMOTO_GIT_ROOT=~/git/                  # Enables project switching
 export FUJIMOTO_TERMINAL="alacritty --working-directory {dir}"  # Linux-only: terminal command
 export FUJIMOTO_WINDOW_TITLE="{git_project} - {worktree_name}"   # Terminal window title template
-export FUJIMOTO_META_KEY="C-f"                                   # In-session fujimoto chord (blank to disable)
+export FUJIMOTO_META_KEY="C-a"                                   # In-session fujimoto chord (blank to disable)
+export FUJIMOTO_TMUX_PREFIX="C-b"                                # tmux prefix key (default: C-b)
 export FUJIMOTO_QUICK_TERMINAL_KEY="C-\`"                        # Global quick-terminal toggle key (blank to disable)
 ```
+
+> **Note:** As of this release, the **defaults are swapped** from earlier
+> versions. The fujimoto chord is now `Ctrl-A` (was `Ctrl-F`) and the tmux
+> prefix is now `Ctrl-B` (was `Ctrl-A`). To restore the previous layout:
+>
+> ```sh
+> export FUJIMOTO_META_KEY="C-f"
+> export FUJIMOTO_TMUX_PREFIX="C-a"
+> ```
 
 If `FUJIMOTO_WORKTREE_ROOT` is unset, worktrees are created inside the current
 project at `<repo>/.fujimoto/worktrees/` (the `.fujimoto/` directory is
@@ -104,7 +114,7 @@ Unknown placeholders render as empty strings.
 
 ### In-session shortcuts
 
-When attached to a fujimoto-managed tmux session, press `Ctrl-F` (configurable
+When attached to a fujimoto-managed tmux session, press `Ctrl-A` (configurable
 via `FUJIMOTO_META_KEY`) to enter a one-shot "fujimoto mode", then:
 
 | Key | Action |
@@ -113,10 +123,15 @@ via `FUJIMOTO_META_KEY`) to enter a one-shot "fujimoto mode", then:
 | `T` | Open a full-height side pane on the right. Same behavior as `t`: press again to toggle focus. |
 | `v` | Open VS Code at the session's working directory. |
 | `w` | Open a native terminal window at the session's working directory. |
+| `d` | Detach the tmux session (returns you to the fujimoto TUI). |
+| `x` | Kill the current pane (with confirmation prompt). |
+| `[` | Enter copy mode (scrollback / selection). |
 | `?` | Flash the binding cheatsheet in the status bar. |
 
 Set `FUJIMOTO_META_KEY=""` to disable the chord entirely, or to an alternative
-tmux key spec (e.g. `M-f`, `C-Space`) to remap.
+tmux key spec (e.g. `M-f`, `C-Space`) to remap. `FUJIMOTO_META_KEY` and
+`FUJIMOTO_TMUX_PREFIX` must differ — fujimoto will refuse to start a session
+otherwise.
 
 ### Quick terminal shortcut (global)
 
@@ -227,15 +242,20 @@ For already-merged branches: **Delete** or **Delete + remove remote branch**.
 
 ### tmux Session Controls
 
-Each session remaps the prefix key to `Ctrl+A`:
+The tmux prefix defaults to `Ctrl-B` (tmux's standard default) and is
+configurable via `FUJIMOTO_TMUX_PREFIX`:
 
 | Shortcut | Action |
 |----------|--------|
-| `Ctrl+A D` | Detach (leave running) |
-| `Ctrl+A [` | Scroll/copy mode |
-| `Ctrl+A X` | Kill pane |
+| `Ctrl-B D` | Detach (leave running) |
+| `Ctrl-B [` | Scroll/copy mode |
+| `Ctrl-B X` | Kill pane |
 
-These are set per-session and don't affect your global tmux config.
+The same actions are also reachable from the fujimoto chord — e.g. `Ctrl-A d`,
+`Ctrl-A [`, `Ctrl-A x` — so swapping the prefix off `Ctrl-A` doesn't cost you
+these bindings.
+
+These options are set per-session and don't affect your global tmux config.
 
 ### Keyboard Shortcuts
 
