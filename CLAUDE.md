@@ -164,9 +164,11 @@ src/fujimoto/
 - Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
 - Session actions submenu: Connect/Launch, Resume previous session (worktree/direct), Terminate, Resume (claude sessions), Rename, Open terminal, Open in VS Code, Finish (worktree only)
 - Finish flow: Push & Create PR (background Claude), Cherry-pick to base, Discard & Delete
+- Open terminal flow: sub-menu with "New window" (spawns a new iTerm/Terminal/Linux emulator window via `open_terminal()`) and "This window" (sets `_shell_target` and exits the TUI; `main()` then `os.execvp`s the user's `$SHELL` with cwd set to the session path, so the current terminal becomes a shell in that directory and `exit` returns to the parent shell that launched fujimoto)
 - All view transitions are `async` — `await _clear_main()` then `await mount()`
 - Session data stored in `_session_map` dict keyed by ListItem ID
 - `_launch_target` is `(project, path, tmux_name, session_type, resume_id)`, set before `self.exit()`
+- `_shell_target` is a `Path` set before `self.exit()` when the user picks "Open terminal → This window"; consumed by `main()` to `os.execvp` a shell in that directory
 
 ### Error Handling
 
