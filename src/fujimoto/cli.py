@@ -1094,10 +1094,7 @@ class SessionApp(App):
             except OSError as e:
                 await self._show_error(str(e))
                 return
-            try:
-                await self._show_home()
-            except (ConfigError, GitError) as e:  # pragma: no cover
-                await self._show_error(str(e))
+            await self._show_session_actions(session)
         elif action == "term-this":
             shell = os.environ.get("SHELL", "/bin/sh")
             try:
