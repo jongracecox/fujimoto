@@ -98,6 +98,66 @@ def _clean_argv(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("sys.argv", ["fujimoto"])
 
 
+class TestPaneSubcommand:
+    def test_vscode_invokes_open_vscode_with_session_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "sys.argv", ["fujimoto", "pane", "vscode", "--session", "proj/test"]
+        )
+        with (
+            patch("fujimoto.cli.get_session_path", return_value=Path("/tmp/wt")),
+            patch("fujimoto.cli.open_vscode") as mock_code,
+        ):
+            main()
+            mock_code.assert_called_once_with(Path("/tmp/wt"))
+
+    def test_terminal_invokes_open_terminal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "sys.argv", ["fujimoto", "pane", "terminal", "--session", "proj/test"]
+        )
+        with (
+            patch("fujimoto.cli.get_session_path", return_value=Path("/tmp/wt")),
+            patch("fujimoto.cli.open_terminal") as mock_term,
+        ):
+            main()
+            mock_term.assert_called_once_with(Path("/tmp/wt"))
+
+    def test_missing_session_path_surfaces_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "sys.argv", ["fujimoto", "pane", "vscode", "--session", "ghost"]
+        )
+        with (
+            patch("fujimoto.cli.get_session_path", return_value=None),
+            patch("fujimoto.cli.display_message") as mock_msg,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        assert exc_info.value.code == 1
+        mock_msg.assert_called_once()
+        assert "ghost" in mock_msg.call_args.args[1]
+
+    def test_oserror_surfaces_via_display_message(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "sys.argv", ["fujimoto", "pane", "vscode", "--session", "proj/test"]
+        )
+        with (
+            patch("fujimoto.cli.get_session_path", return_value=Path("/tmp/wt")),
+            patch("fujimoto.cli.open_vscode", side_effect=OSError("code missing")),
+            patch("fujimoto.cli.display_message") as mock_msg,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        assert exc_info.value.code == 1
+        assert "code missing" in mock_msg.call_args.args[1]
+
+
 class TestMain:
     def test_exits_on_config_error(self) -> None:
         with (

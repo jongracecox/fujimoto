@@ -61,6 +61,8 @@ from fujimoto.vscode import open_vscode
 from fujimoto.tmux import (
     TmuxError,
     create_session_with_command,
+    display_message,
+    get_session_path,
     install_tmux,
     is_tmux_installed,
     kill_session,
@@ -1929,6 +1931,22 @@ def _session_terminal_title(
     return f"{prefix} - {suffix}"
 
 
+def _run_pane_command(action: str, session: str) -> None:
+    """Dispatch in-session pane actions invoked via tmux key bindings."""
+    path = get_session_path(session)
+    if path is None:
+        display_message(session, f"fujimoto: could not resolve session '{session}'")
+        sys.exit(1)
+    try:
+        if action == "vscode":
+            open_vscode(path)
+        elif action == "terminal":
+            open_terminal(path)
+    except OSError as exc:
+        display_message(session, f"fujimoto: {exc}")
+        sys.exit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="fujimoto", add_help=True)
     parser.add_argument(
@@ -1937,7 +1955,15 @@ def main() -> None:
         action="version",
         version=f"fujimoto {get_version()}",
     )
-    parser.parse_args()
+    sub = parser.add_subparsers(dest="command")
+    pane = sub.add_parser("pane", help="Per-session pane actions")
+    pane.add_argument("action", choices=["vscode", "terminal"])
+    pane.add_argument("--session", required=True)
+
+    args = parser.parse_args()
+    if args.command == "pane":
+        _run_pane_command(args.action, args.session)
+        return
 
     try:
         issues = _check_prerequisites()
