@@ -330,15 +330,6 @@ def create_session_with_command(name: str, working_dir: Path, command: str) -> N
 
 
 def attach_session(name: str) -> None:
-    print()
-    print("╭─────────────────────────────────────────────╮")
-    print("│  Attaching to tmux session                  │")
-    print("│                                             │")
-    print("│  Ctrl+A D  — Detach (leave running)         │")
-    print("│  Ctrl+A [  — Scroll mode                    │")
-    print("│  Ctrl+A X  — Kill pane                      │")
-    print("╰─────────────────────────────────────────────╯")
-    print()
     subprocess.run(["tmux", "attach-session", "-t", name])
 
 
