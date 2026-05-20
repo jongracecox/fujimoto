@@ -102,8 +102,10 @@ Unknown placeholders render as empty strings.
 
 Fujimoto runs on macOS and Linux.
 
-- **macOS**: "Open terminal" uses iTerm2 if installed, otherwise Terminal.app. tmux is auto-installable via brew.
-- **Linux**: "Open terminal" uses `FUJIMOTO_TERMINAL` if set, otherwise auto-detects a common terminal emulator (gnome-terminal, konsole, kitty, alacritty, wezterm, foot, xfce4-terminal, tilix, terminator, xterm). `FUJIMOTO_TERMINAL` accepts a `{dir}` placeholder for the working directory; if absent, the directory is appended as the final argument. tmux must be installed manually — fujimoto will print the right command for your distro (apt-get / dnf / pacman / zypper / apk).
+- **macOS**: "Open terminal → New window" uses iTerm2 if installed, otherwise Terminal.app. tmux is auto-installable via brew.
+- **Linux**: "Open terminal → New window" uses `FUJIMOTO_TERMINAL` if set, otherwise auto-detects a common terminal emulator (gnome-terminal, konsole, kitty, alacritty, wezterm, foot, xfce4-terminal, tilix, terminator, xterm). `FUJIMOTO_TERMINAL` accepts a `{dir}` placeholder for the working directory; if absent, the directory is appended as the final argument. tmux must be installed manually — fujimoto will print the right command for your distro (apt-get / dnf / pacman / zypper / apk).
+
+"Open terminal → This window" instead replaces the running fujimoto process with your `$SHELL`, with the working directory set to the session path. Running `exit` returns you to the shell that originally launched fujimoto.
 
 ## Usage
 

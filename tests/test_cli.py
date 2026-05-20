@@ -152,6 +152,45 @@ class TestMain:
             main()
         assert exc_info.value.code == 130
 
+    def test_shell_target_execs_shell(self) -> None:
+        mock_app = SessionApp.__new__(SessionApp)
+        mock_app._launch_target = None
+        mock_app._shell_target = Path("/tmp/worktree")
+
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", return_value=mock_app),
+            patch.object(mock_app, "run"),
+            patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli._exec_shell_in") as mock_exec,
+        ):
+            main()
+            mock_exec.assert_called_once_with(Path("/tmp/worktree"))
+            mock_launch.assert_not_called()
+
+    def test_exec_shell_in_calls_execvp(self) -> None:
+        from fujimoto.cli import _exec_shell_in
+
+        with (
+            patch("fujimoto.cli.os.environ", {"SHELL": "/bin/zsh"}),
+            patch("fujimoto.cli.os.chdir") as mock_chdir,
+            patch("fujimoto.cli.os.execvp") as mock_execvp,
+        ):
+            _exec_shell_in(Path("/tmp/worktree"))
+            mock_chdir.assert_called_once_with(Path("/tmp/worktree"))
+            mock_execvp.assert_called_once_with("/bin/zsh", ["/bin/zsh"])
+
+    def test_exec_shell_in_defaults_to_sh(self) -> None:
+        from fujimoto.cli import _exec_shell_in
+
+        with (
+            patch("fujimoto.cli.os.environ", {}),
+            patch("fujimoto.cli.os.chdir"),
+            patch("fujimoto.cli.os.execvp") as mock_execvp,
+        ):
+            _exec_shell_in(Path("/tmp/worktree"))
+            mock_execvp.assert_called_once_with("/bin/sh", ["/bin/sh"])
+
     def test_launches_tmux_then_loops_back(self) -> None:
         # First iteration: launch target set -> attach tmux
         # Second iteration: no target -> exit loop
@@ -805,7 +844,7 @@ class TestSessionAppOpenTerminal:
                 assert "sa-terminal" in action_ids
 
     @pytest.mark.asyncio
-    async def test_open_terminal_calls_open_terminal(self) -> None:
+    async def test_open_terminal_shows_mode_submenu(self) -> None:
         with _patch_git_info(sessions=["test-proj/direct-1"]):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -820,30 +859,57 @@ class TestSessionAppOpenTerminal:
                 for i, item in enumerate(actions.children):
                     if item.id == "sa-terminal":
                         actions.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                mode_list = app.query_one("#terminal-mode-list", ListView)
+                ids = [c.id for c in mode_list.children]
+                assert ids == ["term-window", "term-this", "term-cancel"]
+
+    async def _navigate_to_terminal_mode(self, pilot: object, app: SessionApp) -> None:
+        home_list = app.query_one("#home-list", ListView)
+        for i, item in enumerate(home_list.children):
+            if item.id == "ds-test-proj--direct-1":
+                home_list.index = i
+                break
+        await pilot.press("enter")  # type: ignore[attr-defined]
+        await pilot.pause()  # type: ignore[attr-defined]
+        actions = app.query_one("#session-actions", ListView)
+        for i, item in enumerate(actions.children):
+            if item.id == "sa-terminal":
+                actions.index = i
+                break
+        await pilot.press("enter")  # type: ignore[attr-defined]
+        await pilot.pause()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_term_window_calls_open_terminal_and_returns_home(self) -> None:
+        with _patch_git_info(sessions=["test-proj/direct-1"]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._navigate_to_terminal_mode(pilot, app)
+                mode_list = app.query_one("#terminal-mode-list", ListView)
+                for i, item in enumerate(mode_list.children):
+                    if item.id == "term-window":
+                        mode_list.index = i
                         break
                 with patch("fujimoto.cli.open_terminal") as mock_open:
                     await pilot.press("enter")
                     await pilot.pause()
                     mock_open.assert_called_once()
-                    # Should stay on session actions menu
-                    assert len(app.query("#session-actions")) > 0
+                    # Returned to home view
+                    assert len(app.query("#home-list")) > 0
 
     @pytest.mark.asyncio
-    async def test_open_terminal_error_shows_error(self) -> None:
+    async def test_term_window_error_shows_error(self) -> None:
         with _patch_git_info(sessions=["test-proj/direct-1"]):
             app = SessionApp()
             async with app.run_test() as pilot:
-                home_list = app.query_one("#home-list", ListView)
-                for i, item in enumerate(home_list.children):
-                    if item.id == "ds-test-proj--direct-1":
-                        home_list.index = i
-                        break
-                await pilot.press("enter")
-                await pilot.pause()
-                actions = app.query_one("#session-actions", ListView)
-                for i, item in enumerate(actions.children):
-                    if item.id == "sa-terminal":
-                        actions.index = i
+                await self._navigate_to_terminal_mode(pilot, app)
+                mode_list = app.query_one("#terminal-mode-list", ListView)
+                for i, item in enumerate(mode_list.children):
+                    if item.id == "term-window":
+                        mode_list.index = i
                         break
                 with patch(
                     "fujimoto.cli.open_terminal",
@@ -851,9 +917,40 @@ class TestSessionAppOpenTerminal:
                 ):
                     await pilot.press("enter")
                     await pilot.pause()
-                    # Error view: no session-actions, no home-list
-                    assert len(app.query("#session-actions")) == 0
+                    assert len(app.query("#terminal-mode-list")) == 0
                     assert len(app.query("#home-list")) == 0
+
+    @pytest.mark.asyncio
+    async def test_term_this_sets_shell_target_and_exits(self) -> None:
+        with _patch_git_info(sessions=["test-proj/direct-1"]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._navigate_to_terminal_mode(pilot, app)
+                mode_list = app.query_one("#terminal-mode-list", ListView)
+                for i, item in enumerate(mode_list.children):
+                    if item.id == "term-this":
+                        mode_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+            assert app._shell_target is not None
+            assert app._launch_target is None
+
+    @pytest.mark.asyncio
+    async def test_term_cancel_returns_to_session_actions(self) -> None:
+        with _patch_git_info(sessions=["test-proj/direct-1"]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._navigate_to_terminal_mode(pilot, app)
+                mode_list = app.query_one("#terminal-mode-list", ListView)
+                for i, item in enumerate(mode_list.children):
+                    if item.id == "term-cancel":
+                        mode_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#session-actions")) > 0
+                assert len(app.query("#terminal-mode-list")) == 0
 
 
 class TestSessionAppOpenVscode:
