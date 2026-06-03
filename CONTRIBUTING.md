@@ -36,6 +36,8 @@ src/fujimoto/
 ├── config.py     # Env var loading, path construction, session metadata
 ├── git.py        # Git subprocess wrappers
 ├── tmux.py       # tmux session management
+├── project_config.py  # Optional per-project .fujimoto.yaml (copy/link/init)
+├── templates/    # Packaged scaffolds (fujimoto.yaml.template)
 └── claude/
     ├── __init__.py      # Re-exports public API
     └── log_parser.py    # Parse Claude JSONL session logs

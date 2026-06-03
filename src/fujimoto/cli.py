@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from rich.markup import escape
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -31,10 +32,12 @@ from fujimoto.claude import ClaudeSession, SessionState, get_sessions_for_path
 from fujimoto.config import (
     ConfigError,
     build_worktree_path,
+    config_once_applied,
     get_next_adhoc_session_name,
     get_next_direct_session_name,
     get_project_worktrees_dir,
     list_projects,
+    mark_config_once_applied,
     read_session_meta,
     slugify,
     store_session_meta,
@@ -47,6 +50,7 @@ from fujimoto.git import (
     fetch_branch,
     get_current_branch,
     get_default_branch,
+    get_main_worktree_root,
     get_project_name,
     get_repo_root,
     get_unpushed_commits,
@@ -55,6 +59,13 @@ from fujimoto.git import (
     list_branches,
     push_branch,
     remove_worktree,
+)
+from fujimoto.project_config import (
+    OnError,
+    Trigger,
+    apply_project_config,
+    load_project_config,
+    write_config_template,
 )
 from fujimoto.terminal import open_terminal
 from fujimoto.version import get_version
@@ -433,6 +444,33 @@ QuickTerminalPrompt #qt-buttons {
 QuickTerminalPrompt Button {
     margin: 0 1;
 }
+
+ConfigErrorDialog {
+    align: center middle;
+}
+
+ConfigErrorDialog > #ce-dialog {
+    width: 80;
+    max-width: 90%;
+    height: auto;
+    max-height: 80%;
+    padding: 1 2;
+    border: round $error;
+    background: $surface;
+}
+
+ConfigErrorDialog #ce-message {
+    height: auto;
+    max-height: 20;
+    overflow-y: auto;
+    margin-top: 1;
+}
+
+ConfigErrorDialog #ce-buttons {
+    height: auto;
+    align: center middle;
+    margin-top: 1;
+}
 """
 
 
@@ -482,6 +520,45 @@ class QuickTerminalPrompt(ModalScreen[bool]):
 
     def action_answer_no(self) -> None:
         self.dismiss(False)
+
+
+class ConfigErrorDialog(ModalScreen[None]):
+    """Modal shown at startup when `.fujimoto.yaml` fails to parse/validate."""
+
+    BINDINGS = [
+        Binding("escape", "close", show=False),
+        Binding("enter", "close", show=False),
+    ]
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self._message = message
+
+    def compose(self) -> ComposeResult:
+        yield Container(
+            Label("[bold red]⚠ .fujimoto.yaml is invalid[/]", markup=True),
+            # markup=False: validation text can contain brackets that aren't markup.
+            Static(self._message, markup=False, id="ce-message"),
+            Label(
+                "Project config will be skipped until this is fixed.",
+                classes="hint",
+            ),
+            Horizontal(
+                Button("OK", id="ce-ok", variant="primary"),
+                id="ce-buttons",
+            ),
+            id="ce-dialog",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#ce-ok", Button).focus()
+
+    @on(Button.Pressed, "#ce-ok")
+    def _ok(self) -> None:
+        self.dismiss(None)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
 
 
 @dataclass
@@ -550,6 +627,9 @@ class SessionApp(App):
             self._init_git_info()
             self._start_update_check()
             await self._show_home()
+            config_error = self._project_config_error()
+            if config_error is not None:
+                self.push_screen(ConfigErrorDialog(config_error))
             if load_settings().quick_terminal_enabled is None and quick_terminal_key():
                 self._prompt_quick_terminal()
         except (ConfigError, GitError) as e:
@@ -616,8 +696,10 @@ class SessionApp(App):
     async def _show_error(self, message: str) -> None:
         await self._clear_main()
         main = self.query_one("#main")
+        # Escape the message: error text (e.g. pydantic validation output) can
+        # contain brackets that would otherwise be parsed as console markup.
         await main.mount(
-            Static(f"[bold red]Error:[/] {message}", markup=True),
+            Static(f"[bold red]Error:[/] {escape(message)}", markup=True),
         )
 
     def _prompt_quick_terminal(self) -> None:
@@ -662,6 +744,16 @@ class SessionApp(App):
         self.query_one("#tmux-install-list").focus()
 
     # -- Home screen --
+
+    def _project_config_error(self) -> str | None:
+        """Return the project's `.fujimoto.yaml` validation error, if any."""
+        if self._project_root is None:
+            return None
+        try:
+            load_project_config(self._project_root)
+        except ConfigError as e:
+            return str(e)
+        return None
 
     async def _show_home(self) -> None:
         await self._clear_main()
@@ -1428,6 +1520,7 @@ class SessionApp(App):
 
     async def _do_create_and_launch(self) -> None:
         assert self._worktree_path is not None
+        assert self._project_root is not None
         new_branch = f"worktree/{self._worktree_path.name}"
         try:
             create_worktree(
@@ -1436,10 +1529,14 @@ class SessionApp(App):
                 new_branch,
                 cwd=self._project_cwd,
             )
-            store_session_meta(self._worktree_path, self._base_branch)
+            store_session_meta(
+                self._worktree_path, self._base_branch, source_root=self._project_root
+            )
         except GitError as e:
             await self._show_error(str(e))
             return
+        # Project config (copy/link/init) is applied in main() before launch,
+        # uniformly across all connection modes.
         self._launch_target = (
             self._project_name,
             self._worktree_path,
@@ -2088,6 +2185,109 @@ def _session_terminal_title(
     return f"{prefix} - {suffix}"
 
 
+def _pause_for_key(prompt: str) -> None:
+    """Block until the user presses a key, so a message survives `tmux attach`.
+
+    Reads a single keypress in raw mode on a tty; falls back to line input
+    elsewhere and is a no-op when stdin is not a terminal (e.g. tests).
+    """
+    if not sys.stdin.isatty():  # pragma: no cover - exercised via patching
+        return
+    print(prompt, end="", flush=True)
+    try:
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:  # pragma: no cover - non-POSIX / no termios
+        sys.stdin.readline()
+    print()
+
+
+def _resolve_worktree_source(working_dir: Path) -> Path | None:
+    """Return the main repo root if `working_dir` is a linked worktree, else None.
+
+    Prefers the `source_root` recorded in session metadata, falling back to
+    deriving it from git. Returns None for the main repo, direct/adhoc sessions,
+    or anything that isn't a linked worktree — those get no project config.
+    """
+    recorded = read_session_meta(working_dir).get("source_root")
+    try:
+        main_root = get_main_worktree_root(working_dir)
+    except GitError:
+        return None
+    if main_root == working_dir.resolve():
+        return None  # main repo (direct session), not a linked worktree
+    return Path(recorded) if recorded else main_root
+
+
+def _apply_worktree_config(working_dir: Path) -> bool:
+    """Apply project config before launching a worktree session.
+
+    Runs `once` actions only on first creation (tracked by a marker), and
+    `always` actions on every connection mode. Errors are shown and the user is
+    prompted to acknowledge before the screen is taken over by `tmux attach`.
+
+    Returns True to proceed with the launch, False to abort it (the caller then
+    reopens the TUI). Non-worktree sessions always proceed.
+    """
+    source_root = _resolve_worktree_source(working_dir)
+    if source_root is None:
+        return True
+
+    first_time = not config_once_applied(working_dir)
+    trigger = Trigger.CREATE if first_time else Trigger.LAUNCH
+
+    # The config is a local file in the main clone (not committed, so it isn't
+    # present in worktree checkouts) — read it from the source root. A malformed
+    # config is already surfaced on the home screen, so here we just skip it.
+    try:
+        config = load_project_config(source_root)
+    except ConfigError:
+        return True
+
+    result = apply_project_config(
+        config,
+        source_root=source_root,
+        worktree_root=working_dir,
+        trigger=trigger,
+    )
+    for warning in result.warnings:
+        print(f"fujimoto: {warning}", file=sys.stderr)
+
+    if result.init_error:
+        print(f"fujimoto: {result.init_error}", file=sys.stderr)
+        abort = config.on_error is OnError.ABORT
+        verb = "aborting launch" if abort else "continuing"
+        _pause_for_key(f"An error was encountered ({verb}). Press any key...")
+        if abort:
+            return False
+        if first_time:
+            mark_config_once_applied(working_dir)
+        return True
+
+    if first_time:
+        mark_config_once_applied(working_dir)
+    return True
+
+
+def _create_config() -> None:
+    """Scaffold a `.fujimoto.yaml` at the repo root (used by --create-config)."""
+    try:
+        repo_root = get_repo_root()
+        dest = write_config_template(repo_root)
+    except (ConfigError, GitError) as e:
+        print(f"fujimoto: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Created {dest}")
+
+
 def _run_pane_command(action: str, session: str) -> None:
     """Dispatch in-session pane actions invoked via tmux key bindings."""
     path = get_session_path(session)
@@ -2112,6 +2312,11 @@ def main() -> None:
         action="version",
         version=f"fujimoto {get_version()}",
     )
+    parser.add_argument(
+        "--create-config",
+        action="store_true",
+        help="Write a commented .fujimoto.yaml template to the repo root and exit",
+    )
     sub = parser.add_subparsers(dest="command")
     pane = sub.add_parser("pane", help="Per-session pane actions")
     pane.add_argument("action", choices=["vscode", "terminal"])
@@ -2120,6 +2325,9 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "pane":
         _run_pane_command(args.action, args.session)
+        return
+    if args.create_config:
+        _create_config()
         return
 
     try:
@@ -2149,6 +2357,8 @@ def main() -> None:
                         project_name, tmux_name, working_dir, session_type
                     )
                 )
+                if not _apply_worktree_config(working_dir):
+                    continue  # setup failed and on_error=abort -> reopen the TUI
                 launch_claude_in_tmux(
                     project_name,
                     working_dir,

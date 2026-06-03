@@ -15,6 +15,7 @@ from fujimoto.cli import (
     ICON_GEAR,
     ICON_SHIELD,
     SessionApp,
+    SessionInfo,
     _claude_state_label,
     _format_prompt_lines,
     _friendly_key_label,
@@ -165,7 +166,352 @@ class TestPaneSubcommand:
         assert "code missing" in mock_msg.call_args.args[1]
 
 
+class TestCreateConfigFlag:
+    def test_creates_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", "--create-config"])
+        with patch("fujimoto.cli.get_repo_root", return_value=tmp_path):
+            main()
+        assert (tmp_path / ".fujimoto.yaml").exists()
+
+    def test_refuses_overwrite(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        (tmp_path / ".fujimoto.yaml").write_text("existing")
+        monkeypatch.setattr("sys.argv", ["fujimoto", "--create-config"])
+        with (
+            patch("fujimoto.cli.get_repo_root", return_value=tmp_path),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        assert exc_info.value.code == 1
+        assert (tmp_path / ".fujimoto.yaml").read_text() == "existing"
+
+    def test_not_a_repo(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", "--create-config"])
+        with (
+            patch("fujimoto.cli.get_repo_root", side_effect=GitError("not a git repo")),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        assert exc_info.value.code == 1
+
+
+class TestShowError:
+    @pytest.mark.asyncio
+    async def test_renders_message_with_brackets(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test():
+                # Brackets would be parsed as markup if not escaped.
+                await app._show_error("boom [type=int, input_value=1]")
+                text = app.query_one("#main").query("Static")[0].render().plain
+                assert "[type=int, input_value=1]" in text
+
+
+class TestConfigErrorDialog:
+    @pytest.mark.asyncio
+    async def test_dialog_shown_for_invalid_config(self) -> None:
+        from fujimoto.cli import ConfigErrorDialog
+        from fujimoto.config import ConfigError
+
+        # Message contains brackets (like pydantic's validation output) which
+        # must not be parsed as console markup.
+        msg = "Invalid .fujimoto.yaml:\nwhen [type=enum, input_value=1, input_type=int]"
+        with _patch_git_info():
+            with patch(
+                "fujimoto.cli.load_project_config",
+                side_effect=ConfigError(msg),
+            ):
+                app = SessionApp()
+                async with app.run_test() as pilot:
+                    await pilot.pause()
+                    assert isinstance(app.screen, ConfigErrorDialog)
+
+    @pytest.mark.asyncio
+    async def test_dialog_dismissed_with_ok(self) -> None:
+        from fujimoto.cli import ConfigErrorDialog
+        from fujimoto.config import ConfigError
+
+        with _patch_git_info():
+            with patch(
+                "fujimoto.cli.load_project_config",
+                side_effect=ConfigError("bad yaml"),
+            ):
+                app = SessionApp()
+                async with app.run_test() as pilot:
+                    await pilot.pause()
+                    assert isinstance(app.screen, ConfigErrorDialog)
+                    await pilot.click("#ce-ok")
+                    await pilot.pause()
+                    assert not isinstance(app.screen, ConfigErrorDialog)
+
+    @pytest.mark.asyncio
+    async def test_no_dialog_for_valid_config(self) -> None:
+        from fujimoto.cli import ConfigErrorDialog
+
+        with _patch_git_info():
+            with patch("fujimoto.cli.load_project_config"):
+                app = SessionApp()
+                async with app.run_test() as pilot:
+                    await pilot.pause()
+                    assert not isinstance(app.screen, ConfigErrorDialog)
+
+    @pytest.mark.asyncio
+    async def test_invalid_config_does_not_block_launch(self) -> None:
+        # The dialog informs but must not prevent opening a session — you may
+        # need to launch one to fix the file.
+        from types import SimpleNamespace
+
+        from fujimoto.config import ConfigError
+
+        with _patch_git_info():
+            with patch(
+                "fujimoto.cli.load_project_config",
+                side_effect=ConfigError("bad yaml"),
+            ):
+                app = SessionApp()
+                async with app.run_test() as pilot:
+                    await pilot.pause()
+                    app._selected_session = SessionInfo(
+                        name="wt",
+                        session_type="worktree",
+                        project="p",
+                        path=Path("/tmp/wt"),
+                        tmux_session="p/wt",
+                        is_active=True,
+                        branch="b",
+                    )
+                    event = SimpleNamespace(item=SimpleNamespace(id="sa-connect"))
+                    await app.on_session_action_selected(event)  # type: ignore[arg-type]
+                    assert app._launch_target is not None
+
+
+class TestResolveWorktreeSource:
+    def test_prefers_meta_source_root(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _resolve_worktree_source
+
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        with (
+            patch(
+                "fujimoto.cli.read_session_meta",
+                return_value={"source_root": "/main/repo"},
+            ),
+            patch(
+                "fujimoto.cli.get_main_worktree_root",
+                return_value=Path("/main/repo"),
+            ),
+        ):
+            assert _resolve_worktree_source(wt) == Path("/main/repo")
+
+    def test_falls_back_to_git(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _resolve_worktree_source
+
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        with (
+            patch("fujimoto.cli.read_session_meta", return_value={}),
+            patch(
+                "fujimoto.cli.get_main_worktree_root",
+                return_value=Path("/derived/repo"),
+            ),
+        ):
+            assert _resolve_worktree_source(wt) == Path("/derived/repo")
+
+    def test_none_for_main_repo(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _resolve_worktree_source
+
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        with (
+            patch("fujimoto.cli.read_session_meta", return_value={}),
+            patch("fujimoto.cli.get_main_worktree_root", return_value=wt.resolve()),
+        ):
+            assert _resolve_worktree_source(wt) is None
+
+    def test_none_when_not_a_repo(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _resolve_worktree_source
+
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        with (
+            patch("fujimoto.cli.read_session_meta", return_value={}),
+            patch(
+                "fujimoto.cli.get_main_worktree_root",
+                side_effect=GitError("not a repo"),
+            ),
+        ):
+            assert _resolve_worktree_source(wt) is None
+
+
+class TestApplyWorktreeConfig:
+    def test_non_worktree_proceeds(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _apply_worktree_config
+
+        with patch("fujimoto.cli._resolve_worktree_source", return_value=None):
+            assert _apply_worktree_config(tmp_path) is True
+
+    def test_first_time_uses_create_and_marks(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _apply_worktree_config
+        from fujimoto.project_config import ApplyResult, Trigger
+
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        source = tmp_path / "main"
+        source.mkdir()
+        with (
+            patch("fujimoto.cli._resolve_worktree_source", return_value=source),
+            patch("fujimoto.cli.config_once_applied", return_value=False),
+            patch("fujimoto.cli.load_project_config") as mock_load,
+            patch(
+                "fujimoto.cli.apply_project_config", return_value=ApplyResult()
+            ) as mock_apply,
+            patch("fujimoto.cli.mark_config_once_applied") as mock_mark,
+        ):
+            assert _apply_worktree_config(wt) is True
+            # Config is read from the source (main clone), not the worktree.
+            mock_load.assert_called_once_with(source)
+            assert mock_apply.call_args.kwargs["trigger"] is Trigger.CREATE
+            assert mock_apply.call_args.kwargs["source_root"] == source
+            assert mock_apply.call_args.kwargs["worktree_root"] == wt
+            mock_mark.assert_called_once_with(wt)
+
+    def test_subsequent_uses_launch_no_mark(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _apply_worktree_config
+        from fujimoto.project_config import ApplyResult, Trigger
+
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        with (
+            patch("fujimoto.cli._resolve_worktree_source", return_value=tmp_path),
+            patch("fujimoto.cli.config_once_applied", return_value=True),
+            patch("fujimoto.cli.load_project_config"),
+            patch(
+                "fujimoto.cli.apply_project_config", return_value=ApplyResult()
+            ) as mock_apply,
+            patch("fujimoto.cli.mark_config_once_applied") as mock_mark,
+        ):
+            assert _apply_worktree_config(wt) is True
+            assert mock_apply.call_args.kwargs["trigger"] is Trigger.LAUNCH
+            mock_mark.assert_not_called()
+
+    def test_init_error_abort_returns_false(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _apply_worktree_config
+        from fujimoto.project_config import ApplyResult, OnError, ProjectConfig
+
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        with (
+            patch("fujimoto.cli._resolve_worktree_source", return_value=tmp_path),
+            patch("fujimoto.cli.config_once_applied", return_value=False),
+            patch(
+                "fujimoto.cli.load_project_config",
+                return_value=ProjectConfig(on_error=OnError.ABORT),
+            ),
+            patch(
+                "fujimoto.cli.apply_project_config",
+                return_value=ApplyResult(init_error="boom"),
+            ),
+            patch("fujimoto.cli._pause_for_key") as mock_pause,
+            patch("fujimoto.cli.mark_config_once_applied") as mock_mark,
+        ):
+            assert _apply_worktree_config(wt) is False
+            mock_pause.assert_called_once()
+            mock_mark.assert_not_called()
+
+    def test_init_error_continue_returns_true_and_marks(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _apply_worktree_config
+        from fujimoto.project_config import ApplyResult, OnError, ProjectConfig
+
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        with (
+            patch("fujimoto.cli._resolve_worktree_source", return_value=tmp_path),
+            patch("fujimoto.cli.config_once_applied", return_value=False),
+            patch(
+                "fujimoto.cli.load_project_config",
+                return_value=ProjectConfig(on_error=OnError.CONTINUE),
+            ),
+            patch(
+                "fujimoto.cli.apply_project_config",
+                return_value=ApplyResult(init_error="boom"),
+            ),
+            patch("fujimoto.cli._pause_for_key"),
+            patch("fujimoto.cli.mark_config_once_applied") as mock_mark,
+        ):
+            assert _apply_worktree_config(wt) is True
+            mock_mark.assert_called_once_with(wt)
+
+    def test_config_error_skips_and_proceeds(self, tmp_path: Path) -> None:
+        # Malformed config is surfaced on the home screen; at launch it is just
+        # skipped (no pause, no apply) and the session still opens.
+        from fujimoto.cli import _apply_worktree_config
+        from fujimoto.config import ConfigError
+
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        with (
+            patch("fujimoto.cli._resolve_worktree_source", return_value=tmp_path),
+            patch("fujimoto.cli.config_once_applied", return_value=False),
+            patch(
+                "fujimoto.cli.load_project_config",
+                side_effect=ConfigError("bad yaml"),
+            ),
+            patch("fujimoto.cli.apply_project_config") as mock_apply,
+            patch("fujimoto.cli._pause_for_key") as mock_pause,
+        ):
+            assert _apply_worktree_config(wt) is True
+            mock_apply.assert_not_called()
+            mock_pause.assert_not_called()
+
+
+class TestPauseForKey:
+    def test_reads_single_key_on_tty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import termios
+        import tty
+
+        from fujimoto import cli
+
+        monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(cli.sys.stdin, "fileno", lambda: 0)
+        monkeypatch.setattr(termios, "tcgetattr", lambda fd: [])
+        monkeypatch.setattr(termios, "tcsetattr", lambda fd, when, attrs: None)
+        monkeypatch.setattr(tty, "setraw", lambda fd: None)
+        reads: list[int] = []
+        monkeypatch.setattr(cli.sys.stdin, "read", lambda n: (reads.append(n), "x")[1])
+        cli._pause_for_key("prompt")
+        assert reads == [1]
+
+    def test_noop_when_not_a_tty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fujimoto import cli
+
+        monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
+        # Should return without touching stdin.read
+        cli._pause_for_key("prompt")
+
+
 class TestMain:
+    def test_aborts_launch_when_config_returns_false(self) -> None:
+        app1 = SessionApp.__new__(SessionApp)
+        app1._launch_target = ("proj", Path("/tmp/test"), None, "worktree", None)
+        app2 = SessionApp.__new__(SessionApp)
+        app2._launch_target = None
+
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]),
+            patch.object(app1, "run"),
+            patch.object(app2, "run"),
+            patch("fujimoto.cli._apply_worktree_config", return_value=False),
+            patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli._build_system_prompt", return_value="test"),
+            patch("fujimoto.cli._session_terminal_title", return_value="t"),
+        ):
+            main()
+            mock_launch.assert_not_called()
+
     def test_exits_on_config_error(self) -> None:
         with (
             patch("fujimoto.cli._check_prerequisites", return_value=[]),
@@ -233,11 +579,15 @@ class TestMain:
             patch.object(app1, "run"),
             patch.object(app2, "run"),
             patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            patch(
+                "fujimoto.cli._apply_worktree_config", return_value=True
+            ) as mock_apply,
             patch("fujimoto.cli._build_system_prompt", return_value="test") as mock_sp,
             patch("fujimoto.cli._session_terminal_title", return_value="test-title"),
         ):
             main()
             mock_sp.assert_called_once_with("worktree", "proj", Path("/tmp/test"))
+            mock_apply.assert_called_once_with(Path("/tmp/test"))
             mock_launch.assert_called_once_with(
                 "proj",
                 Path("/tmp/test"),
@@ -277,6 +627,7 @@ class TestMain:
             patch.object(app1, "run"),
             patch.object(app2, "run"),
             patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
             patch("fujimoto.cli._build_system_prompt", return_value="test"),
             patch("fujimoto.cli._session_terminal_title", return_value="test-title"),
         ):
@@ -1851,7 +2202,37 @@ class TestSessionAppCreateFlow:
                 await pilot.pause()
                 await pilot.press("enter")  # Select default branch
                 await pilot.pause()
-                mock_meta.assert_called_once_with(tmp_path / "new-wt", "main")
+                mock_meta.assert_called_once_with(
+                    tmp_path / "new-wt", "main", source_root=Path("/fake/repo")
+                )
+
+    @pytest.mark.asyncio
+    async def test_create_defers_config_to_launch(self, tmp_path: Path) -> None:
+        # Project config is applied in main() before launch, not in the create
+        # flow — so creating a worktree must not call apply_project_config.
+        with (
+            _patch_git_info(current="main", default="main"),
+            patch(
+                "fujimoto.cli.build_worktree_path",
+                return_value=tmp_path / "new-wt",
+            ),
+            patch("fujimoto.cli.create_worktree"),
+            patch("fujimoto.cli.store_session_meta"),
+            patch("fujimoto.cli.fetch_branch"),
+            patch("fujimoto.cli.apply_project_config") as mock_apply,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press(*"title")
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("enter")  # Select default branch
+                await pilot.pause()
+                mock_apply.assert_not_called()
+                assert app._launch_target is not None
+                assert app._launch_target[3] == "worktree"
 
 
 class TestSessionAppConflict:
@@ -2780,6 +3161,7 @@ class TestMainResume:
             patch.object(app1, "run"),
             patch.object(app2, "run"),
             patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
         ):
             main()
             mock_launch.assert_called_once_with(

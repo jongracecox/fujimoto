@@ -118,9 +118,17 @@ def _ensure_meta_dir(worktree_path: Path) -> Path:
     return meta_dir
 
 
-def store_session_meta(worktree_path: Path, base_branch: str) -> None:
-    """Write session metadata to a JSON file in the worktree directory."""
+def store_session_meta(
+    worktree_path: Path, base_branch: str, source_root: Path | None = None
+) -> None:
+    """Write session metadata to a JSON file in the worktree directory.
+
+    `source_root` records the main repo root the worktree was created from, so
+    project-config actions can resolve copy/link sources on later launches.
+    """
     meta = {"base_branch": base_branch}
+    if source_root is not None:
+        meta["source_root"] = str(source_root)
     meta_dir = _ensure_meta_dir(worktree_path)
     meta_path = meta_dir / META_FILENAME
     meta_path.write_text(json.dumps(meta))
@@ -135,6 +143,23 @@ def read_session_meta(worktree_path: Path) -> dict[str, str]:
         return json.loads(meta_path.read_text())
     except (json.JSONDecodeError, OSError):
         return {}
+
+
+CONFIG_ONCE_MARKER = "config_once_applied"
+
+
+def config_once_applied(worktree_path: Path) -> bool:
+    """Whether `once` project-config actions have already run for this worktree."""
+    return (_get_meta_dir(worktree_path) / CONFIG_ONCE_MARKER).exists()
+
+
+def mark_config_once_applied(worktree_path: Path) -> None:
+    """Record that `once` project-config actions have run for this worktree.
+
+    Subsequent launches read this marker and apply only `always` actions.
+    """
+    meta_dir = _ensure_meta_dir(worktree_path)
+    (meta_dir / CONFIG_ONCE_MARKER).write_text("")
 
 
 def get_next_direct_session_name(project_name: str, active_sessions: set[str]) -> str:

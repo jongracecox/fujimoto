@@ -1,0 +1,83 @@
+# .fujimoto.yaml — per-project worktree setup
+#
+# Optional configuration that fujimoto applies when it creates a worktree and
+# when it launches/resumes a session in one. Everything below is commented out:
+# uncomment and adapt the bits you need.
+#
+# This file lives in your MAIN clone and is read from there (worktrees don't
+# need their own copy). It's typically a local, uncommitted file — add it to
+# .git/info/exclude or .gitignore — since it often references local-only files
+# like .env.
+#
+# Three sections, all optional:
+#   copy  — files copied from the main repo into the worktree
+#   link  — files hard/symbolically linked into the worktree
+#   init  — commands run inside the worktree after copy/link
+#
+# WHEN do actions run? Each entry has an optional `when:`
+#   once   (default) — only the first time the worktree is created
+#   always           — on every connection: first create, reconnecting to a
+#                      running session, and relaunching/resuming an existing one
+#                      (use this to keep e.g. .env in sync with the main repo)
+#
+# All actions run in fujimoto (before the session is attached), so init output
+# is shown with a shell trace; on a non-`continue_on_error` failure you're asked
+# to acknowledge before continuing.
+#
+# PATHS: copy/link sources are resolved relative to the main repo root, and the
+# destination mirrors the same relative path inside the worktree (parent
+# directories are created as needed). Glob patterns are supported.
+
+# ---------------------------------------------------------------------------
+# copy: files to copy into the worktree
+# ---------------------------------------------------------------------------
+# copy:
+#   # Bare string — copied once at creation.
+#   - .env
+#
+#   # Mapping form — control when it is (re)copied.
+#   - path: config/secrets.json
+#     when: always          # re-copied on every launch
+#
+#   # Glob pattern — every match is copied.
+#   - "certs/*.pem"
+
+# ---------------------------------------------------------------------------
+# link: files to link into the worktree (instead of copying)
+# ---------------------------------------------------------------------------
+# A hard link shares storage with the original — edits in the worktree change
+# the source file too. Hard links cannot cross filesystems; if the worktree is
+# on a different volume, fujimoto falls back to a copy and warns. Use
+# `type: symbolic` for a symlink, which works across filesystems.
+# link:
+#   - path: shared/large-model.bin     # type: hard (default), when: once
+#
+#   - path: shared/dev.db
+#     type: symbolic
+#     when: always
+
+# ---------------------------------------------------------------------------
+# init: commands to run inside the worktree after files are copied/linked
+# ---------------------------------------------------------------------------
+# Commands run sequentially via the shell (with `sh -x`, so each command and its
+# output is visible), with the working directory set to the worktree root by
+# default. Running stops at the first failing command; set
+# `continue_on_error: true` to treat a failure as a warning and keep going.
+#
+# Placeholders available in `run` and `cwd`:
+#   {{ source_dir }}   — absolute path to the main repo root
+#   {{ worktree_dir }} — absolute path to the new worktree
+#
+# `on_error` (top level) decides what happens when a non-continue_on_error
+# command fails: `abort` (default) cancels the launch and returns to the
+# fujimoto menu; `continue` attaches the session anyway.
+# on_error: abort
+# init:
+#   # Bare string — runs once at creation, stops the run on failure.
+#   - uv sync
+#
+#   # Mapping form — full control.
+#   - run: ./scripts/dev-setup.sh {{ worktree_dir }}
+#     when: always
+#     continue_on_error: true
+#     cwd: "{{ source_dir }}"     # optional; defaults to the worktree root

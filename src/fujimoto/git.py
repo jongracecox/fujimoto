@@ -32,6 +32,16 @@ def get_project_name(cwd: Path | str | None = None) -> str:
     return get_repo_root(cwd).name
 
 
+def get_main_worktree_root(cwd: Path | str | None = None) -> Path:
+    """Return the main worktree's root for the repo containing `cwd`.
+
+    The common git dir (`--git-common-dir`) lives at `<main-worktree>/.git`, so
+    its parent is the main working copy even when `cwd` is a linked worktree.
+    """
+    common = _run(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=cwd)
+    return Path(common).parent
+
+
 def get_current_branch(cwd: Path | str | None = None) -> str:
     return _run(["branch", "--show-current"], cwd=cwd)
 

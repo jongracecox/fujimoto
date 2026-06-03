@@ -90,6 +90,67 @@ auto-gitignored). If `FUJIMOTO_GIT_ROOT` is unset, the project switcher is
 hidden. Add these to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.) to
 persist them.
 
+### Per-project setup (`.fujimoto.yaml`)
+
+Worktrees start as clean checkouts, so untracked local files (e.g. `.env`) and
+per-worktree setup aren't carried over automatically. Drop an optional
+`.fujimoto.yaml` in your **main clone** to declare what fujimoto should do when
+it creates a worktree — and, optionally, every time you launch a session in one.
+
+fujimoto reads the file from the main clone (not from the worktree), so it's
+typically a **local, uncommitted file** — add it to `.git/info/exclude` or
+`.gitignore`, since it often references local-only files like `.env`.
+
+Scaffold a fully commented starter file with:
+
+```sh
+fujimoto --create-config      # writes .fujimoto.yaml to the main clone's root
+```
+
+All three sections are optional:
+
+```yaml
+# Copy files from the main repo into the new worktree.
+copy:
+  - .env                       # string form -> copied once, at creation
+  - path: config/secrets.json
+    when: always               # re-copied on every launch (keeps it in sync)
+  - "certs/*.pem"              # glob patterns are supported
+
+# Link files instead of copying (hard link by default; falls back to a copy
+# with a warning if the worktree is on a different filesystem).
+link:
+  - path: shared/model.bin
+    type: symbolic             # hard (default) | symbolic
+
+# What to do if an init command fails (without continue_on_error):
+#   abort (default) returns to the menu; continue launches the session anyway.
+on_error: abort
+
+# Run setup commands in the worktree after files are placed.
+init:
+  - uv sync                    # e.g. create the worktree's virtualenv
+  - run: ./scripts/dev-setup.sh {{ worktree_dir }}
+    when: always
+    continue_on_error: true
+    cwd: "{{ source_dir }}"    # optional; defaults to the worktree root
+```
+
+Notes:
+
+- **`when`** controls timing: `once` (default) runs only the first time the
+  worktree is created; `always` runs on every connection — creating it,
+  reconnecting to a running session, and relaunching/resuming an existing one.
+- **Paths** are relative to the repo root; the destination mirrors the same
+  relative path inside the worktree.
+- **`init` commands** run (before the session is attached) via `sh -x`, so each
+  command and its output is shown, stopping at the first failure unless
+  `continue_on_error: true`. `{{ source_dir }}` and `{{ worktree_dir }}` expand
+  to the main repo and worktree paths. On failure you're prompted to acknowledge
+  the error before the screen is handed to the session.
+- fujimoto itself never creates a `.venv` — that's `uv` (or your tooling)
+  running inside the worktree. Use an `init: [uv sync]` entry to set one up.
+
 ### Window title template
 
 When a Claude session is attached, fujimoto sets the terminal window title to
