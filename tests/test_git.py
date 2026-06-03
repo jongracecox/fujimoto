@@ -16,6 +16,7 @@ from fujimoto.git import (
     fetch_branch,
     get_current_branch,
     get_default_branch,
+    get_main_worktree_root,
     get_merge_base,
     get_project_name,
     get_repo_root,
@@ -112,6 +113,26 @@ class TestGetDefaultBranch:
         with patch("fujimoto.git._run", side_effect=mock_run):
             result = get_default_branch()
             assert result == "main"
+
+
+class TestGetMainWorktreeRoot:
+    def test_returns_parent_of_common_git_dir(self) -> None:
+        def mock_run(args: list[str], **kwargs) -> str:  # type: ignore[no-untyped-def]
+            assert args == [
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ]
+            return "/home/user/repo/.git"
+
+        with patch("fujimoto.git._run", side_effect=mock_run):
+            assert get_main_worktree_root() == Path("/home/user/repo")
+
+    def test_resolves_against_real_repo(self) -> None:
+        # The main worktree root is a real directory holding the shared git dir.
+        root = get_main_worktree_root()
+        assert root.is_dir()
+        assert (root / ".git").exists()
 
 
 class TestCreateWorktree:

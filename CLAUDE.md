@@ -100,6 +100,10 @@ src/fujimoto/
 ├── version.py    # importlib.metadata wrapper for the running fujimoto version
 ├── version_check.py  # daily PyPI update check, dismissal cache (~/.cache/fujimoto/)
 ├── settings.py   # persistent user settings (~/.cache/fujimoto/settings.json)
+├── project_config.py  # optional per-project .fujimoto.yaml (copy/link/init worktree setup)
+├── templates/
+│   ├── __init__.py
+│   └── fujimoto.yaml.template  # commented scaffold written by `fujimoto --create-config`
 └── claude/
     ├── __init__.py      # Re-exports public API
     └── log_parser.py    # Parse Claude JSONL session logs (state, metadata, session lookup)
@@ -111,6 +115,7 @@ src/fujimoto/
 
 `cli.py:main()` is the package entry point (`pyproject.toml` `[project.scripts]`). It parses CLI args:
 - `--version`/`-V` prints `fujimoto {version}` and exits
+- `--create-config` writes a commented `.fujimoto.yaml` template to the repo root (via `project_config.write_config_template`) and exits; errors (already exists, not a git repo) print to stderr and exit 1.
 - `fujimoto pane <vscode|terminal> --session <name>` dispatches to `_run_pane_command`, used by the in-session tmux key table (`Ctrl-F v` / `Ctrl-F w`). Resolves the session's working directory via `tmux display-message -p '#{session_path}'` and calls the existing `open_vscode` / `open_terminal` helpers; errors are surfaced via `tmux display-message` so they appear in the session's status bar.
 
 Otherwise it:
@@ -146,7 +151,8 @@ Otherwise it:
 - `slugify(title)` — lowercase, replace non-alphanumeric with hyphens, strip/collapse
 - `build_worktree_path(project, title, project_root=None)` — with env var: `{root}/{project}/{YYYYMMDD}-{slug}`; with fallback: `<project_root>/.fujimoto/worktrees/{YYYYMMDD}-{slug}`
 - `get_project_worktrees_dir(project, project_root=None)` — with env var: `{root}/{project}`; with fallback: `<project_root>/.fujimoto/worktrees/`
-- `store_session_meta(path, base_branch)` / `read_session_meta(path)` — JSON metadata
+- `store_session_meta(path, base_branch, source_root=None)` / `read_session_meta(path)` — JSON metadata. `source_root` records the main repo the worktree was created from, so `project_config` can resolve copy/link sources on later launches (older worktrees without it fall back to deriving the root via `git.get_main_worktree_root`).
+- `config_once_applied(path)` / `mark_config_once_applied(path)` — presence-of-marker-file flag (`.fujimoto/config_once_applied`) recording that `once` project-config actions have run for the worktree.
 - `get_next_direct_session_name(project, sessions)` — computes `{project}/direct-N`
 - `get_next_adhoc_session_name(sessions)` — computes `adhoc-N`
 
@@ -154,6 +160,7 @@ Otherwise it:
 - `_run(args, cwd)` — subprocess runner, raises `GitError` on non-zero exit
 - `get_repo_root()` — `git rev-parse --show-toplevel`
 - `get_project_name()` — basename of repo root
+- `get_main_worktree_root(cwd)` — parent of `--git-common-dir`; the main worktree root even when `cwd` is a linked worktree
 - `get_current_branch()` — `git branch --show-current`
 - `get_default_branch()` — tries `symbolic-ref`, falls back to checking main/master
 - `fetch_and_rebase_branch(branch)` — `git fetch origin` + `git rebase origin/{branch}`
@@ -186,6 +193,39 @@ Otherwise it:
 - `load_settings()` / `save_settings()` — graceful read/write, swallow OS errors
   and corrupt JSON (returns defaults). Mirrors the `version_check.py` cache
   pattern.
+
+**`project_config.py`** — Optional per-project `.fujimoto.yaml` (validated with
+pydantic):
+- `CONFIG_FILENAME = ".fujimoto.yaml"`. Three optional sections — `copy`, `link`,
+  `init` — each a list whose items are a bare string or a mapping.
+- Enums: `Trigger` (`CREATE`, `LAUNCH`), `When` (`ONCE`, `ALWAYS`) with
+  `When.runs_on(trigger)` (ONCE → create only; ALWAYS → create + launch),
+  `LinkType` (`HARD`, `SYMBOLIC`), `OnError` (`ABORT`, `CONTINUE`).
+- Pydantic models: `CopyEntry(path, when)`, `LinkEntry(path, type, when)`,
+  `InitCommand(run, when, continue_on_error, cwd)`, `ProjectConfig(..., on_error)`.
+  A `model_validator(mode="before")` coerces bare strings into the mapping form;
+  `extra="forbid"` rejects unknown keys. `ProjectConfig` uses field aliases
+  (`copy`/`link`/`init`) because `copy` would shadow `BaseModel.copy()` — the
+  Python attributes are `copy_entries` / `link_entries` / `init_commands`.
+  `on_error` (default `ABORT`) governs the caller's reaction to a hard init
+  failure.
+- `load_project_config(project_root)` — returns an empty config if the file is
+  absent; raises `ConfigError` (reusing `config.ConfigError`) on malformed YAML
+  or validation failure (config errors are surfaced, not swallowed).
+- `apply_project_config(config, *, source_root, worktree_root, trigger)` — runs
+  entries where `when.runs_on(trigger)`. Copy/link sources resolve relative to
+  `source_root` (globs supported via `glob.has_magic`); destinations mirror the
+  same relative path. Hard links fall back to `shutil.copy2` + warning on
+  cross-filesystem `OSError`; `symbolic` uses `os.symlink`. Init commands run via
+  `subprocess.run(["sh", "-x", "-c", run])` — `sh -x` echoes each command so the
+  command and its output appear in the launch trace — with
+  `{{ source_dir }}`/`{{ worktree_dir }}` substitution, cwd defaulting to the
+  worktree root, stopping on first failure unless `continue_on_error`. Returns an
+  `ApplyResult(actions, warnings, init_error)` — it never raises for individual
+  action failures (`actions` is a log of what ran).
+- `template_text()` / `write_config_template(project_root)` — read the bundled
+  `templates/fujimoto.yaml.template` (via `importlib.resources`) and scaffold it
+  into a repo (refusing to overwrite an existing file).
 
 **`tmux.py`** — tmux session management:
 - `is_tmux_installed()` / `install_tmux()` — detection and install. macOS: brew install. Linux: raises `TmuxError` with a distro-appropriate install command (apt-get/dnf/pacman/zypper/apk) — does not invoke sudo automatically.
@@ -254,7 +294,13 @@ Three custom exception types, all caught in `main()`:
 - **TUI loop with tmux detach**: The TUI runs in a `while True` loop. After tmux detach (subprocess.run returns), the loop restarts and the TUI reappears. The loop breaks when the user quits without selecting a session.
 - **Per-session tmux config**: Prefix defaults to `Ctrl-B` (tmux's standard default; configurable via `FUJIMOTO_TMUX_PREFIX`), status bar with shortcut hints — all set via `tmux set-option -t` so the user's global config is untouched. The attach flow is silent (no pre-attach banner) to reduce noise when launching sessions repeatedly.
 - **Global install via `uv tool`**: Requires `--force --reinstall` to rebuild the wheel from source. Plain `--force` reuses cached builds.
-- **Session metadata**: `.fujimoto/meta.json` stored in worktree directory records the base branch for cherry-pick targeting. The `.fujimoto/` directory contains a `.gitignore` with `*` so its contents are automatically ignored by git.
+- **Session metadata**: `.fujimoto/meta.json` stored in worktree directory records the base branch for cherry-pick targeting and the `source_root` (main repo) for project-config source resolution. The `.fujimoto/` directory contains a `.gitignore` with `*` so its contents are automatically ignored by git.
+- **Project config (`.fujimoto.yaml`)**: An optional, committed per-project file (`project_config.py`) declaring files to copy/link into a worktree and init commands to run. Applied centrally in `main()`'s launch loop (parent process, **before** `tmux attach`) by `_apply_worktree_config(working_dir)`, for **every** worktree connection mode (new, reconnect-to-live, relaunch/resume) — so copy/link/init run on each connect, not just creation. `_do_create_and_launch` no longer applies config; it only creates the worktree and stores meta. Key mechanics:
+  - **Config is read from the source root (main clone), not the worktree.** `.fujimoto.yaml` is a local, uncommitted file in the main clone, so it isn't present in a worktree checkout — `_apply_worktree_config` calls `load_project_config(source_root)`. (`--create-config` writes it to the main clone's root.)
+  - **Worktree detection**: `_resolve_worktree_source` returns the main repo root (from meta `source_root`, else derived via `git.get_main_worktree_root`) only for a *linked* worktree; returns `None` for the main repo / direct / adhoc sessions (which then get no config). This is git-based, not `session_type`-based, so the resume path (historically labelled `"direct"`) is covered too.
+  - **`once` vs `always`**: trigger is `CREATE` only on the worktree's first launch — tracked by the `.fujimoto/config_once_applied` marker (`config.config_once_applied` / `mark_config_once_applied`); every later connection uses `LAUNCH` (only `always` entries). The marker is set after a successful (or `on_error=continue`) CREATE application, so `once` truly runs once.
+  - **Syntax errors are surfaced when the TUI opens.** `on_mount` calls `_project_config_error()` (which parses `load_project_config(self._project_root)`) and, on a `ConfigError`, pushes a `ConfigErrorDialog` modal (OK button; Enter/Escape to dismiss) over the home screen. It's informational only — dismissing it doesn't block any action, since you may need to launch a session to fix the file. Shown once per TUI appearance (per `SessionApp` instance / loop iteration). At launch time `_apply_worktree_config` simply skips a malformed config (no pause), since it's already been surfaced. The dialog (and `_show_error`) render the message with `markup=False` / `rich.markup.escape` because pydantic validation text contains brackets that would otherwise be parsed as console markup.
+  - **Errors**: copy/link issues are non-fatal warnings printed to stderr. A non-`continue_on_error` init failure is governed by the config's `on_error`: `abort` returns `False` (main `continue`s the loop → TUI reopens, launch skipped) and `continue` attaches anyway. Either way `_pause_for_key` shows the error and waits for a keypress so it isn't wiped by `tmux attach`.
 - **Background PR creation**: Uses `claude -p --allowedTools "Bash(git:*) Bash(gh:*)"` in a tmux session for unattended PR creation.
 - **Claude session integration**: The home screen fetches Claude session state from `~/.claude/projects/` JSONL logs via the log parser. Session states: 👀 awaiting input (`WAITING_FOR_USER`), 🛡️ approve tool (`WAITING_FOR_TOOL_APPROVAL`), ⚙ working (`WORKING`), 💤 idle (`IDLE`), no indicator (`UNKNOWN`). State logic: `last-prompt` marker → `IDLE` (session ended). For assistant entries: `stop_reason=tool_use` without a following `tool_result` → `WAITING_FOR_TOOL_APPROVAL` (pending user approval), `stop_reason=tool_use` with `tool_result` → `WORKING`, any other stop reason or no stop reason → `WAITING_FOR_USER`. Last entry is user → `WORKING`. Previous Claude sessions (from the project root, capped at 5) appear as resumable items. Resuming launches `claude --resume SESSION_ID` in a new tmux session. The latest Claude session per path is "claimed" by the corresponding tmux/worktree item to avoid duplication.
 - **Resume previous session — tmux naming**: When resuming from an inactive worktree, the resumed session reuses the worktree's existing tmux session name (e.g., `project/20260101-feature`) instead of generating a new `direct-N` name. This keeps the session correctly identified as a worktree item on subsequent TUI views, so its path and Claude session lookup remain tied to the worktree directory. For active worktrees (original session still alive), a `direct-N` name is used because the worktree name is occupied. The working directory for resumed sessions always comes from `cs.cwd` (the directory recorded in the Claude session log) rather than `session.path`.
@@ -312,6 +358,8 @@ Things discovered during development that are easy to forget:
 - **Global find-replace for renames** works well but always verify test patch target strings — they are plain strings not checked by the import system. Run the full test suite after any rename.
 - **Claude log entry types evolve** — real logs contain `last-prompt`, `queue-operation`, `progress` and other types beyond `assistant`/`user`/`system`/`file-history-snapshot`. The parser skips unrecognized types gracefully. `last-prompt` signals session end → `IDLE` state. `stop_reason=None` on assistant entries means interrupted/canceled (Esc) → `WAITING_FOR_USER`. Always smoke-test against real `~/.claude/projects/` data after changes.
 - **Shift+Enter in tmux requires `extended-keys always` globally** — tmux strips modifier info by default, making Shift+Enter identical to Enter. The fix requires two server/global-level settings: `set-option -g extended-keys always` and `set-option -s -a terminal-features xterm*:extkeys`. Per-session (`-t`) doesn't work. `extended-keys on` (vs `always`) doesn't work because Claude Code doesn't send the kitty keyboard protocol activation sequence. Requires tmux 3.2+. See `_ensure_extended_keys()` in `tmux.py`.
+- **fujimoto never creates `.venv` — `uv` does.** `create_worktree` only runs `git worktree add`; there is no venv/copy logic in the worktree lifecycle. A `.venv` appears in a worktree only because `uv sync`/`uv run` was run there (each worktree is its own project root with its own `pyproject.toml`, and uv materializes a per-project environment by default unless `UV_PROJECT_ENVIRONMENT` is set — which only `noxfile.py` does). The intended way to seed an environment in a fresh worktree is an `init: [uv sync]` entry in `.fujimoto.yaml`.
+- **Bundled package data must be importable as a subpackage.** `templates/` has an `__init__.py` so `importlib.resources.files("fujimoto.templates")` resolves and hatchling ships the `.template` file in the wheel. Verify with `uv build --wheel && unzip -l dist/*.whl | grep templates` after touching packaged resources.
 
 ## Releases
 

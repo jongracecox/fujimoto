@@ -9,12 +9,14 @@ import pytest
 from fujimoto.config import (
     ConfigError,
     build_worktree_path,
+    config_once_applied,
     get_git_projects_root,
     get_next_adhoc_session_name,
     get_next_direct_session_name,
     get_project_worktrees_dir,
     get_worktree_root,
     list_projects,
+    mark_config_once_applied,
     read_session_meta,
     slugify,
     store_session_meta,
@@ -271,6 +273,34 @@ class TestReadSessionMeta:
         meta_path.write_text("not json")
         result = read_session_meta(tmp_path)
         assert result == {}
+
+
+class TestStoreSessionMetaSourceRoot:
+    def test_records_source_root(self, tmp_path: Path) -> None:
+        store_session_meta(tmp_path, "main", source_root=Path("/main/repo"))
+        data = json.loads((tmp_path / ".fujimoto" / "meta.json").read_text())
+        assert data["source_root"] == "/main/repo"
+
+    def test_omits_source_root_when_none(self, tmp_path: Path) -> None:
+        store_session_meta(tmp_path, "main")
+        data = json.loads((tmp_path / ".fujimoto" / "meta.json").read_text())
+        assert "source_root" not in data
+
+
+class TestConfigOnceMarker:
+    def test_absent_by_default(self, tmp_path: Path) -> None:
+        assert config_once_applied(tmp_path) is False
+
+    def test_mark_then_present(self, tmp_path: Path) -> None:
+        mark_config_once_applied(tmp_path)
+        assert config_once_applied(tmp_path) is True
+
+    def test_marker_does_not_clobber_meta(self, tmp_path: Path) -> None:
+        store_session_meta(tmp_path, "main", source_root=Path("/main/repo"))
+        mark_config_once_applied(tmp_path)
+        data = json.loads((tmp_path / ".fujimoto" / "meta.json").read_text())
+        assert data["base_branch"] == "main"
+        assert data["source_root"] == "/main/repo"
 
 
 class TestGetNextDirectSessionName:
