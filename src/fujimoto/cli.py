@@ -667,6 +667,7 @@ class SessionApp(App):
         self._active_sessions = set(list_project_sessions(self._project_name))
         self._available_projects = list_projects()
         self.sub_title = self._project_name
+        set_terminal_title(_session_manager_title(self._project_name))
 
         self._existing_worktrees = []
         try:
@@ -2183,6 +2184,18 @@ def _session_terminal_title(
     if not suffix:
         return prefix
     return f"{prefix} - {suffix}"
+
+
+def _session_manager_title(project: str) -> str:
+    """Build the terminal title for the session-manager TUI.
+
+    Uses the same "<icon> fujimoto - <project>" format as a Claude session's
+    title, minus the worktree portion.
+    """
+    prefix = f"{ICON_WIZARD} fujimoto"
+    if not project:
+        return prefix
+    return f"{prefix} - {project}"
 
 
 def _pause_for_key(prompt: str) -> None:

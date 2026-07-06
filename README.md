@@ -173,6 +173,11 @@ Supported placeholders:
 
 Unknown placeholders render as empty strings.
 
+While the session-manager screen itself is open (before you attach a session),
+the title uses the same format without the worktree portion:
+`🧙🏽‍♂️ fujimoto - <project>`. It follows the current project as you switch
+projects. `FUJIMOTO_WINDOW_TITLE` does not affect this screen.
+
 ### In-session shortcuts
 
 When attached to a fujimoto-managed tmux session, press `Ctrl-A` (configurable

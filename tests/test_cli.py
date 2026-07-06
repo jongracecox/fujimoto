@@ -722,6 +722,18 @@ class TestSessionTerminalTitle:
         assert title == f"{ICON_WIZARD} fujimoto - proj/wt"
 
 
+class TestSessionManagerTitle:
+    def test_includes_project(self) -> None:
+        from fujimoto.cli import ICON_WIZARD, _session_manager_title
+
+        assert _session_manager_title("myproj") == f"{ICON_WIZARD} fujimoto - myproj"
+
+    def test_empty_project_returns_prefix_only(self) -> None:
+        from fujimoto.cli import ICON_WIZARD, _session_manager_title
+
+        assert _session_manager_title("") == f"{ICON_WIZARD} fujimoto"
+
+
 class TestBuildSystemPrompt:
     def test_worktree_prompt_includes_base_branch(self, tmp_path: Path) -> None:
         from fujimoto.cli import _build_system_prompt

@@ -528,21 +528,29 @@ class TestEnsureExtendedKeys:
 
 class TestSetTerminalTitle:
     def test_writes_osc_sequence(self) -> None:
-        with patch("fujimoto.tmux.sys.stdout") as mock_stdout:
+        with patch("fujimoto.tmux.sys.__stdout__") as mock_stdout:
             set_terminal_title("hello")
             mock_stdout.write.assert_called_once_with("\033]0;hello\007")
             mock_stdout.flush.assert_called_once()
 
     def test_handles_oserror_gracefully(self) -> None:
-        with patch("fujimoto.tmux.sys.stdout") as mock_stdout:
+        with patch("fujimoto.tmux.sys.__stdout__") as mock_stdout:
             mock_stdout.write.side_effect = OSError("broken pipe")
             # Should not raise
             set_terminal_title("hello")
 
     def test_empty_title(self) -> None:
-        with patch("fujimoto.tmux.sys.stdout") as mock_stdout:
+        with patch("fujimoto.tmux.sys.__stdout__") as mock_stdout:
             set_terminal_title("")
             mock_stdout.write.assert_called_once_with("\033]0;\007")
+
+    def test_falls_back_to_stdout_when_original_missing(self) -> None:
+        with (
+            patch("fujimoto.tmux.sys.__stdout__", None),
+            patch("fujimoto.tmux.sys.stdout") as mock_stdout,
+        ):
+            set_terminal_title("hello")
+            mock_stdout.write.assert_called_once_with("\033]0;hello\007")
 
 
 class TestQuickTerminalBinding:
