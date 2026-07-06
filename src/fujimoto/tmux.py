@@ -45,10 +45,17 @@ def set_terminal_title(title: str) -> None:
     """Set the terminal window/tab title via OSC escape sequence.
 
     Works in iTerm2 and most modern terminals. Silently ignored otherwise.
+
+    Writes to ``sys.__stdout__`` rather than ``sys.stdout`` so the sequence
+    reaches the real terminal even while a Textual app is running (Textual
+    redirects ``sys.stdout`` to an internal capture, but leaves
+    ``sys.__stdout__`` connected to the tty). Falls back to ``sys.stdout``
+    when the original stream is unavailable.
     """
+    stream = sys.__stdout__ or sys.stdout
     try:
-        sys.stdout.write(f"\033]0;{title}\007")
-        sys.stdout.flush()
+        stream.write(f"\033]0;{title}\007")
+        stream.flush()
     except OSError:
         pass
 

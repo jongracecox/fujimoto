@@ -37,6 +37,14 @@ If unset, fujimoto auto-detects a common terminal emulator on PATH.
 `{session_type}`, `{tmux_name}`. Unknown placeholders render as empty strings.
 Empty string suppresses the suffix.
 
+While the session-manager TUI itself is open (before attaching a Claude
+session), the window title uses the same format minus the worktree portion:
+`🧙🏽‍♂️ fujimoto - {project}` (via `_session_manager_title`). It is set in
+`_init_git_info`, so it follows the current project across the project switcher.
+`FUJIMOTO_WINDOW_TITLE` does not affect the TUI title. `set_terminal_title`
+writes to `sys.__stdout__` (not `sys.stdout`) precisely so this write lands on
+the real terminal while Textual is running — see the gotcha below.
+
 `FUJIMOTO_QUICK_TERMINAL_KEY` (default `` C-` ``) configures the **server-global**
 one-press quick-terminal toggle. First press splits a 30% bottom pane in the
 current pane's working directory; subsequent presses cycle focus between the
@@ -360,6 +368,7 @@ Things discovered during development that are easy to forget:
 - **Shift+Enter in tmux requires `extended-keys always` globally** — tmux strips modifier info by default, making Shift+Enter identical to Enter. The fix requires two server/global-level settings: `set-option -g extended-keys always` and `set-option -s -a terminal-features xterm*:extkeys`. Per-session (`-t`) doesn't work. `extended-keys on` (vs `always`) doesn't work because Claude Code doesn't send the kitty keyboard protocol activation sequence. Requires tmux 3.2+. See `_ensure_extended_keys()` in `tmux.py`.
 - **fujimoto never creates `.venv` — `uv` does.** `create_worktree` only runs `git worktree add`; there is no venv/copy logic in the worktree lifecycle. A `.venv` appears in a worktree only because `uv sync`/`uv run` was run there (each worktree is its own project root with its own `pyproject.toml`, and uv materializes a per-project environment by default unless `UV_PROJECT_ENVIRONMENT` is set — which only `noxfile.py` does). The intended way to seed an environment in a fresh worktree is an `init: [uv sync]` entry in `.fujimoto.yaml`.
 - **Bundled package data must be importable as a subpackage.** `templates/` has an `__init__.py` so `importlib.resources.files("fujimoto.templates")` resolves and hatchling ships the `.template` file in the wheel. Verify with `uv build --wheel && unzip -l dist/*.whl | grep templates` after touching packaged resources.
+- **OSC escape writes during a Textual run must go to `sys.__stdout__`, not `sys.stdout`.** Textual replaces `sys.stdout` with an internal capture while the app runs, so an OSC sequence (e.g. the `set_terminal_title` iTerm2/window-title escape) written to `sys.stdout` from inside a running app — such as `_init_git_info` updating the title on project switch — never reaches the terminal. `sys.__stdout__` stays connected to the real tty, so writing there works both before and during `app.run()`. This is why the session-manager title set at `main()` (pre-run) worked but the in-app update initially did not.
 
 ## Releases
 
