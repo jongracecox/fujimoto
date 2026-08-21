@@ -287,6 +287,36 @@ class TestStoreSessionMetaSourceRoot:
         assert "source_root" not in data
 
 
+class TestStoreSessionMetaFork:
+    def test_records_fork_provenance(self, tmp_path: Path) -> None:
+        store_session_meta(
+            tmp_path,
+            "worktree/20260101-parent",
+            source_root=Path("/main/repo"),
+            forked_from_session_id="abc-123",
+            forked_from_worktree=Path("/wt/20260101-parent"),
+        )
+        data = json.loads((tmp_path / ".fujimoto" / "meta.json").read_text())
+        assert data["base_branch"] == "worktree/20260101-parent"
+        assert data["source_root"] == "/main/repo"
+        assert data["forked_from_session_id"] == "abc-123"
+        assert data["forked_from_worktree"] == "/wt/20260101-parent"
+
+    def test_omits_fork_keys_when_none(self, tmp_path: Path) -> None:
+        store_session_meta(tmp_path, "main", source_root=Path("/main/repo"))
+        data = json.loads((tmp_path / ".fujimoto" / "meta.json").read_text())
+        assert "forked_from_session_id" not in data
+        assert "forked_from_worktree" not in data
+
+    def test_session_id_without_worktree(self, tmp_path: Path) -> None:
+        # The two fields are independent, so a missing parent path must not
+        # suppress the session id.
+        store_session_meta(tmp_path, "main", forked_from_session_id="abc-123")
+        data = json.loads((tmp_path / ".fujimoto" / "meta.json").read_text())
+        assert data["forked_from_session_id"] == "abc-123"
+        assert "forked_from_worktree" not in data
+
+
 class TestConfigOnceMarker:
     def test_absent_by_default(self, tmp_path: Path) -> None:
         assert config_once_applied(tmp_path) is False

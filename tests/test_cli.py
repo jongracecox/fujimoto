@@ -6,16 +6,19 @@ from unittest.mock import patch
 
 import pytest
 
-from textual.widgets import Input, ListView
+from textual.widgets import Input, Label, ListItem, ListView
 
 from fujimoto.claude import ClaudeSession, SessionState
 from fujimoto.claude.log_parser import EntryType, StopReason
 from fujimoto.cli import (
     ICON_EYES,
+    ICON_FORK,
     ICON_GEAR,
     ICON_SHIELD,
+    LaunchTarget,
     SessionApp,
     SessionInfo,
+    _build_fork_system_prompt,
     _claude_state_label,
     _format_prompt_lines,
     _friendly_key_label,
@@ -495,7 +498,9 @@ class TestPauseForKey:
 class TestMain:
     def test_aborts_launch_when_config_returns_false(self) -> None:
         app1 = SessionApp.__new__(SessionApp)
-        app1._launch_target = ("proj", Path("/tmp/test"), None, "worktree", None)
+        app1._launch_target = LaunchTarget(
+            "proj", Path("/tmp/test"), None, "worktree", None
+        )
         app2 = SessionApp.__new__(SessionApp)
         app2._launch_target = None
 
@@ -569,7 +574,9 @@ class TestMain:
         # First iteration: launch target set -> attach tmux
         # Second iteration: no target -> exit loop
         app1 = SessionApp.__new__(SessionApp)
-        app1._launch_target = ("proj", Path("/tmp/test"), None, "worktree", None)
+        app1._launch_target = LaunchTarget(
+            "proj", Path("/tmp/test"), None, "worktree", None
+        )
         app2 = SessionApp.__new__(SessionApp)
         app2._launch_target = None
 
@@ -594,6 +601,7 @@ class TestMain:
                 None,
                 system_prompt="test",
                 resume_session_id=None,
+                fork_session=False,
             )
 
     def test_no_launch_when_target_not_set(self) -> None:
@@ -611,7 +619,7 @@ class TestMain:
 
     def test_launches_with_tmux_name(self) -> None:
         app1 = SessionApp.__new__(SessionApp)
-        app1._launch_target = (
+        app1._launch_target = LaunchTarget(
             "proj",
             Path("/tmp/repo"),
             "proj/direct-1",
@@ -638,6 +646,7 @@ class TestMain:
                 "proj/direct-1",
                 system_prompt="test",
                 resume_session_id=None,
+                fork_session=False,
             )
 
 
@@ -914,14 +923,13 @@ class TestSessionAppAdhocSession:
                 await pilot.press("enter")
                 await pilot.pause()
                 assert app._launch_target is not None
-                project, working_dir, tmux_name, session_type, resume_id = (
-                    app._launch_target
-                )
-                assert project == "adhoc"
-                assert session_type == "adhoc"
-                assert tmux_name == "adhoc-1"
-                assert resume_id is None
-                assert working_dir.exists()
+                target = app._launch_target
+                assert target.project == "adhoc"
+                assert target.session_type == "adhoc"
+                assert target.tmux_name == "adhoc-1"
+                assert target.resume_session_id is None
+                assert target.forked_from_session_id is None
+                assert target.working_dir.exists()
 
     @pytest.mark.asyncio
     async def test_launch_adhoc_increments_name(self) -> None:
@@ -1164,10 +1172,13 @@ class TestSessionAppSessionActions:
                         break
                 await pilot.press("enter")
                 await pilot.pause()
-                # "Resume previous session" is the second option (after Connect).
                 # With a single previous session, the picker is skipped and the
                 # session launches directly.
-                await pilot.press("down")
+                actions = app.query_one("#session-actions", ListView)
+                for i, item in enumerate(actions.children):
+                    if item.id == "sa-resume-picker":
+                        actions.index = i
+                        break
                 await pilot.press("enter")
                 await pilot.pause()
                 assert app._launch_target is not None
@@ -1260,7 +1271,11 @@ class TestSessionAppSessionActions:
                         break
                 await pilot.press("enter")
                 await pilot.pause()
-                await pilot.press("down")
+                actions = app.query_one("#session-actions", ListView)
+                for i, item in enumerate(actions.children):
+                    if item.id == "sa-resume-picker":
+                        actions.index = i
+                        break
                 await pilot.press("enter")
                 await pilot.pause()
                 # Two sessions → picker shown
@@ -2215,7 +2230,11 @@ class TestSessionAppCreateFlow:
                 await pilot.press("enter")  # Select default branch
                 await pilot.pause()
                 mock_meta.assert_called_once_with(
-                    tmp_path / "new-wt", "main", source_root=Path("/fake/repo")
+                    tmp_path / "new-wt",
+                    "main",
+                    source_root=Path("/fake/repo"),
+                    forked_from_session_id=None,
+                    forked_from_worktree=None,
                 )
 
     @pytest.mark.asyncio
@@ -2245,6 +2264,538 @@ class TestSessionAppCreateFlow:
                 mock_apply.assert_not_called()
                 assert app._launch_target is not None
                 assert app._launch_target[3] == "worktree"
+
+
+def _fake_claude_session(
+    wt: Path,
+    session_id: str = "abc12345-def6-7890-abcd-ef1234567890",
+    title: str = "Parent session",
+    minute: int = 0,
+) -> ClaudeSession:
+    return ClaudeSession(
+        jsonl_path=wt / f"{session_id}.jsonl",
+        session_id=session_id,
+        state=SessionState.IDLE,
+        last_entry_type=EntryType.ASSISTANT,
+        stop_reason=StopReason.END_TURN,
+        cwd=wt,
+        git_branch=f"worktree/{wt.name}",
+        last_activity=datetime(2026, 3, 9, 12, minute, 0, tzinfo=timezone.utc),
+        title=title,
+        first_prompt="Do the thing",
+    )
+
+
+class TestBuildForkSystemPrompt:
+    def test_names_both_worktrees_and_the_caveat(self) -> None:
+        prompt = _build_fork_system_prompt(
+            "test-proj",
+            Path("/wt/20260309-fork"),
+            Path("/wt/20260101-parent"),
+            "worktree/20260101-parent",
+        )
+        assert "/wt/20260101-parent" in prompt
+        assert "/wt/20260309-fork" in prompt
+        assert "worktree/20260309-fork" in prompt
+        assert "worktree/20260101-parent" in prompt
+        assert "uncommitted" in prompt
+
+    def test_survives_unknown_parent(self) -> None:
+        prompt = _build_fork_system_prompt("test-proj", Path("/wt/fork"), None, "main")
+        assert "different git worktree" in prompt
+        assert "None" not in prompt
+
+
+class TestForkMenuItem:
+    """Fork needs a conversation to inherit and a branch to base the tree on."""
+
+    @staticmethod
+    def _action_ids(app: SessionApp) -> list[str]:
+        return [i.id for i in app.query_one("#session-actions", ListView).children]
+
+    async def _open_actions(self, app: SessionApp, pilot, item_id: str) -> None:
+        home_list = app.query_one("#home-list", ListView)
+        for i, item in enumerate(home_list.children):
+            if item.id == item_id:
+                home_list.index = i
+                break
+        await pilot.press("enter")
+        await pilot.pause()
+
+    @pytest.mark.asyncio
+    async def test_second_item_for_active_worktree(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: [_fake_claude_session(wt)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                ids = self._action_ids(app)
+                assert ids[0] == "sa-connect"
+                assert ids[1] == "sa-fork"
+
+    @pytest.mark.asyncio
+    async def test_second_item_for_inactive_worktree(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: [_fake_claude_session(wt)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                ids = self._action_ids(app)
+                assert ids[0] == "sa-resume-picker"
+                assert ids[1] == "sa-fork"
+
+    @pytest.mark.asyncio
+    async def test_offered_for_direct_session(self, tmp_path: Path) -> None:
+        with _patch_git_info(
+            sessions=["test-proj/direct-1"],
+            claude_sessions_fn=lambda _p: [_fake_claude_session(tmp_path)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "ds-test-proj--direct-1")
+                assert "sa-fork" in self._action_ids(app)
+
+    @pytest.mark.asyncio
+    async def test_absent_without_previous_sessions(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                assert "sa-fork" not in self._action_ids(app)
+
+    @pytest.mark.asyncio
+    async def test_absent_for_claude_session_row(self, tmp_path: Path) -> None:
+        cs = _fake_claude_session(tmp_path)
+        with _patch_git_info(claude_sessions_fn=lambda _p: [cs]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, f"cs-{cs.session_id}")
+                assert "sa-fork" not in self._action_ids(app)
+
+
+class TestForkFlow:
+    async def _start_fork(self, app: SessionApp, pilot, item_id: str) -> None:
+        home_list = app.query_one("#home-list", ListView)
+        for i, item in enumerate(home_list.children):
+            if item.id == item_id:
+                home_list.index = i
+                break
+        await pilot.press("enter")
+        await pilot.pause()
+        actions = app.query_one("#session-actions", ListView)
+        for i, item in enumerate(actions.children):
+            if item.id == "sa-fork":
+                actions.index = i
+                break
+        await pilot.press("enter")
+        await pilot.pause()
+
+    @staticmethod
+    async def _pick(app: SessionApp, pilot, list_id: str, item_id: str) -> None:
+        lv = app.query_one(list_id, ListView)
+        for i, item in enumerate(lv.children):
+            if item.id == item_id:
+                lv.index = i
+                break
+        await pilot.press("enter")
+        await pilot.pause()
+
+    @pytest.mark.asyncio
+    async def test_forks_off_parent_branch(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        parent = _fake_claude_session(wt)
+        new_wt = tmp_path / "20260309-fork"
+        with (
+            _patch_git_info(
+                sessions=["test-proj/20260309-test"],
+                worktrees=[wt],
+                claude_sessions_fn=lambda _p: [parent],
+            ),
+            patch("fujimoto.cli.build_worktree_path", return_value=new_wt),
+            patch("fujimoto.cli.create_worktree") as mock_create,
+            patch("fujimoto.cli.store_session_meta") as mock_meta,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._start_fork(app, pilot, "wt-20260309-test")
+                assert len(app.query("#fork-title-input")) > 0
+                await pilot.press(*"fork")
+                await pilot.press("enter")
+                await pilot.pause()
+                # Parent branch is the default (first) option.
+                assert len(app.query("#fork-branch-list")) > 0
+                await self._pick(app, pilot, "#fork-branch-list", "fork-branch-parent")
+
+            mock_create.assert_called_once_with(
+                new_wt,
+                "worktree/20260309-test",
+                "worktree/20260309-fork",
+                cwd=None,
+            )
+            # The worktree dir the TUI listed, not the fake session's cwd.
+            parent_path = app._fork_parent_path
+            assert parent_path is not None
+            assert parent_path.name == "20260309-test"
+            mock_meta.assert_called_once_with(
+                new_wt,
+                "worktree/20260309-test",
+                source_root=Path("/fake/repo"),
+                forked_from_session_id=parent.session_id,
+                forked_from_worktree=parent_path,
+            )
+            target = app._launch_target
+            assert target is not None
+            assert target.working_dir == new_wt
+            assert target.session_type == "worktree"
+            assert target.forked_from_session_id == parent.session_id
+            assert target.forked_from_worktree == parent_path
+            # A fork is not a resume-in-place.
+            assert target.resume_session_id is None
+
+    @pytest.mark.asyncio
+    async def test_forks_off_parents_base_branch(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        parent = _fake_claude_session(wt)
+        new_wt = tmp_path / "20260309-fork"
+        with (
+            _patch_git_info(
+                sessions=["test-proj/20260309-test"],
+                worktrees=[wt],
+                claude_sessions_fn=lambda _p: [parent],
+            ),
+            patch("fujimoto.cli.build_worktree_path", return_value=new_wt),
+            patch("fujimoto.cli.create_worktree") as mock_create,
+            patch("fujimoto.cli.store_session_meta"),
+            patch(
+                "fujimoto.cli.read_session_meta",
+                return_value={"base_branch": "develop"},
+            ),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._start_fork(app, pilot, "wt-20260309-test")
+                await pilot.press(*"fork")
+                await pilot.press("enter")
+                await pilot.pause()
+                await self._pick(app, pilot, "#fork-branch-list", "fork-branch-base")
+
+            assert mock_create.call_args.args[1] == "develop"
+
+    @pytest.mark.asyncio
+    async def test_picker_shown_for_multiple_sessions(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        older = _fake_claude_session(wt, session_id="older-1", title="Older", minute=0)
+        newer = _fake_claude_session(wt, session_id="newer-2", title="Newer", minute=5)
+        new_wt = tmp_path / "20260309-fork"
+        with (
+            _patch_git_info(
+                sessions=["test-proj/20260309-test"],
+                worktrees=[wt],
+                claude_sessions_fn=lambda _p: [newer, older],
+            ),
+            patch("fujimoto.cli.build_worktree_path", return_value=new_wt),
+            patch("fujimoto.cli.create_worktree"),
+            patch("fujimoto.cli.store_session_meta"),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._start_fork(app, pilot, "wt-20260309-test")
+                await pilot.press(*"fork")
+                await pilot.press("enter")
+                await pilot.pause()
+                await self._pick(app, pilot, "#fork-branch-list", "fork-branch-parent")
+                # Two candidates → pick which conversation to fork.
+                assert len(app.query("#fork-picker")) > 0
+                await self._pick(app, pilot, "#fork-picker", "fp-1")
+
+            target = app._launch_target
+            assert target is not None
+            assert target.forked_from_session_id == "older-1"
+
+    @pytest.mark.asyncio
+    async def test_picker_cancel_returns_home(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        sessions = [
+            _fake_claude_session(wt, session_id="a-1", minute=1),
+            _fake_claude_session(wt, session_id="b-2", minute=2),
+        ]
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: sessions,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._start_fork(app, pilot, "wt-20260309-test")
+                await pilot.press(*"fork")
+                await pilot.press("enter")
+                await pilot.pause()
+                await self._pick(app, pilot, "#fork-branch-list", "fork-branch-parent")
+                await self._pick(app, pilot, "#fork-picker", "fp-cancel")
+                assert len(app.query("#home-list")) > 0
+                assert app._launch_target is None
+
+    @pytest.mark.asyncio
+    async def test_empty_title_stays_on_form(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: [_fake_claude_session(wt)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._start_fork(app, pilot, "wt-20260309-test")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#fork-title-input")) > 0
+
+    @pytest.mark.asyncio
+    async def test_branch_picker_offers_worktree_branches(self, tmp_path: Path) -> None:
+        # Plain create hides worktree/* as base candidates; a fork wants them.
+        wt = tmp_path / "20260309-test"
+        new_wt = tmp_path / "20260309-fork"
+        with (
+            _patch_git_info(
+                sessions=["test-proj/20260309-test"],
+                worktrees=[wt],
+                claude_sessions_fn=lambda _p: [_fake_claude_session(wt)],
+            ),
+            patch(
+                "fujimoto.cli.list_branches",
+                return_value=["main", "worktree/20260309-test"],
+            ),
+            patch("fujimoto.cli.build_worktree_path", return_value=new_wt),
+            patch("fujimoto.cli.create_worktree") as mock_create,
+            patch("fujimoto.cli.store_session_meta"),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._start_fork(app, pilot, "wt-20260309-test")
+                await pilot.press(*"fork")
+                await pilot.press("enter")
+                await pilot.pause()
+                await self._pick(app, pilot, "#fork-branch-list", "fork-branch-other")
+                assert set(app._branch_picker_names.values()) == {
+                    "main",
+                    "worktree/20260309-test",
+                }
+                await self._pick(app, pilot, "#branch-picker-list", "bp-1")
+
+            assert mock_create.call_args.args[1] == "worktree/20260309-test"
+
+    @pytest.mark.asyncio
+    async def test_plain_create_clears_fork_state(self, tmp_path: Path) -> None:
+        # A cancelled fork must not turn the next plain create into a fork.
+        wt = tmp_path / "20260309-test"
+        new_wt = tmp_path / "20260309-plain"
+        with (
+            _patch_git_info(
+                sessions=["test-proj/20260309-test"],
+                worktrees=[wt],
+                claude_sessions_fn=lambda _p: [_fake_claude_session(wt)],
+            ),
+            patch("fujimoto.cli.build_worktree_path", return_value=new_wt),
+            patch("fujimoto.cli.create_worktree"),
+            patch("fujimoto.cli.store_session_meta") as mock_meta,
+            patch("fujimoto.cli.fetch_branch"),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._start_fork(app, pilot, "wt-20260309-test")
+                await app._show_home()
+                await pilot.pause()
+                await self._pick(app, pilot, "#home-list", "action-create")
+                await pilot.press(*"plain")
+                await pilot.press("enter")
+                await pilot.pause()
+                await self._pick(app, pilot, "#branch-list", "branch-current")
+
+            assert mock_meta.call_args.kwargs["forked_from_session_id"] is None
+            assert app._launch_target is not None
+            assert app._launch_target.forked_from_session_id is None
+
+
+class TestPendingFork:
+    """`Ctrl-A f` detaches and hands the fork to the TUI."""
+
+    @pytest.mark.asyncio
+    async def test_opens_fork_flow_for_the_requesting_worktree(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: [_fake_claude_session(wt)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                # The worktree dir the TUI actually listed.
+                listed = app._session_map["wt-20260309-test"].path
+                app._pending_fork = listed
+                await app._open_pending_fork()
+                await pilot.pause()
+                assert len(app.query("#fork-title-input")) > 0
+                assert app._forking is True
+                assert app._fork_parent_path == listed
+                # Consumed, so a later detach doesn't re-trigger it.
+                assert app._pending_fork is None
+
+    @pytest.mark.asyncio
+    async def test_no_pending_fork_stays_on_home(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._open_pending_fork()
+                await pilot.pause()
+                assert len(app.query("#home-list")) > 0
+                assert len(app.query("#fork-title-input")) == 0
+
+    @pytest.mark.asyncio
+    async def test_unknown_path_stays_on_home(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                app._pending_fork = tmp_path / "somewhere-else"
+                await app._open_pending_fork()
+                await pilot.pause()
+                assert len(app.query("#home-list")) > 0
+                assert len(app.query("#fork-title-input")) == 0
+
+    @pytest.mark.asyncio
+    async def test_errors_when_no_conversation_to_fork(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                app._pending_fork = app._session_map["wt-20260309-test"].path
+                await app._open_pending_fork()
+                await pilot.pause()
+                assert len(app.query("#fork-title-input")) == 0
+
+    def test_constructor_accepts_pending_fork(self, tmp_path: Path) -> None:
+        assert SessionApp()._pending_fork is None
+        assert SessionApp(pending_fork=tmp_path)._pending_fork == tmp_path
+
+
+class TestMainPendingFork:
+    def _app(self, target: LaunchTarget | None) -> SessionApp:
+        app = SessionApp.__new__(SessionApp)
+        app._launch_target = target
+        return app
+
+    def test_pending_fork_passed_to_next_app(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        app1 = self._app(LaunchTarget("proj", wt, "proj/20260309-test", "worktree"))
+        app2 = self._app(None)
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]) as mock_cls,
+            patch.object(app1, "run"),
+            patch.object(app2, "run"),
+            patch("fujimoto.cli.launch_claude_in_tmux"),
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
+            patch("fujimoto.cli.take_pending_action", return_value="fork") as mock_take,
+        ):
+            main()
+        mock_take.assert_called_once_with("proj/20260309-test")
+        # First app opens normally; the one after the detach opens on the fork.
+        assert mock_cls.call_args_list[0].kwargs["pending_fork"] is None
+        assert mock_cls.call_args_list[1].kwargs["pending_fork"] == wt
+
+    def test_no_pending_action_leaves_next_app_clean(self, tmp_path: Path) -> None:
+        app1 = self._app(LaunchTarget("proj", tmp_path / "wt", "proj/wt", "worktree"))
+        app2 = self._app(None)
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]) as mock_cls,
+            patch.object(app1, "run"),
+            patch.object(app2, "run"),
+            patch("fujimoto.cli.launch_claude_in_tmux"),
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
+            patch("fujimoto.cli.take_pending_action", return_value=None),
+        ):
+            main()
+        assert mock_cls.call_args_list[1].kwargs["pending_fork"] is None
+
+    def test_derives_session_name_when_not_given(self, tmp_path: Path) -> None:
+        # tmux_name is None for a freshly created worktree; the flag is keyed by
+        # the name launch_claude_in_tmux would have derived.
+        app1 = self._app(
+            LaunchTarget("proj", tmp_path / "20260309-new", None, "worktree")
+        )
+        app2 = self._app(None)
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]),
+            patch.object(app1, "run"),
+            patch.object(app2, "run"),
+            patch("fujimoto.cli.launch_claude_in_tmux"),
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
+            patch("fujimoto.cli.session_name", return_value="proj/20260309-new"),
+            patch("fujimoto.cli.take_pending_action", return_value=None) as mock_take,
+        ):
+            main()
+        mock_take.assert_called_once_with("proj/20260309-new")
+
+
+class TestForkHomeMarker:
+    @pytest.mark.asyncio
+    async def test_fork_worktree_gets_marker(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-fork"
+        with (
+            _patch_git_info(worktrees=[wt]),
+            patch("fujimoto.cli._is_fork_worktree", return_value=True),
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                item = app.query_one("#wt-20260309-fork", ListItem)
+                label = item.query_one(Label)
+                assert ICON_FORK in str(label.content)
+                assert app._session_map["wt-20260309-fork"].is_fork is True
+
+    @pytest.mark.asyncio
+    async def test_plain_worktree_has_no_marker(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-plain"
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test():
+                item = app.query_one("#wt-20260309-plain", ListItem)
+                label = item.query_one(Label)
+                assert ICON_FORK not in str(label.content)
+                assert app._session_map["wt-20260309-plain"].is_fork is False
+
+
+class TestIsForkWorktree:
+    def test_true_when_recorded(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _is_fork_worktree
+        from fujimoto.config import store_session_meta as real_store
+
+        real_store(tmp_path, "main", forked_from_session_id="abc")
+        assert _is_fork_worktree(tmp_path) is True
+
+    def test_false_for_plain_worktree(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _is_fork_worktree
+        from fujimoto.config import store_session_meta as real_store
+
+        real_store(tmp_path, "main")
+        assert _is_fork_worktree(tmp_path) is False
+
+    def test_false_without_meta(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _is_fork_worktree
+
+        assert _is_fork_worktree(tmp_path) is False
 
 
 class TestSessionAppConflict:
@@ -3157,7 +3708,7 @@ class TestPolling:
 class TestMainResume:
     def test_resume_skips_system_prompt(self) -> None:
         app1 = SessionApp.__new__(SessionApp)
-        app1._launch_target = (
+        app1._launch_target = LaunchTarget(
             "proj",
             Path("/tmp/repo"),
             "proj/direct-1",
@@ -3182,7 +3733,48 @@ class TestMainResume:
                 "proj/direct-1",
                 system_prompt=None,
                 resume_session_id="resume-session-id",
+                fork_session=False,
             )
+
+    def test_fork_resumes_parent_with_fork_flag(self, tmp_path: Path) -> None:
+        app1 = SessionApp.__new__(SessionApp)
+        app1._launch_target = LaunchTarget(
+            "proj",
+            tmp_path / "20260309-fork",
+            "proj/20260309-fork",
+            "worktree",
+            forked_from_session_id="parent-session-id",
+            forked_from_worktree=tmp_path / "20260101-parent",
+        )
+        app2 = SessionApp.__new__(SessionApp)
+        app2._launch_target = None
+
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]),
+            patch.object(app1, "run"),
+            patch.object(app2, "run"),
+            patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
+            patch(
+                "fujimoto.cli.read_session_meta",
+                return_value={"base_branch": "worktree/20260101-parent"},
+            ),
+        ):
+            main()
+
+        kwargs = mock_launch.call_args.kwargs
+        # A fork resumes the PARENT conversation, with --fork-session so the
+        # parent's transcript is left untouched.
+        assert kwargs["resume_session_id"] == "parent-session-id"
+        assert kwargs["fork_session"] is True
+        # Unlike a plain resume, a fork does get a system prompt — it has moved
+        # to a different worktree and needs to be told.
+        prompt = kwargs["system_prompt"]
+        assert prompt is not None
+        assert str(tmp_path / "20260101-parent") in prompt
+        assert str(tmp_path / "20260309-fork") in prompt
+        assert "worktree/20260101-parent" in prompt
 
 
 # -- Update banner tests --

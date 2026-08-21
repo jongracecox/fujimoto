@@ -189,6 +189,7 @@ via `FUJIMOTO_META_KEY`) to enter a one-shot "fujimoto mode", then:
 | `T` | Open a full-height side pane on the right. Same behavior as `t`: press again to toggle focus. |
 | `v` | Open VS Code at the session's working directory. |
 | `w` | Open a native terminal window at the session's working directory. |
+| `f` | Fork this session — detaches back to the fujimoto TUI and opens the **Fork session** flow for this worktree, so you get the usual name prompt, base-branch menu and conversation picker. |
 | `d` | Detach the tmux session (returns you to the fujimoto TUI). |
 | `x` | Kill the current pane (with confirmation prompt). |
 | `[` | Enter copy mode (scrollback / selection). |
@@ -265,9 +266,13 @@ fujimoto
 🟢 direct-1                     (direct @ main)
 ───── inactive worktrees ─────
 ⚫ 20260308-old-experiment      (worktree)
+⚫ 20260309-cleanup-ui-alt 🍴   (worktree)
 ─────
   Switch project
 ```
+
+Worktrees created with **Fork session** are marked with 🍴.
+
 
 ### Three Session Types
 
@@ -283,9 +288,35 @@ Select any session to see contextual options:
 
 | Session State | Options |
 |--------------|---------|
-| Active worktree | Connect, Terminate, Finish |
-| Inactive worktree | Launch, Finish |
-| Active direct | Connect, Terminate |
+| Active worktree | Connect, Fork session, Resume previous session, Terminate, Finish |
+| Inactive worktree | Resume previous session, Fork session, Launch, Finish |
+| Active direct | Connect, Fork session, Resume previous session, Terminate |
+
+All session types also offer **Open terminal**, **Open in VS Code** and
+**Rename**.
+
+### Fork Session
+
+**Fork session** branches a conversation and the filesystem in one step: it
+creates a new worktree and starts Claude there with the parent session's full
+history (`claude --resume <id> --fork-session`). Use it to try a second
+approach without losing the context you have built up, or without disturbing
+the work already in the original worktree.
+
+It asks for a name, then a base branch — defaulting to the **parent's branch**,
+so the fork starts from the parent's commits. Choosing the parent's own base
+branch instead gives you a sibling: same conversation, none of the parent's
+code changes. If the directory has more than one previous Claude session, you
+also pick which conversation to fork.
+
+The fork appears in the session list as a normal worktree session marked with
+🍴, and the forked Claude session is told it has moved: it knows the original
+worktree's location, and that it was branched from the parent's **committed
+tip** — so any uncommitted changes in the original worktree are not present.
+
+Fork is offered for worktree and direct sessions that have at least one
+previous Claude session. Requires **Claude Code 2.1.223 or newer**, which is
+the first version that can resume a session id from a different directory.
 
 ### Finish Flow
 

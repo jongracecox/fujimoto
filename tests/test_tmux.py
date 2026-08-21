@@ -11,6 +11,7 @@ from fujimoto.tmux import (
     _ensure_extended_keys,
     _meta_key_label,
     attach_session,
+    build_claude_command,
     create_session,
     create_session_with_command,
     display_message,
@@ -24,6 +25,7 @@ from fujimoto.tmux import (
     session_exists,
     session_name,
     set_terminal_title,
+    take_pending_action,
 )
 
 
@@ -235,6 +237,125 @@ class TestCreateSession:
             )
 
 
+class TestCreateSessionFork:
+    def test_passes_fork_flags_to_tmux(self, tmp_path: Path) -> None:
+        with patch(
+            "fujimoto.tmux.subprocess.run", return_value=MagicMock(returncode=0)
+        ) as mock_run:
+            create_session(
+                "proj/fork",
+                tmp_path,
+                system_prompt="you are a fork",
+                resume_session_id="abc",
+                fork_session=True,
+            )
+            assert mock_run.call_args_list[0] == call(
+                [
+                    "tmux",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "proj/fork",
+                    "-c",
+                    str(tmp_path),
+                    "claude --resume abc --fork-session "
+                    "--append-system-prompt 'you are a fork'",
+                ],
+                check=True,
+            )
+
+
+class TestBuildClaudeCommand:
+    """The flags compose; they used to be mutually exclusive."""
+
+    def test_plain(self) -> None:
+        assert build_claude_command() == "claude"
+
+    def test_system_prompt_only(self) -> None:
+        assert (
+            build_claude_command(system_prompt="hello")
+            == "claude --append-system-prompt 'hello'"
+        )
+
+    def test_resume_only(self) -> None:
+        assert build_claude_command(resume_session_id="abc") == "claude --resume abc"
+
+    def test_resume_ignores_fork_flag_without_id(self) -> None:
+        assert build_claude_command(fork_session=True) == "claude"
+
+    def test_fork(self) -> None:
+        assert (
+            build_claude_command(resume_session_id="abc", fork_session=True)
+            == "claude --resume abc --fork-session"
+        )
+
+    def test_fork_with_system_prompt(self) -> None:
+        assert build_claude_command(
+            system_prompt="you are a fork",
+            resume_session_id="abc",
+            fork_session=True,
+        ) == (
+            "claude --resume abc --fork-session --append-system-prompt 'you are a fork'"
+        )
+
+    def test_resume_with_system_prompt(self) -> None:
+        # A plain resume never sets a prompt today, but the composition must
+        # still be correct rather than silently dropping one.
+        assert (
+            build_claude_command(system_prompt="hi", resume_session_id="abc")
+            == "claude --resume abc --append-system-prompt 'hi'"
+        )
+
+    def test_escapes_single_quotes(self) -> None:
+        assert (
+            build_claude_command(system_prompt="it's fine")
+            == "claude --append-system-prompt 'it'\\''s fine'"
+        )
+
+
+class TestTakePendingAction:
+    """`Ctrl-A f` records intent as a session option, then detaches."""
+
+    def test_returns_and_clears_action(self) -> None:
+        with patch("fujimoto.tmux.subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="fork\n"),
+                MagicMock(returncode=0),
+            ]
+            assert take_pending_action("proj/wt") == "fork"
+            assert mock_run.call_args_list[0].args[0] == [
+                "tmux",
+                "show-options",
+                "-t",
+                "proj/wt",
+                "-v",
+                "@fujimoto_pending_action",
+            ]
+            # Must be cleared, or every later detach would re-trigger the fork.
+            assert mock_run.call_args_list[1].args[0] == [
+                "tmux",
+                "set-option",
+                "-t",
+                "proj/wt",
+                "-u",
+                "@fujimoto_pending_action",
+            ]
+
+    def test_unset_option_is_not_pending(self) -> None:
+        # Reading an unset option exits non-zero; so does a dead session.
+        with patch("fujimoto.tmux.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=1, stdout="invalid option: @fujimoto_pending_action"
+            )
+            assert take_pending_action("proj/wt") is None
+            assert mock_run.call_count == 1  # nothing to clear
+
+    def test_blank_value_is_not_pending(self) -> None:
+        with patch("fujimoto.tmux.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="  \n")
+            assert take_pending_action("proj/wt") is None
+
+
 class TestConfigureSession:
     def test_installs_fujimoto_key_table_by_default(
         self, monkeypatch: pytest.MonkeyPatch
@@ -253,14 +374,31 @@ class TestConfigureSession:
                 for c in cmds
                 if c[:3] == ["tmux", "set-option", "-t"] and c[4] == "status-right"
             )
-            assert "Fujimoto: ^A t/T/w/v/d/x/[" in status_cmd[5]
+            assert "Fujimoto: ^A t/T/w/v/f/d/x/[" in status_cmd[5]
             assert "^A t toggles" in status_cmd[5]
             assert "help: ^A ?" in status_cmd[5]
             # fujimoto-table bindings present (server-global, no -t)
             table_keys = [
                 c[4] for c in cmds if c[:4] == ["tmux", "bind-key", "-T", "fujimoto"]
             ]
-            assert set(table_keys) == {"t", "T", "v", "w", "d", "x", "[", "?"}
+            assert set(table_keys) == {"t", "T", "v", "w", "f", "d", "x", "[", "?"}
+            # The fork binding must prompt for both name and base branch, and
+            # thread the client tty through so switch-client has a target.
+            fork_cmd = next(
+                c
+                for c in cmds
+                if c[:4] == ["tmux", "bind-key", "-T", "fujimoto"] and c[4] == "f"
+            )
+            # f flags the session and detaches so the TUI can take over.
+            # `set-option` deliberately has no -t: a binding targets its own
+            # session, and -t "#{session_name}" is not format-expanded.
+            assert fork_cmd[5:] == [
+                "set-option",
+                "@fujimoto_pending_action",
+                "fork",
+                "\\;",
+                "detach-client",
+            ]
             # Root C-a switches to fujimoto table (server-global, no -t)
             assert any(
                 c[:5] == ["tmux", "bind-key", "-n", "C-a", "switch-client"]
@@ -459,6 +597,7 @@ class TestLaunchClaudeInTmux:
                 wt_path,
                 system_prompt=None,
                 resume_session_id=None,
+                fork_session=False,
             )
             mock_attach.assert_called_once_with("proj/20260309-test")
 
