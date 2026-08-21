@@ -115,6 +115,21 @@ The Textual app cannot run simultaneously with tmux attach (both need the termin
 3. Wire navigation from an existing view
 4. Add any new state to `__init__` with type annotations
 
+Handlers are bound to a **specific list id**, so a view that reuses another
+view's layout still needs its own id and its own widget-id prefix — the fork
+picker is `#fork-picker` with `fp-{i}` rows precisely so it doesn't collide
+with the resume picker's `#resume-picker` / `rp-{i}`. Where two views render
+the same kind of row, factor the row building into a helper that takes the
+prefix (see `_build_claude_session_items`) rather than copying it.
+
+Prefer extending an existing flow over adding a parallel one. The fork flow
+reaches the same `_finalize_create` / `_do_create_and_launch` as the plain
+create flow, differing only by `_fork_source` being set — which is why it gets
+the directory-conflict handling for free. When you add state that switches a
+shared flow's behaviour like that, clear it on the entry point of the other
+path (`_show_create_form` resets the fork state) so a cancelled flow can't
+leak into the next one.
+
 ### Adding New Git/tmux Operations
 
 - Git wrappers go in `git.py` using the `_run()` helper
@@ -192,10 +207,25 @@ https://docs.pypi.org/trusted-publishers/
 2. Create a new worktree — verify the directory and git branch are created
 3. Detach from tmux (`Ctrl+A D`)
 4. Run `fujimoto` again — the worktree should show a green circle, direct sessions listed
-5. Select an existing session — should show the actions submenu (Connect/Launch/Finish)
+5. Select an existing session — should show the actions submenu (Connect/Fork/Launch/Finish)
 6. Test the Finish flow on a worktree with unpushed commits
-7. Test error cases:
+7. Test the Fork flow (needs a real `claude` and Claude Code >= 2.1.223):
+   - Chat in a worktree session, detach, then select it → **Fork session**
+   - Accept the default (parent branch) — the new worktree's `git log -1`
+     should match the parent's tip
+   - Claude should start with the parent's history and a *new* session id, and
+     should be able to name the original worktree's path when asked
+   - `.fujimoto/meta.json` in the fork records `forked_from_session_id` and
+     `forked_from_worktree`
+   - Detach — the fork appears in the list with 🍴 and a live state indicator,
+     and `~/.claude/projects/` has an encoded dir for the fork's own path
+   - Re-attach and press `Ctrl-A f`: the session should detach and the TUI
+     reappear already on the fork flow for that worktree. Note `tmux send-keys`
+     cannot be used to test key bindings — it injects into the pane and
+     bypasses key-table dispatch; to automate it, write the keys to an attached
+     client's pty instead (`pty.fork()`, then `os.write(fd, b"\x01f")`).
+8. Test error cases:
    - Run outside a git repo
    - Create a worktree with a name that already exists
-8. With `FUJIMOTO_WORKTREE_ROOT` unset: confirm worktrees land in
+9. With `FUJIMOTO_WORKTREE_ROOT` unset: confirm worktrees land in
    `<repo>/.fujimoto/worktrees/` and the directory is gitignored

@@ -119,16 +119,29 @@ def _ensure_meta_dir(worktree_path: Path) -> Path:
 
 
 def store_session_meta(
-    worktree_path: Path, base_branch: str, source_root: Path | None = None
+    worktree_path: Path,
+    base_branch: str,
+    source_root: Path | None = None,
+    forked_from_session_id: str | None = None,
+    forked_from_worktree: Path | None = None,
 ) -> None:
     """Write session metadata to a JSON file in the worktree directory.
 
     `source_root` records the main repo root the worktree was created from, so
     project-config actions can resolve copy/link sources on later launches.
+
+    `forked_from_session_id` / `forked_from_worktree` record that this worktree
+    was created by forking another session, and where that session was running.
+    Keeping both in the worktree means a fork stays identifiable even if the
+    original Claude transcript is deleted.
     """
     meta = {"base_branch": base_branch}
     if source_root is not None:
         meta["source_root"] = str(source_root)
+    if forked_from_session_id is not None:
+        meta["forked_from_session_id"] = forked_from_session_id
+    if forked_from_worktree is not None:
+        meta["forked_from_worktree"] = str(forked_from_worktree)
     meta_dir = _ensure_meta_dir(worktree_path)
     meta_path = meta_dir / META_FILENAME
     meta_path.write_text(json.dumps(meta))

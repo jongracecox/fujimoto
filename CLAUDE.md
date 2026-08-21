@@ -70,8 +70,9 @@ where `t`/`T` split a terminal pane (single-pane guard via `if-shell` on
 `#{session_panes}`), `v` opens VS Code, `w` opens a native terminal window,
 `d` detaches the session, `x` kills the current pane (via `confirm-before`),
 `[` enters copy mode, and `?` flashes a cheatsheet via `display-message`.
-`v`/`w` dispatch to the `fujimoto pane <action> --session <name>` CLI
-subcommand which reuses the existing launchers in `vscode.py` / `terminal.py`.
+`f` forks the session (see below), and `v`/`w` dispatch to the
+`fujimoto pane <action> --session <name>` CLI subcommand which reuses the
+existing launchers in `vscode.py` / `terminal.py`.
 Set to the empty string to disable; the bindings and the status-bar hint are
 then both omitted.
 
@@ -124,7 +125,7 @@ src/fujimoto/
 `cli.py:main()` is the package entry point (`pyproject.toml` `[project.scripts]`). It parses CLI args:
 - `--version`/`-V` prints `fujimoto {version}` and exits
 - `--create-config` writes a commented `.fujimoto.yaml` template to the repo root (via `project_config.write_config_template`) and exits; errors (already exists, not a git repo) print to stderr and exit 1.
-- `fujimoto pane <vscode|terminal> --session <name>` dispatches to `_run_pane_command`, used by the in-session tmux key table (`Ctrl-F v` / `Ctrl-F w`). Resolves the session's working directory via `tmux display-message -p '#{session_path}'` and calls the existing `open_vscode` / `open_terminal` helpers; errors are surfaced via `tmux display-message` so they appear in the session's status bar.
+- `fujimoto pane <vscode|terminal> --session <name>` dispatches to `_run_pane_command`, used by the in-session tmux key table (`Ctrl-A v` / `Ctrl-A w`). Resolves the session's working directory via `tmux display-message -p '#{session_path}'` and calls the existing `open_vscode` / `open_terminal` helpers; errors are surfaced via `tmux display-message` so they appear in the session's status bar.
 
 Otherwise it:
 1. Runs the Textual `SessionApp` in a loop
@@ -137,7 +138,7 @@ Otherwise it:
 **Worktree sessions** — isolated git worktree with its own branch:
 - Creates a new branch + working directory via `git worktree add`
 - Finish flow: Push & Create PR, Cherry-pick to base branch, or Discard & Delete
-- Session metadata (base branch) stored in `.fujimoto/meta.json` (auto-gitignored)
+- Session metadata (base branch, source root, fork provenance) stored in `.fujimoto/meta.json` (auto-gitignored)
 
 **Direct sessions** — Claude launched in an existing repo directory:
 - No worktree creation, uses the repo's current branch
@@ -159,7 +160,7 @@ Otherwise it:
 - `slugify(title)` — lowercase, replace non-alphanumeric with hyphens, strip/collapse
 - `build_worktree_path(project, title, project_root=None)` — with env var: `{root}/{project}/{YYYYMMDD}-{slug}`; with fallback: `<project_root>/.fujimoto/worktrees/{YYYYMMDD}-{slug}`
 - `get_project_worktrees_dir(project, project_root=None)` — with env var: `{root}/{project}`; with fallback: `<project_root>/.fujimoto/worktrees/`
-- `store_session_meta(path, base_branch, source_root=None)` / `read_session_meta(path)` — JSON metadata. `source_root` records the main repo the worktree was created from, so `project_config` can resolve copy/link sources on later launches (older worktrees without it fall back to deriving the root via `git.get_main_worktree_root`).
+- `store_session_meta(path, base_branch, source_root=None, forked_from_session_id=None, forked_from_worktree=None)` / `read_session_meta(path)` — JSON metadata. `source_root` records the main repo the worktree was created from, so `project_config` can resolve copy/link sources on later launches (older worktrees without it fall back to deriving the root via `git.get_main_worktree_root`). The two `forked_from_*` keys record that the worktree was created by forking another session and where that session was running; keeping both in the worktree means a fork stays identifiable even if the source Claude transcript is deleted. All optional keys are omitted when `None`.
 - `config_once_applied(path)` / `mark_config_once_applied(path)` — presence-of-marker-file flag (`.fujimoto/config_once_applied`) recording that `once` project-config actions have run for the worktree.
 - `get_next_direct_session_name(project, sessions)` — computes `{project}/direct-N`
 - `get_next_adhoc_session_name(sessions)` — computes `adhoc-N`
@@ -240,18 +241,20 @@ pydantic):
 - `list_all_sessions()` — lists all active tmux session names
 - `list_project_sessions(project)` — lists active tmux sessions for a project
 - `session_name(project, dir)` — naming convention: `{project}/{dir}`
-- `create_session(name, dir, system_prompt, resume_session_id)` — creates detached session, sets prefix to Ctrl+A, runs `claude` (with optional `--resume`)
+- `build_claude_command(system_prompt, resume_session_id, fork_session)` — composes the `claude` invocation. The flags **compose** rather than exclude each other (they used to be mutually exclusive): a fork needs `--resume <id> --fork-session` *and* `--append-system-prompt` together.
+- `create_session(name, dir, system_prompt, resume_session_id, fork_session)` — creates detached session, applies the configured prefix, runs the command from `build_claude_command`
 - `create_session_with_command(name, dir, command)` — like `create_session` but with custom command
 - `kill_session(name)` — `tmux kill-session -t`
 - `attach_session(name)` — `subprocess.run` tmux attach (returns on detach). Shortcut hints live in the per-session tmux status bar, not in a pre-attach banner.
-- `launch_claude_in_tmux(project, path, tmux_name, system_prompt, resume_session_id)` — orchestrates create-or-attach, supports resuming previous Claude sessions
+- `launch_claude_in_tmux(project, path, tmux_name, system_prompt, resume_session_id, fork_session)` — orchestrates create-or-attach, supports resuming and forking previous Claude sessions
+- `take_pending_action(name)` — reads **and clears** the `@fujimoto_pending_action` tmux session option (`PENDING_ACTION_OPTION`), the channel by which an in-session key binding hands work to the TUI. Returns `None` when the option is unset or the session is gone (both exit non-zero). Consumed by `main()` right after `tmux attach` returns.
 - `get_session_path(name)` — returns the start directory of a tmux session via `display-message -p '#{session_path}'`, used by the `fujimoto pane` subcommand
 - `display_message(name, message)` — surface a transient message in the session's status bar, used to report errors from `fujimoto pane` back into the session
 - `_configure_session(name)` — applies the configured prefix (default `C-b`), status bar, and (if `FUJIMOTO_META_KEY` is non-empty) the fujimoto key table via `_configure_fujimoto_key_table`. Raises `TmuxError` if the meta and prefix keys collide. The `unbind-key C-b` step only runs when the prefix has been moved off `C-b` (otherwise it would unbind the new prefix).
 - `quick_terminal_key()` — returns the configured `FUJIMOTO_QUICK_TERMINAL_KEY` (default `` C-` ``)
 - `enable_quick_terminal_binding()` / `disable_quick_terminal_binding()` — install/remove the **server-global** root-table binding (`bind-key -n <key>`) that toggles a 30% bottom pane. The bound command uses `if-shell -F '#{==:#{window_panes},1}'` to split on the first press and cycle focus on subsequent presses. Both are no-ops when the env var is empty. Idempotent.
 - `_apply_quick_terminal_setting()` — called from `create_session` / `create_session_with_command` after `_ensure_extended_keys()`. Re-applies the binding when `Settings.quick_terminal_enabled` is True, so the feature survives `tmux kill-server`. Lazily imports `settings` to avoid a circular import.
-- `_configure_fujimoto_key_table(name, meta_key)` — installs the one-shot key table: `t`/`T` (`if-shell` guard ensuring a single extra pane; falls back to `select-pane :.+`), `v`/`w` (dispatch to `fujimoto pane <action> --session #{session_name}` via `run-shell`), `d` (detach-client), `x` (`confirm-before` kill-pane), `[` (copy-mode), `?` (cheatsheet). Root-level `bind-key -n <meta_key> switch-client -T fujimoto` arms the chord.
+- `_configure_fujimoto_key_table(name, meta_key)` — installs the one-shot key table: `t`/`T` (`if-shell` guard ensuring a single extra pane; falls back to `select-pane :.+`), `v`/`w` (dispatch to `fujimoto pane <action> --session #{session_name}` via `run-shell`), `f` (`set-option @fujimoto_pending_action fork \; detach-client` — hands the fork to the TUI), `d` (detach-client), `x` (`confirm-before` kill-pane), `[` (copy-mode), `?` (cheatsheet). Root-level `bind-key -n <meta_key> switch-client -T fujimoto` arms the chord.
 
 **`claude/log_parser.py`** — Parse Claude Code's JSONL session logs:
 - `ClaudeLogError` — raised on empty/unreadable logs
@@ -263,20 +266,22 @@ pydantic):
 - `get_sessions_for_path(project_path)` — encodes path, globs `*.jsonl`, returns sorted sessions
 
 **`cli.py`** — Textual TUI with async view management:
-- `SessionInfo` — dataclass for session state (type, project, path, tmux name, active status, claude_session_id, claude_state)
+- `SessionInfo` — dataclass for session state (type, project, path, tmux name, active status, claude_session_id, claude_state, is_fork)
+- `LaunchTarget` — `NamedTuple` describing what `main()` should launch: `(project, working_dir, tmux_name, session_type, resume_session_id, forked_from_session_id, forked_from_worktree)`. A `NamedTuple` rather than a dataclass so existing index-based access keeps working.
 - `SessionApp` — main app class with CSS styling
-- Module-level helpers: `_claude_state_label(state)`, `_relative_time(dt)`, `_get_claude_sessions(root, worktrees)`
-- Instance helpers: `_build_session_label(session, state_suffix)` — generates label text for session items, used by both `_show_home` initial render and `_poll_session_states` in-place updates
-- Views: home (sessions list), session actions submenu, finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), conflict resolution, project switcher (with autocomplete filter), tmux install, error
+- Module-level helpers: `_claude_state_label(state)`, `_relative_time(dt)`, `_get_claude_sessions(root, worktrees)`, `_is_fork_worktree(path)`, `_build_fork_system_prompt(project, working_dir, parent_worktree, base_branch)`
+- Instance helpers: `_build_session_label(session, state_suffix)` — the single source of truth for session row text (including the 🍴 fork marker), used by `_show_home`'s initial render of worktree rows and by `_poll_session_states` for in-place updates; `_build_claude_session_items(sessions, prefix)` — shared row rendering for the resume (`rp-*`) and fork (`fp-*`) pickers
+- Views: home (sessions list), session actions submenu, finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), fork title form, fork branch select, fork session picker, conflict resolution, project switcher (with autocomplete filter), tmux install, error
 - Home screen sections: actions ("New worktree session", "New session in X", "Ad hoc session"), active sessions (with Claude state indicators), inactive worktrees (with Claude state), previous Claude sessions (resumable, capped at 5), switch project
 - Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
-- Session actions submenu (in order): for active sessions, Connect → Resume previous session; for inactive worktrees, Resume previous session → Launch (resume is the more common action when picking an idle worktree). Then: Open terminal, Open in VS Code, Rename, Terminate session (active only), Finish (worktree only), Cancel. Claude-session items show just "Resume" + Open terminal/VS Code + Cancel.
+- Session actions submenu (in order): for active sessions, Connect → Fork session → Resume previous session; for inactive worktrees, Resume previous session → Fork session → Launch (resume is the more common action when picking an idle worktree). Then: Open terminal, Open in VS Code, Rename, Terminate session (active only), Finish (worktree only), Cancel. Claude-session items show just "Resume" + Open terminal/VS Code + Cancel. "Fork session" is always inserted at index 1 (`items.insert(1, ...)`) so its position holds across both layouts.
 - "Resume previous session" auto-launches the sole candidate when only one previous Claude session exists for the path, skipping the picker. Two or more sessions still show the picker.
+- Fork flow: `sa-fork` → `#fork-title-input` → `#fork-branch-list` (parent branch (default) / parent's base / another branch → the shared `_show_branch_picker`) → conversation picker `#fork-picker` (`fp-{i}`, only when >1 candidate) → the shared `_finalize_create` / `_do_create_and_launch`. Offered for worktree *and* direct sessions that have at least one previous Claude session.
 - Finish flow: Push & Create PR (background Claude), Cherry-pick to base, Discard & Delete
 - Open terminal flow: sub-menu with "This window" (default; uses Textual's `App.suspend()` to pause the TUI, then runs `subprocess.run([$SHELL], cwd=session.path)` as a child process — when the user types `exit`, the TUI resumes on the session actions menu) and "New window" (spawns a new iTerm/Terminal/Linux emulator window via `open_terminal()`)
 - All view transitions are `async` — `await _clear_main()` then `await mount()`
 - Session data stored in `_session_map` dict keyed by ListItem ID
-- `_launch_target` is `(project, path, tmux_name, session_type, resume_id)`, set before `self.exit()`
+- `_launch_target` is a `LaunchTarget`, set before `self.exit()`
 
 ### Error Handling
 
@@ -296,13 +301,14 @@ Three custom exception types, all caught in `main()`:
 | tmux session (adhoc) | `adhoc-{N}` | `adhoc-1` |
 | Widget ID (direct) | `ds-{project}--direct-{N}` | `ds-qsic-data--direct-1` |
 | Widget ID (claude session) | `cs-{session-id}` | `cs-abc12345-def6-7890` |
+| Widget ID (fork picker) | `fp-{index}` | `fp-0` |
 
 ### Key Design Decisions
 
 - **TUI loop with tmux detach**: The TUI runs in a `while True` loop. After tmux detach (subprocess.run returns), the loop restarts and the TUI reappears. The loop breaks when the user quits without selecting a session.
 - **Per-session tmux config**: Prefix defaults to `Ctrl-B` (tmux's standard default; configurable via `FUJIMOTO_TMUX_PREFIX`), status bar with shortcut hints — all set via `tmux set-option -t` so the user's global config is untouched. The attach flow is silent (no pre-attach banner) to reduce noise when launching sessions repeatedly.
 - **Global install via `uv tool`**: Requires `--force --reinstall` to rebuild the wheel from source. Plain `--force` reuses cached builds.
-- **Session metadata**: `.fujimoto/meta.json` stored in worktree directory records the base branch for cherry-pick targeting and the `source_root` (main repo) for project-config source resolution. The `.fujimoto/` directory contains a `.gitignore` with `*` so its contents are automatically ignored by git.
+- **Session metadata**: `.fujimoto/meta.json` stored in worktree directory records the base branch for cherry-pick targeting, the `source_root` (main repo) for project-config source resolution, and — for forks — `forked_from_session_id` plus `forked_from_worktree`. The `.fujimoto/` directory contains a `.gitignore` with `*` so its contents are automatically ignored by git.
 - **Project config (`.fujimoto.yaml`)**: An optional, committed per-project file (`project_config.py`) declaring files to copy/link into a worktree and init commands to run. Applied centrally in `main()`'s launch loop (parent process, **before** `tmux attach`) by `_apply_worktree_config(working_dir)`, for **every** worktree connection mode (new, reconnect-to-live, relaunch/resume) — so copy/link/init run on each connect, not just creation. `_do_create_and_launch` no longer applies config; it only creates the worktree and stores meta. Key mechanics:
   - **Config is read from the source root (main clone), not the worktree.** `.fujimoto.yaml` is a local, uncommitted file in the main clone, so it isn't present in a worktree checkout — `_apply_worktree_config` calls `load_project_config(source_root)`. (`--create-config` writes it to the main clone's root.)
   - **Worktree detection**: `_resolve_worktree_source` returns the main repo root (from meta `source_root`, else derived via `git.get_main_worktree_root`) only for a *linked* worktree; returns `None` for the main repo / direct / adhoc sessions (which then get no config). This is git-based, not `session_type`-based, so the resume path (historically labelled `"direct"`) is covered too.
@@ -311,6 +317,17 @@ Three custom exception types, all caught in `main()`:
   - **Errors**: copy/link issues are non-fatal warnings printed to stderr. A non-`continue_on_error` init failure is governed by the config's `on_error`: `abort` returns `False` (main `continue`s the loop → TUI reopens, launch skipped) and `continue` attaches anyway. Either way `_pause_for_key` shows the error and waits for a keypress so it isn't wiped by `tmux attach`.
 - **Background PR creation**: Uses `claude -p --allowedTools "Bash(git:*) Bash(gh:*)"` in a tmux session for unattended PR creation.
 - **Claude session integration**: The home screen fetches Claude session state from `~/.claude/projects/` JSONL logs via the log parser. Session states: 👀 awaiting input (`WAITING_FOR_USER`), 🛡️ approve tool (`WAITING_FOR_TOOL_APPROVAL`), ⚙ working (`WORKING`), 💤 idle (`IDLE`), no indicator (`UNKNOWN`). State logic: `last-prompt` marker → `IDLE` (session ended). For assistant entries: `stop_reason=tool_use` without a following `tool_result` → `WAITING_FOR_TOOL_APPROVAL` (pending user approval), `stop_reason=tool_use` with `tool_result` → `WORKING`, any other stop reason or no stop reason → `WAITING_FOR_USER`. Last entry is user → `WORKING`. Previous Claude sessions (from the project root, capped at 5) appear as resumable items. Resuming launches `claude --resume SESSION_ID` in a new tmux session. The latest Claude session per path is "claimed" by the corresponding tmux/worktree item to avoid duplication.
+- **Forking a session**: "Fork session" creates a new worktree *and* forks the conversation in one step — `git worktree add -b worktree/<new> <path> <base>` followed by `claude --resume <parent-id> --fork-session` in the new directory. Notes:
+  - The base branch defaults to the **parent's branch**, so the fork inherits the parent's commits; the other options are the parent's own base branch (a sibling rather than a child) and any branch via the picker. `_show_branch_picker` hides `worktree/*` branches for a plain create but keeps them for a fork, since that is exactly what a fork wants.
+  - The fork branches from the parent's **committed tip** — uncommitted work in the parent is not carried over. `_build_fork_system_prompt` tells the forked session this, along with the parent's path, because the inherited conversation refers to files by the *parent's* paths.
+  - **Cross-directory resume requires Claude Code ≥ 2.1.223**, which looks a session id up in the current project and its worktrees first, then every other project on the machine. Earlier versions only searched the current project directory.
+  - Claude Code keys transcripts by cwd, so the forked session's JSONL lands under the *new* worktree's encoded project dir. No special casing is needed — `_get_claude_sessions` and the home screen's live state polling pick a fork up like any other session.
+  - **In-session `Ctrl-A f` hands over to the TUI rather than reimplementing the flow.** A key binding can only prompt for free text (`command-prompt`), which makes naming a base branch a blind typing exercise and a conversation picker impossible. So `f` runs `set-option @fujimoto_pending_action fork \; detach-client`: the detach returns control to the `fujimoto` process blocked in `attach_session`, `main()` consumes the flag with `take_pending_action`, and the next `SessionApp(pending_fork=...)` opens straight onto the fork flow via `_open_pending_fork`. One implementation, all the pickers. Three non-obvious mechanics:
+    - `set-option` must **not** take `-t "#{session_name}"`. A key binding already targets its own session, and the target of `set-option` is *not* format-expanded — passing it makes the command fail, which aborts the rest of the sequence so the detach never happens.
+    - The two commands are joined by a literal `\;` argument. A bare `;` is consumed as a top-level separator by the `tmux bind-key` invocation itself, so `detach-client` would run at bind time instead of being bound.
+    - `tmux send-keys` **cannot** test key bindings — it injects into the pane and bypasses key-table dispatch entirely. Drive an attached client's pty instead (`pty.fork()`, then `os.write(fd, b"\x01f")`).
+  - The flag is cleared on read, so a later ordinary detach of the same session can't re-trigger the fork. `main()` keys it on `tmux_name or session_name(project, working_dir.name)` — the same name `launch_claude_in_tmux` derives — so a freshly created worktree (whose `tmux_name` is `None`) is matched correctly.
+  - The whole flow funnels into the shared `_finalize_create` / `_do_create_and_launch`, so forks inherit the directory-conflict handling (`_show_conflict`, `conflict-suffix`) for free. A non-`None` `_fork_source` is the only difference; `_show_create_form` clears the fork state so a cancelled fork can't leak into the next plain create.
 - **Resume previous session — tmux naming**: When resuming from an inactive worktree, the resumed session reuses the worktree's existing tmux session name (e.g., `project/20260101-feature`) instead of generating a new `direct-N` name. This keeps the session correctly identified as a worktree item on subsequent TUI views, so its path and Claude session lookup remain tied to the worktree directory. For active worktrees (original session still alive), a `direct-N` name is used because the worktree name is occupied. The working directory for resumed sessions always comes from `cs.cwd` (the directory recorded in the Claude session log) rather than `session.path`.
 - **Live polling**: The home screen uses `set_interval(3s)` to poll Claude JSONL logs for state changes. When a session's state changes, labels are updated in-place via `label.update()` — the screen is never cleared or rebuilt, which avoids blank-screen flicker. A snapshot dict (`path → (session_id, state)`) is compared each tick to detect changes efficiently. The timer is stopped when navigating away (`_clear_main` cancels it) and restarted by `_show_home`.
 

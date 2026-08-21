@@ -10,6 +10,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 from rich.markup import escape
 from textual import events, on
@@ -87,8 +88,10 @@ from fujimoto.tmux import (
     list_project_sessions,
     quick_terminal_key,
     rename_session,
+    PENDING_FORK,
     session_name,
     set_terminal_title,
+    take_pending_action,
 )
 
 BRANCH_ICON = "\ue0a0"
@@ -100,6 +103,7 @@ ICON_GREEN_CIRCLE = "\U0001f7e2"
 ICON_BLACK_CIRCLE = "\u26ab"
 ICON_HLINE = "\u2500"
 ICON_WIZARD = "\U0001f9d9\U0001f3fd\u200d\u2642\ufe0f"
+ICON_FORK = "\U0001f374"
 
 
 _KEY_PREFIX_LABELS = {"C-": "Ctrl+", "M-": "Alt+", "S-": "Shift+"}
@@ -165,6 +169,11 @@ def _format_prompt_lines(text: str, max_width: int) -> list[str]:
     if len(lines) <= 2:
         return lines
     return [lines[0], lines[1], "…", lines[-1]]
+
+
+def _is_fork_worktree(worktree: Path) -> bool:
+    """Whether this worktree was created by forking another session."""
+    return bool(read_session_meta(worktree).get("forked_from_session_id"))
 
 
 def _get_claude_sessions(
@@ -254,6 +263,16 @@ Screen {
     background: $accent;
 }
 
+#fork-branch-list {
+    height: auto;
+    max-height: 6;
+    margin-bottom: 1;
+}
+
+#fork-branch-list:focus > ListItem.--highlight {
+    background: $accent;
+}
+
 #branch-picker-list {
     height: auto;
     max-height: 16;
@@ -307,7 +326,7 @@ Screen {
 
 #session-actions {
     height: auto;
-    max-height: 8;
+    max-height: 10;
 }
 
 #session-actions:focus > ListItem.--highlight {
@@ -572,6 +591,27 @@ class SessionInfo:
     branch: str
     claude_session_id: str | None = field(default=None)
     claude_state: SessionState | None = field(default=None)
+    is_fork: bool = field(default=False)
+
+
+class LaunchTarget(NamedTuple):
+    """What `main()` should launch once the TUI exits.
+
+    `resume_session_id` means "resume this conversation in place". A fork is
+    described instead by `forked_from_session_id` (the *parent's* conversation)
+    plus `forked_from_worktree` (where that conversation was running) — for a
+    fork, `working_dir` is the newly created worktree, so the two ideas cannot
+    share a field. A non-None `forked_from_session_id` is what marks a launch
+    as a fork; there is no separate boolean.
+    """
+
+    project: str
+    working_dir: Path
+    tmux_name: str | None
+    session_type: str
+    resume_session_id: str | None = None
+    forked_from_session_id: str | None = None
+    forked_from_worktree: Path | None = None
 
 
 class SessionApp(App):
@@ -584,8 +624,11 @@ class SessionApp(App):
         Binding("d", "dismiss_update", "Dismiss update", show=False),
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, pending_fork: Path | None = None) -> None:
         super().__init__()
+        # Set when an in-session `Ctrl-A f` detached to hand the fork over to
+        # the TUI; the home screen then opens straight onto the fork flow.
+        self._pending_fork: Path | None = pending_fork
         self._project_cwd: Path | None = None
         self._project_name: str = ""
         self._current_branch: str = ""
@@ -595,7 +638,7 @@ class SessionApp(App):
         self._base_branch: str = ""
         self._start_point: str = ""
         self._worktree_path: Path | None = None
-        self._launch_target: tuple[str, Path, str | None, str, str | None] | None = None
+        self._launch_target: LaunchTarget | None = None
         self._project_root: Path | None = None
         self._existing_worktrees: list[Path] = []
         self._session_map: dict[str, SessionInfo] = {}
@@ -607,6 +650,13 @@ class SessionApp(App):
         self._poll_timer: object | None = None
         self._claude_state_snapshot: dict[str, tuple[str, SessionState]] = {}
         self._resume_sessions: list[ClaudeSession] = []
+        # Fork state. `_fork_source` being set is what turns the shared create
+        # flow into a fork; both are cleared when entering the plain create
+        # flow so a cancelled fork can't leak into the next worktree.
+        self._forking: bool = False
+        self._fork_sessions: list[ClaudeSession] = []
+        self._fork_source: ClaudeSession | None = None
+        self._fork_parent_path: Path | None = None
         self._update_banner_version: str | None = None
         self._on_home: bool = False
 
@@ -627,6 +677,7 @@ class SessionApp(App):
             self._init_git_info()
             self._start_update_check()
             await self._show_home()
+            await self._open_pending_fork()
             config_error = self._project_config_error()
             if config_error is not None:
                 self.push_screen(ConfigErrorDialog(config_error))
@@ -872,7 +923,7 @@ class SessionApp(App):
                 if cs_id:
                     claimed_claude_ids.add(cs_id)
                 state_suffix = _claude_state_label(cs_state) if cs_state else ""
-                self._session_map[item_id] = SessionInfo(
+                info = SessionInfo(
                     name=wt.name,
                     session_type="worktree",
                     project=self._project_name,
@@ -882,11 +933,10 @@ class SessionApp(App):
                     branch=branch,
                     claude_session_id=cs_id,
                     claude_state=cs_state,
+                    is_fork=_is_fork_worktree(wt),
                 )
-                label_text = (
-                    f"{ICON_GREEN_CIRCLE} {wt.name}"
-                    f"  [dim]({BRANCH_ICON} {branch})[/]{state_suffix}"
-                )
+                self._session_map[item_id] = info
+                label_text = self._build_session_label(info, state_suffix)
                 items.append(ListItem(Label(label_text, markup=True), id=item_id))
 
         # Inactive worktrees section
@@ -915,7 +965,7 @@ class SessionApp(App):
                 cs_state = cs.state if cs else None
                 if cs_id:
                     claimed_claude_ids.add(cs_id)
-                self._session_map[item_id] = SessionInfo(
+                info = SessionInfo(
                     name=wt.name,
                     session_type="worktree",
                     project=self._project_name,
@@ -925,10 +975,10 @@ class SessionApp(App):
                     branch=branch,
                     claude_session_id=cs_id,
                     claude_state=cs_state,
+                    is_fork=_is_fork_worktree(wt),
                 )
-                label_text = (
-                    f"{ICON_BLACK_CIRCLE} {wt.name}  [dim]({BRANCH_ICON} {branch})[/]"
-                )
+                self._session_map[item_id] = info
+                label_text = self._build_session_label(info, "")
                 items.append(ListItem(Label(label_text, markup=True), id=item_id))
 
         # Previous Claude sessions (from project root, not claimed by active items)
@@ -1060,19 +1110,28 @@ class SessionApp(App):
                 pass
 
     def _build_session_label(self, session: SessionInfo, state_suffix: str) -> str:
-        """Build the display label for a session item."""
+        """Build the display label for a session item.
+
+        Single source of truth for session rows: `_show_home` renders with it
+        and `_poll_session_states` updates in place with it, so the two can't
+        drift apart.
+        """
+        fork = f" {ICON_FORK}" if session.is_fork else ""
         if session.is_active:
             if session.session_type == "direct":
                 return (
-                    f"{ICON_GREEN_CIRCLE} {session.name}"
+                    f"{ICON_GREEN_CIRCLE} {session.name}{fork}"
                     f"  [dim]({session.project} {BRANCH_ICON}"
                     f" {session.branch})[/]{state_suffix}"
                 )
             return (
-                f"{ICON_GREEN_CIRCLE} {session.name}"
+                f"{ICON_GREEN_CIRCLE} {session.name}{fork}"
                 f"  [dim]({BRANCH_ICON} {session.branch})[/]{state_suffix}"
             )
-        return f"{ICON_BLACK_CIRCLE} {session.name}  [dim]({BRANCH_ICON} {session.branch})[/]"
+        return (
+            f"{ICON_BLACK_CIRCLE} {session.name}{fork}"
+            f"  [dim]({BRANCH_ICON} {session.branch})[/]"
+        )
 
     # -- Session actions submenu --
 
@@ -1103,6 +1162,12 @@ class SessionApp(App):
                         )
                     )
                 items.append(ListItem(Label("Launch"), id="sa-launch"))
+
+            # Forking needs a conversation to fork and a git branch to base the
+            # new worktree on, so it is offered for worktree/direct sessions
+            # that have at least one previous Claude session.
+            if has_previous and session.session_type in ("worktree", "direct"):
+                items.insert(1, ListItem(Label("Fork session"), id="sa-fork"))
 
         items.append(ListItem(Label("Open terminal"), id="sa-terminal"))
         items.append(ListItem(Label("Open in VS Code"), id="sa-vscode"))
@@ -1157,7 +1222,7 @@ class SessionApp(App):
             tmux_name = get_next_direct_session_name(
                 session.project, self._active_sessions
             )
-        self._launch_target = (
+        self._launch_target = LaunchTarget(
             session.project,
             cs.cwd,  # authoritative original directory from the session log
             tmux_name,
@@ -1178,37 +1243,7 @@ class SessionApp(App):
         await self._clear_main()
         main = self.query_one("#main")
 
-        # Reserve space for list padding (2 chars each side) + container margin
-        max_width = max(20, self.size.width - 8)
-
-        if not sessions:
-            items: list[ListItem] = [
-                ListItem(
-                    Label("[dim]No previous sessions found[/]", markup=True),
-                    id="rp-empty",
-                ),
-                ListItem(Label("[dim]Cancel[/]", markup=True), id="rp-cancel"),
-            ]
-        else:
-            items = []
-            for i, cs in enumerate(sessions):
-                time_text = _relative_time(cs.last_activity)
-                meta = (
-                    f"{cs.title}  [dim]{time_text}[/]"
-                    if cs.title
-                    else f"[dim]{time_text}[/]"
-                )
-                if cs.first_prompt:
-                    prompt_lines = _format_prompt_lines(cs.first_prompt, max_width)
-                    item = ListItem(
-                        *[Label(ln) for ln in prompt_lines],
-                        Label(meta, markup=True),
-                        id=f"rp-{i}",
-                    )
-                else:
-                    item = ListItem(Label(meta, markup=True), id=f"rp-{i}")
-                items.append(item)
-            items.append(ListItem(Label("[dim]Cancel[/]", markup=True), id="rp-cancel"))
+        items = self._build_claude_session_items(sessions, "rp")
 
         await main.mount(
             Container(
@@ -1219,6 +1254,165 @@ class SessionApp(App):
             )
         )
         self.query_one("#resume-picker").focus()
+
+    def _build_claude_session_items(
+        self, sessions: list[ClaudeSession], prefix: str
+    ) -> list[ListItem]:
+        """Build picker rows for a list of Claude sessions.
+
+        Shared by the resume and fork pickers; `prefix` namespaces the widget
+        ids (`rp-*` vs `fp-*`) so each picker's handler owns its own rows.
+        """
+        # Reserve space for list padding (2 chars each side) + container margin
+        max_width = max(20, self.size.width - 8)
+
+        if not sessions:
+            return [
+                ListItem(
+                    Label("[dim]No previous sessions found[/]", markup=True),
+                    id=f"{prefix}-empty",
+                ),
+                ListItem(Label("[dim]Cancel[/]", markup=True), id=f"{prefix}-cancel"),
+            ]
+
+        items: list[ListItem] = []
+        for i, cs in enumerate(sessions):
+            time_text = _relative_time(cs.last_activity)
+            meta = (
+                f"{cs.title}  [dim]{time_text}[/]"
+                if cs.title
+                else f"[dim]{time_text}[/]"
+            )
+            if cs.first_prompt:
+                prompt_lines = _format_prompt_lines(cs.first_prompt, max_width)
+                item = ListItem(
+                    *[Label(ln) for ln in prompt_lines],
+                    Label(meta, markup=True),
+                    id=f"{prefix}-{i}",
+                )
+            else:
+                item = ListItem(Label(meta, markup=True), id=f"{prefix}-{i}")
+            items.append(item)
+        items.append(
+            ListItem(Label("[dim]Cancel[/]", markup=True), id=f"{prefix}-cancel")
+        )
+        return items
+
+    # -- Fork flow --
+
+    async def _open_pending_fork(self) -> None:
+        """Enter the fork flow for a session that requested it via `Ctrl-A f`.
+
+        The requesting session has just detached but is still alive, so it is
+        listed on the home screen and present in `_session_map`; match it by
+        path. If it can't be found we simply stay on the home screen rather
+        than guessing.
+        """
+        target = self._pending_fork
+        self._pending_fork = None
+        if target is None:
+            return
+        resolved = target.resolve()
+        for session in self._session_map.values():
+            if session.path.resolve() != resolved:
+                continue
+            if not get_sessions_for_path(session.path):
+                await self._show_error(
+                    f"No Claude session found in {session.path} to fork."
+                )
+                return
+            await self._show_fork_title_form(session)
+            return
+
+    async def _show_fork_title_form(self, session: SessionInfo) -> None:
+        """Ask for the forked worktree's name."""
+        self._selected_session = session
+        self._forking = True
+        self._fork_parent_path = session.path
+        self._fork_source = None
+        await self._clear_main()
+        main = self.query_one("#main")
+        await main.mount(
+            Container(
+                Label("Fork Session", classes="form-label"),
+                Static(
+                    f"forking {session.name} ({BRANCH_ICON} {session.branch})",
+                    classes="session-info",
+                ),
+                Label("Title:"),
+                Input(placeholder="e.g. try-alternative", id="fork-title-input"),
+                Static("[dim]Press Enter to continue[/]", markup=True, classes="hint"),
+                id="create-panel",
+            )
+        )
+        self.query_one("#fork-title-input").focus()
+
+    async def _show_fork_branch_select(self) -> None:
+        """Pick the base branch for the fork, defaulting to the parent's."""
+        session = self._selected_session
+        if session is None:
+            return  # pragma: no cover
+        await self._clear_main()
+        main = self.query_one("#main")
+
+        meta = read_session_meta(session.path)
+        parent_base = meta.get("base_branch") or self._default_branch
+
+        items = [
+            ListItem(
+                Label(f"Parent branch ({session.branch})"),
+                id="fork-branch-parent",
+            ),
+            ListItem(
+                Label(f"Parent's base ({parent_base})"),
+                id="fork-branch-base",
+            ),
+            ListItem(Label("Another branch…"), id="fork-branch-other"),
+        ]
+
+        await main.mount(
+            Container(
+                Label("Select Base Branch", classes="form-label"),
+                Static(
+                    "the fork inherits this branch's commits",
+                    classes="session-info",
+                ),
+                ListView(*items, id="fork-branch-list"),
+                id="create-panel",
+            )
+        )
+        self.query_one("#fork-branch-list").focus()
+
+    async def _choose_fork_source(self) -> None:
+        """Pick which conversation to fork, then create the worktree.
+
+        A directory accumulates one Claude session per `claude` invocation, so
+        there can be several candidates; with exactly one there is nothing to
+        ask, matching the resume flow.
+        """
+        session = self._selected_session
+        if session is None:
+            return  # pragma: no cover
+        sessions = get_sessions_for_path(session.path)
+        self._fork_sessions = sessions
+
+        if len(sessions) == 1:
+            self._fork_source = sessions[0]
+            await self._finalize_create()
+            return
+
+        await self._clear_main()
+        main = self.query_one("#main")
+        items = self._build_claude_session_items(sessions, "fp")
+        await main.mount(
+            Container(
+                Label(session.name, classes="form-label"),
+                Static("Fork which session?", classes="session-info"),
+                ListView(*items, id="fork-picker"),
+                id="actions-panel",
+            )
+        )
+        self.query_one("#fork-picker").focus()
 
     # -- Rename flow --
 
@@ -1403,6 +1597,10 @@ class SessionApp(App):
     # -- Create worktree flow --
 
     async def _show_create_form(self) -> None:
+        # Plain create: make sure no leftover fork state turns this into a fork.
+        self._forking = False
+        self._fork_source = None
+        self._fork_parent_path = None
         await self._clear_main()
         main = self.query_one("#main")
         await main.mount(
@@ -1454,11 +1652,11 @@ class SessionApp(App):
         main = self.query_one("#main")
 
         try:
-            branches = [
-                b
-                for b in list_branches(cwd=self._project_cwd)
-                if not b.startswith("worktree/")
-            ]
+            branches = list_branches(cwd=self._project_cwd)
+            if not self._forking:
+                # Worktree branches are hidden as base-branch candidates for a
+                # plain create, but they are exactly what a fork wants.
+                branches = [b for b in branches if not b.startswith("worktree/")]
         except GitError:
             branches = []
 
@@ -1520,8 +1718,14 @@ class SessionApp(App):
         self.query_one("#conflict-list").focus()
 
     async def _do_create_and_launch(self) -> None:
+        """Create the worktree and hand off to main() to launch it.
+
+        Shared by the plain create flow and the fork flow — a non-None
+        `_fork_source` is the only difference.
+        """
         assert self._worktree_path is not None
         assert self._project_root is not None
+        fork_id = self._fork_source.session_id if self._fork_source else None
         new_branch = f"worktree/{self._worktree_path.name}"
         try:
             create_worktree(
@@ -1531,19 +1735,24 @@ class SessionApp(App):
                 cwd=self._project_cwd,
             )
             store_session_meta(
-                self._worktree_path, self._base_branch, source_root=self._project_root
+                self._worktree_path,
+                self._base_branch,
+                source_root=self._project_root,
+                forked_from_session_id=fork_id,
+                forked_from_worktree=self._fork_parent_path if fork_id else None,
             )
         except GitError as e:
             await self._show_error(str(e))
             return
         # Project config (copy/link/init) is applied in main() before launch,
         # uniformly across all connection modes.
-        self._launch_target = (
+        self._launch_target = LaunchTarget(
             self._project_name,
             self._worktree_path,
             None,
             "worktree",
-            None,
+            forked_from_session_id=fork_id,
+            forked_from_worktree=self._fork_parent_path if fork_id else None,
         )
         self.exit()
 
@@ -1723,7 +1932,7 @@ class SessionApp(App):
         all_sessions = set(list_all_sessions())
         tmux_name = get_next_adhoc_session_name(all_sessions)
         adhoc_dir = Path(tempfile.mkdtemp(prefix="fujimoto-adhoc-"))
-        self._launch_target = (
+        self._launch_target = LaunchTarget(
             "adhoc",
             adhoc_dir,
             tmux_name,
@@ -1766,7 +1975,7 @@ class SessionApp(App):
         action = event.item.id
 
         if action == "sa-connect":
-            self._launch_target = (
+            self._launch_target = LaunchTarget(
                 session.project,
                 session.path,
                 session.tmux_session,
@@ -1775,7 +1984,7 @@ class SessionApp(App):
             )
             self.exit()
         elif action == "sa-launch":
-            self._launch_target = (
+            self._launch_target = LaunchTarget(
                 session.project,
                 session.path,
                 session.tmux_session,
@@ -1787,7 +1996,7 @@ class SessionApp(App):
             tmux_name = get_next_direct_session_name(
                 session.project, self._active_sessions
             )
-            self._launch_target = (
+            self._launch_target = LaunchTarget(
                 session.project,
                 session.path,
                 tmux_name,
@@ -1797,6 +2006,8 @@ class SessionApp(App):
             self.exit()
         elif action == "sa-resume-picker":
             await self._show_resume_session_picker(session)
+        elif action == "sa-fork":
+            await self._show_fork_title_form(session)
         elif action == "sa-terminate":
             try:
                 kill_session(session.tmux_session)
@@ -1969,7 +2180,7 @@ class SessionApp(App):
             return
         tmux_name = f"{self._project_name}/{slugify(value)}"
         project_path = self._project_cwd or Path(".")
-        self._launch_target = (
+        self._launch_target = LaunchTarget(
             self._project_name,
             project_path,
             tmux_name,
@@ -2008,6 +2219,43 @@ class SessionApp(App):
         self._title_value = value
         await self._show_branch_select()
 
+    @on(Input.Submitted, "#fork-title-input")
+    async def on_fork_title_submitted(self, event: Input.Submitted) -> None:
+        value = event.value.strip()
+        if not value:
+            return
+        self._title_value = value
+        await self._show_fork_branch_select()
+
+    @on(ListView.Selected, "#fork-branch-list")
+    async def on_fork_branch_selected(self, event: ListView.Selected) -> None:
+        session = self._selected_session
+        if session is None:
+            return  # pragma: no cover
+        self._start_point = ""
+        if event.item.id == "fork-branch-parent":
+            self._base_branch = session.branch
+            await self._choose_fork_source()
+        elif event.item.id == "fork-branch-base":
+            meta = read_session_meta(session.path)
+            self._base_branch = meta.get("base_branch") or self._default_branch
+            await self._choose_fork_source()
+        elif event.item.id == "fork-branch-other":
+            await self._show_branch_picker()
+
+    @on(ListView.Selected, "#fork-picker")
+    async def on_fork_picker_selected(self, event: ListView.Selected) -> None:
+        item_id = event.item.id
+        if item_id in ("fp-cancel", "fp-empty"):
+            try:
+                await self._show_home()
+            except (ConfigError, GitError) as e:  # pragma: no cover
+                await self._show_error(str(e))
+            return
+        idx = int(item_id.split("-", 1)[1])
+        self._fork_source = self._fork_sessions[idx]
+        await self._finalize_create()
+
     @on(ListView.Selected, "#branch-list")
     async def on_branch_selected(self, event: ListView.Selected) -> None:
         if event.item.id == "branch-current":
@@ -2042,6 +2290,17 @@ class SessionApp(App):
     async def on_branch_filter_submitted(self, event: Input.Submitted) -> None:
         await self._select_highlighted_branch()
 
+    async def _after_base_branch_chosen(self) -> None:
+        """Continue once `_base_branch` is set.
+
+        A fork still has to pick which conversation it inherits; a plain create
+        goes straight to making the worktree.
+        """
+        if self._forking:
+            await self._choose_fork_source()
+        else:
+            await self._finalize_create()
+
     async def _select_highlighted_branch(self) -> None:
         branch_list = self.query_one("#branch-picker-list", ListView)
         if len(branch_list) == 0 or branch_list.index is None:
@@ -2049,20 +2308,20 @@ class SessionApp(App):
         item = branch_list.children[branch_list.index]
         if item.id and item.id in self._branch_picker_names:
             self._base_branch = self._branch_picker_names[item.id]
-            await self._finalize_create()
+            await self._after_base_branch_chosen()
 
     @on(ListView.Selected, "#branch-picker-list")
     async def on_branch_picker_selected(self, event: ListView.Selected) -> None:
         item_id = event.item.id
         if item_id and item_id in self._branch_picker_names:
             self._base_branch = self._branch_picker_names[item_id]
-            await self._finalize_create()
+            await self._after_base_branch_chosen()
 
     @on(ListView.Selected, "#conflict-list")
     async def on_conflict_selected(self, event: ListView.Selected) -> None:
         assert self._worktree_path is not None
         if event.item.id == "conflict-connect":
-            self._launch_target = (
+            self._launch_target = LaunchTarget(
                 self._project_name,
                 self._worktree_path,
                 None,
@@ -2125,6 +2384,37 @@ def _build_system_prompt(session_type: str, project: str, working_dir: Path) -> 
         f"You are working in a fujimoto direct session for project '{project}'. "
         "This is the project's main repository directory, not an isolated worktree. "
         "Be cautious with branch operations — other sessions may share this directory."
+    )
+
+
+def _build_fork_system_prompt(
+    project: str,
+    working_dir: Path,
+    parent_worktree: Path | None,
+    base_branch: str,
+) -> str:
+    """Context appended to a forked session so it knows it has moved.
+
+    A forked conversation carries file paths and assumptions from the worktree
+    it was originally running in. Without this it would keep editing the parent
+    worktree's paths.
+    """
+    origin = (
+        f"The conversation history above happened in a different git worktree: "
+        f"{parent_worktree}. "
+        if parent_worktree is not None
+        else "The conversation history above happened in a different git worktree. "
+    )
+    return (
+        "This session is a fork of an earlier Claude session, running in a "
+        f"fujimoto worktree session for project '{project}'. "
+        + origin
+        + f"You are now in a NEW worktree at {working_dir}, on branch "
+        f"'worktree/{working_dir.name}', branched from '{base_branch}'. "
+        "File paths referenced earlier in the conversation point at the "
+        "original worktree — work in this one instead. The fork was made from "
+        "the parent's committed tip, so any uncommitted changes in the "
+        "original worktree are not present here."
     )
 
 
@@ -2351,20 +2641,37 @@ def main() -> None:
                 print(f"  {issue}\n", file=sys.stderr)
             sys.exit(1)
 
+        pending_fork: Path | None = None
         while True:
             set_terminal_title(f"{ICON_WIZARD} fujimoto")
-            app = SessionApp()
+            app = SessionApp(pending_fork=pending_fork)
+            pending_fork = None
             app.run()
 
             if app._launch_target:
-                project_name, working_dir, tmux_name, session_type, resume_id = (
-                    app._launch_target
-                )
-                system_prompt = (
-                    None
-                    if resume_id
-                    else _build_system_prompt(session_type, project_name, working_dir)
-                )
+                target = app._launch_target
+                project_name = target.project
+                working_dir = target.working_dir
+                tmux_name = target.tmux_name
+                session_type = target.session_type
+                fork_id = target.forked_from_session_id
+                resume_id = fork_id or target.resume_session_id
+                if fork_id:
+                    # A fork resumes the parent's conversation but in a new
+                    # worktree, so it needs the prompt explaining the move.
+                    meta = read_session_meta(working_dir)
+                    system_prompt = _build_fork_system_prompt(
+                        project_name,
+                        working_dir,
+                        target.forked_from_worktree,
+                        meta.get("base_branch", "unknown"),
+                    )
+                elif resume_id:
+                    system_prompt = None
+                else:
+                    system_prompt = _build_system_prompt(
+                        session_type, project_name, working_dir
+                    )
                 set_terminal_title(
                     _session_terminal_title(
                         project_name, tmux_name, working_dir, session_type
@@ -2378,7 +2685,15 @@ def main() -> None:
                     tmux_name,
                     system_prompt=system_prompt,
                     resume_session_id=resume_id,
+                    fork_session=bool(fork_id),
                 )
+                # `Ctrl-A f` inside the session flags it and detaches, handing
+                # the fork over to the TUI (which can show pickers).
+                resolved_name = tmux_name or session_name(
+                    project_name, working_dir.name
+                )
+                if take_pending_action(resolved_name) == PENDING_FORK:
+                    pending_fork = working_dir
             else:
                 break
         set_terminal_title("")

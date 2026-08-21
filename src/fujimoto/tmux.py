@@ -259,6 +259,10 @@ def disable_quick_terminal_binding() -> None:
     )
 
 
+PENDING_ACTION_OPTION = "@fujimoto_pending_action"
+PENDING_FORK = "fork"
+
+
 def _configure_session(name: str) -> None:
     """Apply standard tmux configuration to a session."""
     meta_key = _meta_key()
@@ -273,7 +277,7 @@ def _configure_session(name: str) -> None:
     if meta_key:
         meta_label = _meta_key_label(meta_key)
         status_right = (
-            f'"Fujimoto: {meta_label} t/T/w/v/d/x/[ ({meta_label} t toggles) | '
+            f'"Fujimoto: {meta_label} t/T/w/v/f/d/x/[ ({meta_label} t toggles) | '
             f'help: {meta_label} ?"'
         )
         status_len = "120"
@@ -339,6 +343,20 @@ def _configure_fujimoto_key_table(name: str, meta_key: str) -> None:
         ],
         ["v", "run-shell", "fujimoto pane vscode --session #{session_name}"],
         ["w", "run-shell", "fujimoto pane terminal --session #{session_name}"],
+        # Forking needs a name, a base branch and possibly a conversation
+        # picker — more than a key binding can ask for. So flag the session and
+        # detach: `main()` sees the flag and reopens the TUI on the fork flow.
+        # Note `set-option` has no `-t` here on purpose: a key binding already
+        # targets its own session, and `-t "#{session_name}"` is NOT format-
+        # expanded, which makes the command fail and abort the whole sequence.
+        [
+            "f",
+            "set-option",
+            PENDING_ACTION_OPTION,
+            PENDING_FORK,
+            "\\;",
+            "detach-client",
+        ],
         ["d", "detach-client"],
         ["x", "confirm-before", "-p", "kill pane #P? (y/n)", "kill-pane"],
         ["[", "copy-mode"],
@@ -347,7 +365,8 @@ def _configure_fujimoto_key_table(name: str, meta_key: str) -> None:
             "display-message",
             "-d",
             "5000",
-            "F-mode: t/T=split  v=code  w=window  d=detach  x=kill  [=copy  ?=help",
+            "F-mode: t/T=split  v=code  w=window  f=fork  d=detach  x=kill  "
+            "[=copy  ?=help",
         ],
     ]
     for key, *cmd in fujimoto_bindings:
@@ -369,18 +388,41 @@ def _configure_fujimoto_key_table(name: str, meta_key: str) -> None:
     )
 
 
+def build_claude_command(
+    system_prompt: str | None = None,
+    resume_session_id: str | None = None,
+    fork_session: bool = False,
+) -> str:
+    """Compose the `claude` invocation for a new tmux session.
+
+    The flags compose rather than exclude each other: a forked session needs
+    both `--resume <id> --fork-session` (to inherit the conversation) and
+    `--append-system-prompt` (to tell it that it is a fork and where the
+    original worktree lives).
+    """
+    parts = ["claude"]
+    if resume_session_id:
+        parts.append(f"--resume {resume_session_id}")
+        if fork_session:
+            parts.append("--fork-session")
+    if system_prompt:
+        escaped = system_prompt.replace("'", "'\\''")
+        parts.append(f"--append-system-prompt '{escaped}'")
+    return " ".join(parts)
+
+
 def create_session(
     name: str,
     working_dir: Path,
     system_prompt: str | None = None,
     resume_session_id: str | None = None,
+    fork_session: bool = False,
 ) -> None:
-    claude_cmd = "claude"
-    if resume_session_id:
-        claude_cmd = f"claude --resume {resume_session_id}"
-    elif system_prompt:
-        escaped = system_prompt.replace("'", "'\\''")
-        claude_cmd = f"claude --append-system-prompt '{escaped}'"
+    claude_cmd = build_claude_command(
+        system_prompt=system_prompt,
+        resume_session_id=resume_session_id,
+        fork_session=fork_session,
+    )
     subprocess.run(
         [
             "tmux",
@@ -423,12 +465,38 @@ def attach_session(name: str) -> None:
     subprocess.run(["tmux", "attach-session", "-t", name])
 
 
+def take_pending_action(name: str) -> str | None:
+    """Read and clear the pending in-session action for a tmux session.
+
+    In-session key bindings that need the TUI record their intent as a tmux
+    session option and detach; `main()` consumes it here when `tmux attach`
+    returns. Reading an unset option exits non-zero, as does a session that has
+    since been killed — both mean "nothing pending".
+    """
+    result = subprocess.run(
+        ["tmux", "show-options", "-t", name, "-v", PENDING_ACTION_OPTION],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    action = result.stdout.strip()
+    if not action:
+        return None
+    subprocess.run(
+        ["tmux", "set-option", "-t", name, "-u", PENDING_ACTION_OPTION],
+        capture_output=True,
+    )
+    return action
+
+
 def launch_claude_in_tmux(
     project_name: str,
     working_dir: Path,
     tmux_name: str | None = None,
     system_prompt: str | None = None,
     resume_session_id: str | None = None,
+    fork_session: bool = False,
 ) -> None:
     name = tmux_name or session_name(project_name, working_dir.name)
     if session_exists(name):
@@ -439,5 +507,6 @@ def launch_claude_in_tmux(
             working_dir,
             system_prompt=system_prompt,
             resume_session_id=resume_session_id,
+            fork_session=fork_session,
         )
         attach_session(name)
