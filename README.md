@@ -273,6 +273,20 @@ fujimoto
 
 Worktrees created with **Fork session** are marked with 🍴.
 
+#### Searching sessions
+
+Press `/` on the home screen to open a search box, then type to filter. Matching
+is live and case-insensitive, against session names and branch names, and covers
+the **active sessions**, **inactive worktrees** and **previous claude sessions**
+lists at once. While a filter is active the action rows (`+ New …`, settings,
+switch project) are hidden so only matches remain.
+
+| Key | While searching |
+|-----|-----------------|
+| `Enter` | Apply the filter and move to the filtered list |
+| `↑` / `↓` | Move the highlight without leaving the search box |
+| `Escape` | Clear the filter and return to the full list |
+
 
 ### Three Session Types
 
@@ -359,7 +373,8 @@ These options are set per-session and don't affect your global tmux config.
 | Key | Action |
 |-----|--------|
 | `Enter` | Select |
-| `Escape` | Back (or quit from home) |
+| `/` | Search sessions (home screen) |
+| `Escape` | Back (or quit from home; clears an active search first) |
 | `q` | Quit |
 | Arrow keys | Navigate |
 

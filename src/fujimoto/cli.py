@@ -220,6 +220,10 @@ Screen {
     margin-bottom: 0;
 }
 
+#home-search {
+    margin-bottom: 1;
+}
+
 #home-list {
     height: auto;
     max-height: 24;
@@ -622,6 +626,7 @@ class SessionApp(App):
         Binding("ctrl+c", "quit", "Quit", show=False),
         Binding("escape", "go_back", "Back", show=True),
         Binding("d", "dismiss_update", "Dismiss update", show=False),
+        Binding("slash", "search", "Search", show=True),
     ]
 
     def __init__(self, pending_fork: Path | None = None) -> None:
@@ -659,6 +664,11 @@ class SessionApp(App):
         self._fork_parent_path: Path | None = None
         self._update_banner_version: str | None = None
         self._on_home: bool = False
+        # Home-screen search. `_searching` is whether the search box is armed
+        # (visible/focused); `_search_query` is the live filter, which stays
+        # applied after Enter hands focus back to the list.
+        self._searching: bool = False
+        self._search_query: str = ""
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -825,6 +835,47 @@ class SessionApp(App):
                 )
             )
 
+        search = Input(
+            value=self._search_query,
+            placeholder="Type to search sessions...",
+            id="home-search",
+        )
+        # The search box lives on the home screen permanently but is only
+        # displayed once `/` arms it, so toggling search never remounts.
+        search.display = self._searching
+        await main.mount(
+            Container(
+                search,
+                ListView(*self._build_home_items(), id="home-list"),
+                id="home-panel",
+            )
+        )
+        if self._searching:
+            self.query_one("#home-search").focus()
+        else:
+            self.query_one("#home-list").focus()
+        self._poll_timer = self.set_interval(3, self._poll_session_states)
+
+    def _search_matches(self, *fields: str) -> bool:
+        """Case-insensitive substring match of the search query against `fields`.
+
+        An empty query matches everything, so callers can filter
+        unconditionally.
+        """
+        query = self._search_query.strip().lower()
+        if not query:
+            return True
+        return any(query in field.lower() for field in fields if field)
+
+    def _build_home_items(self) -> list[ListItem]:
+        """Build the home screen rows, honouring the current search query.
+
+        Also (re)populates `_session_map` and `_claude_state_snapshot`, so it is
+        the single place that decides which sessions are on screen — the live
+        state poller then only touches rows that survived the filter.
+        """
+        searching = bool(self._search_query.strip())
+
         # Fetch Claude session data for state indicators
         path_to_latest, root_claude_sessions = _get_claude_sessions(
             self._project_root, self._existing_worktrees
@@ -834,23 +885,25 @@ class SessionApp(App):
         }
         claimed_claude_ids: set[str] = set()
 
-        items: list[ListItem] = [
-            ListItem(
-                Label("[bold]+ New worktree session[/]", markup=True),
-                id="action-create",
-            ),
-            ListItem(
-                Label(
-                    f"[bold]+ New session in {self._project_name}[/]",
-                    markup=True,
+        items: list[ListItem] = []
+        if not searching:
+            items = [
+                ListItem(
+                    Label("[bold]+ New worktree session[/]", markup=True),
+                    id="action-create",
                 ),
-                id="action-direct",
-            ),
-            ListItem(
-                Label("[bold]+ Ad hoc session[/]", markup=True),
-                id="action-adhoc",
-            ),
-        ]
+                ListItem(
+                    Label(
+                        f"[bold]+ New session in {self._project_name}[/]",
+                        markup=True,
+                    ),
+                    id="action-direct",
+                ),
+                ListItem(
+                    Label("[bold]+ Ad hoc session[/]", markup=True),
+                    id="action-adhoc",
+                ),
+            ]
 
         # Build session map for all items
         self._session_map = {}
@@ -872,9 +925,70 @@ class SessionApp(App):
             for wt in self._existing_worktrees
             if session_name(self._project_name, wt.name) in self._active_sessions
         ]
-        has_active = bool(active_worktrees) or bool(direct_sessions)
 
-        if has_active:
+        active_items: list[ListItem] = []
+
+        for sname in direct_sessions:
+            item_id = f"ds-{sname.replace('/', '--')}"
+            display_name = sname.split("/", 1)[1] if "/" in sname else sname
+            if not self._search_matches(
+                display_name, sname, self._project_name, self._current_branch
+            ):
+                continue
+            project_root_str = str(self._project_root) if self._project_root else ""
+            cs = path_to_latest.get(project_root_str)
+            cs_id = cs.session_id if cs else None
+            cs_state = cs.state if cs else None
+            if cs_id:
+                claimed_claude_ids.add(cs_id)
+            state_suffix = _claude_state_label(cs_state) if cs_state else ""
+            self._session_map[item_id] = SessionInfo(
+                name=display_name,
+                session_type="direct",
+                project=self._project_name,
+                path=self._project_cwd or Path("."),
+                tmux_session=sname,
+                is_active=True,
+                branch=self._current_branch,
+                claude_session_id=cs_id,
+                claude_state=cs_state,
+            )
+            label_text = (
+                f"{ICON_GREEN_CIRCLE} {display_name}"
+                f"  [dim]({self._project_name} {BRANCH_ICON}"
+                f" {self._current_branch})[/]{state_suffix}"
+            )
+            active_items.append(ListItem(Label(label_text, markup=True), id=item_id))
+
+        for wt in active_worktrees:
+            sname = session_name(self._project_name, wt.name)
+            item_id = f"wt-{wt.name}"
+            branch = f"worktree/{wt.name}"
+            if not self._search_matches(wt.name, branch, sname):
+                continue
+            cs = path_to_latest.get(str(wt))
+            cs_id = cs.session_id if cs else None
+            cs_state = cs.state if cs else None
+            if cs_id:
+                claimed_claude_ids.add(cs_id)
+            state_suffix = _claude_state_label(cs_state) if cs_state else ""
+            info = SessionInfo(
+                name=wt.name,
+                session_type="worktree",
+                project=self._project_name,
+                path=wt,
+                tmux_session=sname,
+                is_active=True,
+                branch=branch,
+                claude_session_id=cs_id,
+                claude_state=cs_state,
+                is_fork=_is_fork_worktree(wt),
+            )
+            self._session_map[item_id] = info
+            label_text = self._build_session_label(info, state_suffix)
+            active_items.append(ListItem(Label(label_text, markup=True), id=item_id))
+
+        if active_items:
             items.append(
                 ListItem(
                     Static(
@@ -884,60 +998,7 @@ class SessionApp(App):
                     disabled=True,
                 ),
             )
-
-            for sname in direct_sessions:
-                item_id = f"ds-{sname.replace('/', '--')}"
-                display_name = sname.split("/", 1)[1] if "/" in sname else sname
-                project_root_str = str(self._project_root) if self._project_root else ""
-                cs = path_to_latest.get(project_root_str)
-                cs_id = cs.session_id if cs else None
-                cs_state = cs.state if cs else None
-                if cs_id:
-                    claimed_claude_ids.add(cs_id)
-                state_suffix = _claude_state_label(cs_state) if cs_state else ""
-                self._session_map[item_id] = SessionInfo(
-                    name=display_name,
-                    session_type="direct",
-                    project=self._project_name,
-                    path=self._project_cwd or Path("."),
-                    tmux_session=sname,
-                    is_active=True,
-                    branch=self._current_branch,
-                    claude_session_id=cs_id,
-                    claude_state=cs_state,
-                )
-                label_text = (
-                    f"{ICON_GREEN_CIRCLE} {display_name}"
-                    f"  [dim]({self._project_name} {BRANCH_ICON}"
-                    f" {self._current_branch})[/]{state_suffix}"
-                )
-                items.append(ListItem(Label(label_text, markup=True), id=item_id))
-
-            for wt in active_worktrees:
-                sname = session_name(self._project_name, wt.name)
-                item_id = f"wt-{wt.name}"
-                branch = f"worktree/{wt.name}"
-                cs = path_to_latest.get(str(wt))
-                cs_id = cs.session_id if cs else None
-                cs_state = cs.state if cs else None
-                if cs_id:
-                    claimed_claude_ids.add(cs_id)
-                state_suffix = _claude_state_label(cs_state) if cs_state else ""
-                info = SessionInfo(
-                    name=wt.name,
-                    session_type="worktree",
-                    project=self._project_name,
-                    path=wt,
-                    tmux_session=sname,
-                    is_active=True,
-                    branch=branch,
-                    claude_session_id=cs_id,
-                    claude_state=cs_state,
-                    is_fork=_is_fork_worktree(wt),
-                )
-                self._session_map[item_id] = info
-                label_text = self._build_session_label(info, state_suffix)
-                items.append(ListItem(Label(label_text, markup=True), id=item_id))
+            items.extend(active_items)
 
         # Inactive worktrees section
         inactive_worktrees = [
@@ -946,7 +1007,35 @@ class SessionApp(App):
             if session_name(self._project_name, wt.name) not in self._active_sessions
         ]
 
-        if inactive_worktrees:
+        inactive_items: list[ListItem] = []
+        for wt in inactive_worktrees:
+            sname = session_name(self._project_name, wt.name)
+            item_id = f"wt-{wt.name}"
+            branch = f"worktree/{wt.name}"
+            if not self._search_matches(wt.name, branch, sname):
+                continue
+            cs = path_to_latest.get(str(wt))
+            cs_id = cs.session_id if cs else None
+            cs_state = cs.state if cs else None
+            if cs_id:
+                claimed_claude_ids.add(cs_id)
+            info = SessionInfo(
+                name=wt.name,
+                session_type="worktree",
+                project=self._project_name,
+                path=wt,
+                tmux_session=sname,
+                is_active=False,
+                branch=branch,
+                claude_session_id=cs_id,
+                claude_state=cs_state,
+                is_fork=_is_fork_worktree(wt),
+            )
+            self._session_map[item_id] = info
+            label_text = self._build_session_label(info, "")
+            inactive_items.append(ListItem(Label(label_text, markup=True), id=item_id))
+
+        if inactive_items:
             items.append(
                 ListItem(
                     Static(
@@ -956,37 +1045,36 @@ class SessionApp(App):
                     disabled=True,
                 ),
             )
-            for wt in inactive_worktrees:
-                sname = session_name(self._project_name, wt.name)
-                item_id = f"wt-{wt.name}"
-                branch = f"worktree/{wt.name}"
-                cs = path_to_latest.get(str(wt))
-                cs_id = cs.session_id if cs else None
-                cs_state = cs.state if cs else None
-                if cs_id:
-                    claimed_claude_ids.add(cs_id)
-                info = SessionInfo(
-                    name=wt.name,
-                    session_type="worktree",
-                    project=self._project_name,
-                    path=wt,
-                    tmux_session=sname,
-                    is_active=False,
-                    branch=branch,
-                    claude_session_id=cs_id,
-                    claude_state=cs_state,
-                    is_fork=_is_fork_worktree(wt),
-                )
-                self._session_map[item_id] = info
-                label_text = self._build_session_label(info, "")
-                items.append(ListItem(Label(label_text, markup=True), id=item_id))
+            items.extend(inactive_items)
 
         # Previous Claude sessions (from project root, not claimed by active items)
         previous_claude = [
             cs for cs in root_claude_sessions if cs.session_id not in claimed_claude_ids
         ][:5]
 
-        if previous_claude:
+        previous_items: list[ListItem] = []
+        for cs in previous_claude:
+            short_id = cs.session_id[:8]
+            if not self._search_matches(short_id, cs.session_id, cs.git_branch or ""):
+                continue
+            item_id = f"cs-{cs.session_id}"
+            time_label = _relative_time(cs.last_activity)
+            branch_label = f"{BRANCH_ICON} {cs.git_branch}" if cs.git_branch else ""
+            label_text = f"  {short_id}  [dim]{branch_label}  {time_label}[/]"
+            self._session_map[item_id] = SessionInfo(
+                name=short_id,
+                session_type="claude",
+                project=self._project_name,
+                path=cs.cwd,
+                tmux_session="",
+                is_active=False,
+                branch=cs.git_branch or "",
+                claude_session_id=cs.session_id,
+                claude_state=cs.state,
+            )
+            previous_items.append(ListItem(Label(label_text, markup=True), id=item_id))
+
+        if previous_items:
             items.append(
                 ListItem(
                     Static(
@@ -996,24 +1084,17 @@ class SessionApp(App):
                     disabled=True,
                 ),
             )
-            for cs in previous_claude:
-                short_id = cs.session_id[:8]
-                item_id = f"cs-{cs.session_id}"
-                time_label = _relative_time(cs.last_activity)
-                branch_label = f"{BRANCH_ICON} {cs.git_branch}" if cs.git_branch else ""
-                label_text = f"  {short_id}  [dim]{branch_label}  {time_label}[/]"
-                self._session_map[item_id] = SessionInfo(
-                    name=short_id,
-                    session_type="claude",
-                    project=self._project_name,
-                    path=cs.cwd,
-                    tmux_session="",
-                    is_active=False,
-                    branch=cs.git_branch or "",
-                    claude_session_id=cs.session_id,
-                    claude_state=cs.state,
+            items.extend(previous_items)
+
+        if searching:
+            if not items:
+                items.append(
+                    ListItem(
+                        Static("no matching sessions", classes="separator-item"),
+                        disabled=True,
+                    ),
                 )
-                items.append(ListItem(Label(label_text, markup=True), id=item_id))
+            return items
 
         settings_items = self._build_settings_items()
         if self._available_projects or settings_items:
@@ -1038,14 +1119,61 @@ class SessionApp(App):
                     ),
                 )
 
-        await main.mount(
-            Container(
-                ListView(*items, id="home-list"),
-                id="home-panel",
-            )
-        )
-        self.query_one("#home-list").focus()
-        self._poll_timer = self.set_interval(3, self._poll_session_states)
+        return items
+
+    async def action_search(self) -> None:
+        """Arm the home-screen search box (bound to `/`)."""
+        if not self._on_home or not self.query("#home-search"):
+            return
+        self._searching = True
+        search = self.query_one("#home-search", Input)
+        search.display = True
+        search.focus()
+
+    async def _clear_search(self) -> None:
+        """Drop the filter, hide the search box and return focus to the list."""
+        self._searching = False
+        self._search_query = ""
+        if self.query("#home-search"):
+            search = self.query_one("#home-search", Input)
+            search.value = ""
+            search.display = False
+        await self._refresh_home_list()
+        if self.query("#home-list"):
+            self.query_one("#home-list").focus()
+
+    async def _refresh_home_list(self) -> None:
+        """Re-render the home list rows in place for the current search query."""
+        if not self.query("#home-list"):
+            return
+        home_list = self.query_one("#home-list", ListView)
+        await home_list.clear()
+        for item in self._build_home_items():
+            await home_list.append(item)
+        home_list.index = self._first_selectable_index(home_list)
+
+    @staticmethod
+    def _first_selectable_index(home_list: ListView) -> int | None:
+        """Index of the first non-separator row, so highlight never lands on one."""
+        for index, item in enumerate(home_list.children):
+            if not item.disabled:
+                return index
+        return None
+
+    @on(Input.Changed, "#home-search")
+    async def on_home_search_changed(self, event: Input.Changed) -> None:
+        # Mounting the box with a preserved query fires Changed too; the list is
+        # already built for that query, so only react to a real edit.
+        if event.value == self._search_query:
+            return
+        self._search_query = event.value
+        await self._refresh_home_list()
+
+    @on(Input.Submitted, "#home-search")
+    async def on_home_search_submitted(self, event: Input.Submitted) -> None:
+        # The filter stays applied; Enter just hands focus to the filtered list.
+        if self.query("#home-list"):
+            self.query_one("#home-list").focus()
 
     def _build_settings_items(self) -> list[ListItem]:
         key = quick_terminal_key()
@@ -1829,6 +1957,8 @@ class SessionApp(App):
         item_id = item.id
         if item_id and item_id in self._project_dir_paths:
             self._project_cwd = self._project_dir_paths[item_id]
+            self._searching = False
+            self._search_query = ""
             try:
                 self._init_git_info()
                 await self._show_home()
@@ -1849,6 +1979,29 @@ class SessionApp(App):
     async def _on_key(self, event: events.Key) -> None:
         """Handle arrow keys and tab for filter autocomplete."""
         if not self.focused:
+            return
+
+        if self.focused.id == "home-search":
+            if event.key == "escape":
+                event.prevent_default()
+                event.stop()
+                await self._clear_search()
+                return
+            if event.key in ("down", "up") and self.query("#home-list"):
+                event.prevent_default()
+                event.stop()
+                home_list = self.query_one("#home-list", ListView)
+                if len(home_list) == 0:
+                    return
+                step = 1 if event.key == "down" else -1
+                idx = home_list.index or 0
+                # Skip separator rows so the highlight always lands on a session.
+                candidate = idx + step
+                while 0 <= candidate < len(home_list):
+                    if not home_list.children[candidate].disabled:
+                        home_list.index = candidate
+                        return
+                    candidate += step
             return
 
         if self.focused.id == "branch-filter":
@@ -2342,6 +2495,11 @@ class SessionApp(App):
 
     async def action_go_back(self) -> None:
         if len(self.query("#home-list")) > 0:
+            # On the home screen escape quits — unless a search is active, in
+            # which case it drops the filter first.
+            if self._searching or self._search_query:
+                await self._clear_search()
+                return
             self.exit()
         else:
             try:

@@ -781,6 +781,288 @@ class TestBuildSystemPrompt:
 # -- TUI tests --
 
 
+class TestHomeSearch:
+    @pytest.mark.asyncio
+    async def test_slash_reveals_and_focuses_search(self, tmp_path: Path) -> None:
+        wt1 = tmp_path / "20260309-fix-tests"
+        with _patch_git_info(worktrees=[wt1]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                search = app.query_one("#home-search", Input)
+                assert not search.display
+                await pilot.press("slash")
+                assert search.display
+                assert app._searching
+                assert app.focused is not None
+                assert app.focused.id == "home-search"
+
+    @pytest.mark.asyncio
+    async def test_slash_is_typed_not_rebound_while_searching(self) -> None:
+        """Once the box has focus, `/` is literal text rather than the binding."""
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                await pilot.press("slash")
+                assert app.query_one("#home-search", Input).value == "/"
+
+    @pytest.mark.asyncio
+    async def test_live_filter_is_case_insensitive(self, tmp_path: Path) -> None:
+        wt1 = tmp_path / "20260309-fix-tests"
+        wt2 = tmp_path / "20260308-add-logging"
+        with _patch_git_info(worktrees=[wt1, wt2]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                for key in "LOGGING":
+                    await pilot.press(key)
+                await pilot.pause()
+                assert set(app._session_map) == {"wt-20260308-add-logging"}
+                assert not app.query("#wt-20260309-fix-tests")
+
+    @pytest.mark.asyncio
+    async def test_filter_matches_branch_name(self, tmp_path: Path) -> None:
+        wt1 = tmp_path / "20260309-fix-tests"
+        with _patch_git_info(worktrees=[wt1]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                for key in "worktree":
+                    await pilot.press(key)
+                await pilot.pause()
+                assert set(app._session_map) == {"wt-20260309-fix-tests"}
+
+    @pytest.mark.asyncio
+    async def test_filter_covers_active_and_inactive(self, tmp_path: Path) -> None:
+        """A query spanning both sections keeps a match in each."""
+        active = tmp_path / "20260309-alpha"
+        inactive = tmp_path / "20260308-alpha"
+        other = tmp_path / "20260307-beta"
+        with _patch_git_info(
+            sessions=["test-proj/20260309-alpha"],
+            worktrees=[active, inactive, other],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                for key in "alpha":
+                    await pilot.press(key)
+                await pilot.pause()
+                assert set(app._session_map) == {
+                    "wt-20260309-alpha",
+                    "wt-20260308-alpha",
+                }
+                assert app._session_map["wt-20260309-alpha"].is_active
+                assert not app._session_map["wt-20260308-alpha"].is_active
+
+    @pytest.mark.asyncio
+    async def test_filter_hides_actions_and_settings(self, tmp_path: Path) -> None:
+        wt1 = tmp_path / "20260309-fix-tests"
+        with _patch_git_info(worktrees=[wt1], projects=[Path("/git/other")]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                await pilot.press("f")
+                await pilot.pause()
+                assert not app.query("#action-create")
+                assert not app.query("#action-switch-project")
+                assert not app.query("#action-toggle-quick-terminal")
+
+    @pytest.mark.asyncio
+    async def test_no_matches_shows_placeholder(self, tmp_path: Path) -> None:
+        wt1 = tmp_path / "20260309-fix-tests"
+        with _patch_git_info(worktrees=[wt1]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                for key in "zzz":
+                    await pilot.press(key)
+                await pilot.pause()
+                assert app._session_map == {}
+                home_list = app.query_one("#home-list", ListView)
+                assert len(home_list) == 1
+                assert home_list.children[0].disabled
+
+    @pytest.mark.asyncio
+    async def test_enter_applies_filter_and_focuses_list(self, tmp_path: Path) -> None:
+        wt1 = tmp_path / "20260309-fix-tests"
+        wt2 = tmp_path / "20260308-add-logging"
+        with _patch_git_info(worktrees=[wt1, wt2]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                for key in "logging":
+                    await pilot.press(key)
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app.focused is not None
+                assert app.focused.id == "home-list"
+                assert app._search_query == "logging"
+                assert set(app._session_map) == {"wt-20260308-add-logging"}
+
+    @pytest.mark.asyncio
+    async def test_highlight_skips_separator_rows(self, tmp_path: Path) -> None:
+        wt1 = tmp_path / "20260309-fix-tests"
+        with _patch_git_info(worktrees=[wt1]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                await pilot.press("f")
+                await pilot.pause()
+                home_list = app.query_one("#home-list", ListView)
+                assert home_list.index is not None
+                assert not home_list.children[home_list.index].disabled
+
+    @pytest.mark.asyncio
+    async def test_arrows_in_search_box_move_list(self, tmp_path: Path) -> None:
+        wt1 = tmp_path / "20260309-alpha"
+        wt2 = tmp_path / "20260308-alpha"
+        with _patch_git_info(worktrees=[wt1, wt2]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                for key in "alpha":
+                    await pilot.press(key)
+                await pilot.pause()
+                home_list = app.query_one("#home-list", ListView)
+                start = home_list.index
+                await pilot.press("down")
+                assert home_list.index != start
+                assert not home_list.children[home_list.index or 0].disabled
+                await pilot.press("up")
+                assert home_list.index == start
+
+    @pytest.mark.asyncio
+    async def test_escape_in_search_box_clears_filter(self, tmp_path: Path) -> None:
+        wt1 = tmp_path / "20260309-fix-tests"
+        wt2 = tmp_path / "20260308-add-logging"
+        with _patch_git_info(worktrees=[wt1, wt2]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                for key in "logging":
+                    await pilot.press(key)
+                await pilot.press("escape")
+                await pilot.pause()
+                assert not app._searching
+                assert app._search_query == ""
+                assert not app.query_one("#home-search", Input).display
+                assert len(app._session_map) == 2
+                assert app.focused is not None
+                assert app.focused.id == "home-list"
+                assert app._launch_target is None
+                assert app.is_running
+
+    @pytest.mark.asyncio
+    async def test_escape_on_filtered_list_clears_before_quitting(
+        self, tmp_path: Path
+    ) -> None:
+        wt1 = tmp_path / "20260309-fix-tests"
+        with _patch_git_info(worktrees=[wt1]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                await pilot.press("f")
+                await pilot.press("enter")
+                await pilot.press("escape")
+                await pilot.pause()
+                assert app._search_query == ""
+                assert app.is_running
+                await pilot.press("escape")
+                await pilot.pause()
+                assert not app.is_running
+
+    @pytest.mark.asyncio
+    async def test_filter_excludes_direct_and_previous_sessions(self) -> None:
+        """Direct sessions and previous Claude sessions are filtered too."""
+        cs = _make_claude_session(session_id="session-1111-aaaa", git_branch="main")
+        with _patch_git_info(
+            sessions=["test-proj/direct-1"],
+            claude_sessions_fn=lambda _path: [cs],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                assert "ds-test-proj--direct-1" in app._session_map
+                await pilot.press("slash")
+                for key in "nomatch":
+                    await pilot.press(key)
+                await pilot.pause()
+                assert app._session_map == {}
+
+    @pytest.mark.asyncio
+    async def test_filter_excludes_non_matching_active_worktree(
+        self, tmp_path: Path
+    ) -> None:
+        active = tmp_path / "20260309-alpha"
+        inactive = tmp_path / "20260308-beta"
+        with _patch_git_info(
+            sessions=["test-proj/20260309-alpha"],
+            worktrees=[active, inactive],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                for key in "beta":
+                    await pilot.press(key)
+                await pilot.pause()
+                assert set(app._session_map) == {"wt-20260308-beta"}
+
+    @pytest.mark.asyncio
+    async def test_search_survives_a_trip_through_session_actions(
+        self, tmp_path: Path
+    ) -> None:
+        """Coming back to a re-rendered home keeps the filter and the focus."""
+        wt1 = tmp_path / "20260309-fix-tests"
+        wt2 = tmp_path / "20260308-add-logging"
+        with _patch_git_info(worktrees=[wt1, wt2]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                for key in "logging":
+                    await pilot.press(key)
+                await pilot.press("enter")
+                await pilot.press("enter")
+                await pilot.pause()
+                await app._show_home()
+                await pilot.pause()
+                assert app._search_query == "logging"
+                assert app.query_one("#home-search", Input).display
+                assert app.focused is not None
+                assert app.focused.id == "home-search"
+                assert set(app._session_map) == {"wt-20260308-add-logging"}
+
+    @pytest.mark.asyncio
+    async def test_search_helpers_are_noops_off_home(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("enter")  # into the create form
+                await pilot.pause()
+                assert not app.query("#home-list")
+                await app.action_search()
+                assert not app._searching
+                await app._refresh_home_list()  # no list to refresh
+
+    @pytest.mark.asyncio
+    async def test_selecting_filtered_session_opens_actions(
+        self, tmp_path: Path
+    ) -> None:
+        wt1 = tmp_path / "20260309-fix-tests"
+        wt2 = tmp_path / "20260308-add-logging"
+        with _patch_git_info(worktrees=[wt1, wt2]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                for key in "logging":
+                    await pilot.press(key)
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._selected_session is not None
+                assert app._selected_session.name == "20260308-add-logging"
+
+
 class TestSessionAppHome:
     @pytest.mark.asyncio
     async def test_home_shows_create_option(self) -> None:
