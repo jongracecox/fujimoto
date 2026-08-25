@@ -130,6 +130,25 @@ shared flow's behaviour like that, clear it on the entry point of the other
 path (`_show_create_form` resets the fork state) so a cancelled flow can't
 leak into the next one.
 
+### Filtering a List In Place
+
+The home-screen search (`/`) shows the other half of the view pattern: when a
+view only needs to change its *rows*, don't re-run `_show_*`. Keep the row
+construction in a `_build_*_items()` helper that reads the current filter, and
+have the `Input.Changed` handler `clear()` the `ListView` and re-`append()` the
+result (`_refresh_home_list`). Re-mounting the whole view would steal focus from
+the box being typed into and drop the cursor position.
+
+Two things to get right when you do this:
+
+- Mount the filter box once with `display` toggled, rather than mounting it when
+  the filter is armed — otherwise the keypress that reveals it can race the
+  mount. Note that mounting an `Input` with a non-empty `value` fires
+  `Input.Changed`, so compare against the stored query before reacting.
+- Section separators are `disabled` `ListItem`s, so a filtered list must move the
+  highlight past them (`_first_selectable_index`, plus the up/down handling in
+  `_on_key`) or the user lands on a divider.
+
 ### Adding New Git/tmux Operations
 
 - Git wrappers go in `git.py` using the `_run()` helper

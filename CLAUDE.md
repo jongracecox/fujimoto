@@ -272,6 +272,16 @@ pydantic):
 - Module-level helpers: `_claude_state_label(state)`, `_relative_time(dt)`, `_get_claude_sessions(root, worktrees)`, `_is_fork_worktree(path)`, `_build_fork_system_prompt(project, working_dir, parent_worktree, base_branch)`
 - Instance helpers: `_build_session_label(session, state_suffix)` — the single source of truth for session row text (including the 🍴 fork marker), used by `_show_home`'s initial render of worktree rows and by `_poll_session_states` for in-place updates; `_build_claude_session_items(sessions, prefix)` — shared row rendering for the resume (`rp-*`) and fork (`fp-*`) pickers
 - Views: home (sessions list), session actions submenu, finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), fork title form, fork branch select, fork session picker, conflict resolution, project switcher (with autocomplete filter), tmux install, error
+- Home screen search: `/` arms a filter box (`#home-search`) mounted above
+  `#home-list`. `action_search` reveals + focuses it; `Input.Changed` re-renders
+  the rows via `_refresh_home_list`; `Input.Submitted` keeps the filter and moves
+  focus to the list; Escape (in the box, or on a filtered list via
+  `action_go_back`) clears it through `_clear_search`. Matching is
+  case-insensitive substring (`_search_matches`) over session/worktree name,
+  branch and tmux name, and applies to the active, inactive and previous-Claude
+  sections. A non-empty query hides the action/settings/switch-project rows and
+  any section with no matches; an empty result set renders a disabled "no
+  matching sessions" row.
 - Home screen sections: actions ("New worktree session", "New session in X", "Ad hoc session"), active sessions (with Claude state indicators), inactive worktrees (with Claude state), previous Claude sessions (resumable, capped at 5), switch project
 - Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
 - Session actions submenu (in order): for active sessions, Connect → Fork session → Resume previous session; for inactive worktrees, Resume previous session → Fork session → Launch (resume is the more common action when picking an idle worktree). Then: Open terminal, Open in VS Code, Rename, Terminate session (active only), Finish (worktree only), Cancel. Claude-session items show just "Resume" + Open terminal/VS Code + Cancel. "Fork session" is always inserted at index 1 (`items.insert(1, ...)`) so its position holds across both layouts.
@@ -329,6 +339,19 @@ Three custom exception types, all caught in `main()`:
   - The flag is cleared on read, so a later ordinary detach of the same session can't re-trigger the fork. `main()` keys it on `tmux_name or session_name(project, working_dir.name)` — the same name `launch_claude_in_tmux` derives — so a freshly created worktree (whose `tmux_name` is `None`) is matched correctly.
   - The whole flow funnels into the shared `_finalize_create` / `_do_create_and_launch`, so forks inherit the directory-conflict handling (`_show_conflict`, `conflict-suffix`) for free. A non-`None` `_fork_source` is the only difference; `_show_create_form` clears the fork state so a cancelled fork can't leak into the next plain create.
 - **Resume previous session — tmux naming**: When resuming from an inactive worktree, the resumed session reuses the worktree's existing tmux session name (e.g., `project/20260101-feature`) instead of generating a new `direct-N` name. This keeps the session correctly identified as a worktree item on subsequent TUI views, so its path and Claude session lookup remain tied to the worktree directory. For active worktrees (original session still alive), a `direct-N` name is used because the worktree name is occupied. The working directory for resumed sessions always comes from `cs.cwd` (the directory recorded in the Claude session log) rather than `session.path`.
+- **Home search rebuilds rows, not the screen**: `_show_home` mounts the panel;
+  all row construction (and the population of `_session_map` /
+  `_claude_state_snapshot`) lives in `_build_home_items()`, which applies the
+  current `_search_query`. Filtering therefore only clears and re-appends the
+  `ListView` children — the search box keeps focus and its cursor. Because
+  `_session_map` holds only the visible rows, `_poll_session_states` naturally
+  updates just the filtered set. The search box is always mounted with
+  `display` toggled (never remounted), so `/` can't lose typed input; mounting
+  it with a preserved value fires a spurious `Input.Changed`, which
+  `on_home_search_changed` ignores by comparing against `_search_query`. Arrow
+  keys while the box is focused are handled in `_on_key` and skip disabled
+  separator rows (as does the post-filter default highlight, via
+  `_first_selectable_index`).
 - **Live polling**: The home screen uses `set_interval(3s)` to poll Claude JSONL logs for state changes. When a session's state changes, labels are updated in-place via `label.update()` — the screen is never cleared or rebuilt, which avoids blank-screen flicker. A snapshot dict (`path → (session_id, state)`) is compared each tick to detect changes efficiently. The timer is stopped when navigating away (`_clear_main` cancels it) and restarted by `_show_home`.
 
 ## Testing
