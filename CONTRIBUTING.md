@@ -243,8 +243,26 @@ https://docs.pypi.org/trusted-publishers/
      cannot be used to test key bindings — it injects into the pane and
      bypasses key-table dispatch; to automate it, write the keys to an attached
      client's pty instead (`pty.fork()`, then `os.write(fd, b"\x01f")`).
-8. Test error cases:
+8. Test stop / terminate and restart recovery:
+   - Attach to a session and press `Ctrl-A s` — it should detach with no
+     prompt, and reappear on the home screen as 🟠 in the *sessions* section
+   - Select it → **Launch** or **Resume previous session** — it goes back to 🟢
+   - Press `Ctrl-A x` with claude alone in the window — the TUI should reappear
+     on the terminate prompt; Enter terminates (⚫), `Stop` keeps it 🟠, and
+     `Cancel` drops you straight back into the session having killed nothing
+   - Press `Ctrl-A t` to split, then `Ctrl-A x` — it must fall back to the
+     original `kill pane? (y/n)` confirm and leave the session alone
+   - Simulate a restart with `tmux kill-server` while sessions are open, then
+     run `fujimoto`: every session should come back 🟠, with a
+     **Restore N stopped sessions** row that relaunches them all detached
+   - Terminate one through the menu, then `tmux kill-server` again — the
+     terminated one must stay ⚫ while the others return 🟠
+   - Check `~/.cache/fujimoto/sessions.json` holds a record per open session
+     and nothing for terminated ones
+   As with `Ctrl-A f`, `tmux send-keys` cannot drive these bindings; write to an
+   attached client's pty instead (`pty.fork()`, then `os.write(fd, b"\x01s")`).
+9. Test error cases:
    - Run outside a git repo
    - Create a worktree with a name that already exists
-9. With `FUJIMOTO_WORKTREE_ROOT` unset: confirm worktrees land in
+10. With `FUJIMOTO_WORKTREE_ROOT` unset: confirm worktrees land in
    `<repo>/.fujimoto/worktrees/` and the directory is gitignored
