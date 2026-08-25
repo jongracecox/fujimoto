@@ -68,7 +68,9 @@ you want the removal to persist.
 chord. Pressing it inside an attached tmux session enters a one-shot key table
 where `t`/`T` split a terminal pane (single-pane guard via `if-shell` on
 `#{session_panes}`), `v` opens VS Code, `w` opens a native terminal window,
-`d` detaches the session, `x` kills the current pane (via `confirm-before`),
+`s` stops the session (keeping it resumable), `d` detaches the session,
+`x` ends the session — kill-pane when a split is open, otherwise a hand-off to
+the TUI's terminate/stop prompt —
 `[` enters copy mode, and `?` flashes a cheatsheet via `display-message`.
 `f` forks the session (see below), and `v`/`w` dispatch to the
 `fujimoto pane <action> --session <name>` CLI subcommand which reuses the
@@ -109,6 +111,7 @@ src/fujimoto/
 ├── version.py    # importlib.metadata wrapper for the running fujimoto version
 ├── version_check.py  # daily PyPI update check, dismissal cache (~/.cache/fujimoto/)
 ├── settings.py   # persistent user settings (~/.cache/fujimoto/settings.json)
+├── session_state.py   # which sessions the user still considers open
 ├── project_config.py  # optional per-project .fujimoto.yaml (copy/link/init worktree setup)
 ├── templates/
 │   ├── __init__.py
@@ -132,6 +135,27 @@ Otherwise it:
 2. After the TUI exits, calls `launch_claude_in_tmux()` if the user selected a session
 3. When the tmux session is detached, the loop restarts and the TUI reappears
 4. The loop exits when the user quits the TUI (q/escape/ctrl+c) without selecting a session
+
+### Session Status
+
+Two independent axes, deliberately separated because "Terminate" used to
+conflate them:
+
+- **Intent** — open or closed. Only fujimoto ever changes it.
+- **Runtime** — whether tmux has a live session. Observed, never stored.
+
+| intent | tmux | icon | home-screen section |
+|---|---|---|---|
+| open | running | 🟢 | sessions |
+| open | stopped | 🟠 | sessions |
+| closed / no record | stopped | ⚫ | inactive worktrees |
+
+**Stop** ends the claude process and keeps the record open (the transcript is
+untouched, so the conversation resumes; an in-flight task is interrupted).
+**Terminate** ends it and deletes the record. Anything that kills a session
+*outside* fujimoto — host restart, `tmux kill-session`, a closed window, `exit`
+in the pane — leaves the record alone, so it comes back as stopped. That is the
+whole restart-recovery mechanism: no boot-time detection, no heuristics.
 
 ### Session Types
 
@@ -203,6 +227,26 @@ Otherwise it:
   and corrupt JSON (returns defaults). Mirrors the `version_check.py` cache
   pattern.
 
+**`session_state.py`** — Which sessions the user still considers open, stored
+as JSON in `~/.cache/fujimoto/sessions.json` (same graceful-degradation pattern
+as `settings.py`: missing file, unreadable cache or corrupt JSON yield an empty
+state, never an error):
+- `SessionRecord` dataclass: `cwd`, `project`, `session_type`, `branch`,
+  `claude_session_id`, `last_seen`. Only `cwd` is required — every other field
+  defaults, so a record written by a different fujimoto version still loads.
+- Keyed by **tmux session name**, so worktree, direct and ad hoc sessions are
+  covered uniformly and a record outlives its worktree directory.
+- `load_state()` / `save_state()`, `mark_open(...)` (every launch and
+  reconnect; a reconnect passing no id keeps the id recorded at first launch),
+  `mark_closed(name)`, `touch(name, claude_session_id=None)`,
+  `rename(old, new)`, `prune()`.
+- **A record's presence means "open"; its absence means "closed"** — which is
+  also what a session fujimoto has never launched looks like. `mark_closed`
+  therefore just deletes the record, and there is no reconciliation pass and
+  nothing to age out. `prune()` drops records whose `cwd` is gone (deleted
+  worktree, ad hoc temp dir cleared by a reboot) and is called once per
+  `_init_git_info`, not per render.
+
 **`project_config.py`** — Optional per-project `.fujimoto.yaml` (validated with
 pydantic):
 - `CONFIG_FILENAME = ".fujimoto.yaml"`. Three optional sections — `copy`, `link`,
@@ -252,9 +296,12 @@ pydantic):
 - `display_message(name, message)` — surface a transient message in the session's status bar, used to report errors from `fujimoto pane` back into the session
 - `_configure_session(name)` — applies the configured prefix (default `C-b`), status bar, and (if `FUJIMOTO_META_KEY` is non-empty) the fujimoto key table via `_configure_fujimoto_key_table`. Raises `TmuxError` if the meta and prefix keys collide. The `unbind-key C-b` step only runs when the prefix has been moved off `C-b` (otherwise it would unbind the new prefix).
 - `quick_terminal_key()` — returns the configured `FUJIMOTO_QUICK_TERMINAL_KEY` (default `` C-` ``)
+- `meta_key()` — public accessor for `FUJIMOTO_META_KEY` (empty when disabled), used by the TUI to render the `Ctrl-A s` tip on the terminate prompt
+- `PENDING_FORK` / `PENDING_STOP` / `PENDING_CLOSE` — the three values the in-session key table writes to `PENDING_ACTION_OPTION`
 - `enable_quick_terminal_binding()` / `disable_quick_terminal_binding()` — install/remove the **server-global** root-table binding (`bind-key -n <key>`) that toggles a 30% bottom pane. The bound command uses `if-shell -F '#{==:#{window_panes},1}'` to split on the first press and cycle focus on subsequent presses. Both are no-ops when the env var is empty. Idempotent.
 - `_apply_quick_terminal_setting()` — called from `create_session` / `create_session_with_command` after `_ensure_extended_keys()`. Re-applies the binding when `Settings.quick_terminal_enabled` is True, so the feature survives `tmux kill-server`. Lazily imports `settings` to avoid a circular import.
-- `_configure_fujimoto_key_table(name, meta_key)` — installs the one-shot key table: `t`/`T` (`if-shell` guard ensuring a single extra pane; falls back to `select-pane :.+`), `v`/`w` (dispatch to `fujimoto pane <action> --session #{session_name}` via `run-shell`), `f` (`set-option @fujimoto_pending_action fork \; detach-client` — hands the fork to the TUI), `d` (detach-client), `x` (`confirm-before` kill-pane), `[` (copy-mode), `?` (cheatsheet). Root-level `bind-key -n <meta_key> switch-client -T fujimoto` arms the chord.
+- `_configure_fujimoto_key_table(name, meta_key)` — installs the one-shot key table: `t`/`T` (`if-shell` guard ensuring a single extra pane; falls back to `select-pane :.+`), `v`/`w` (dispatch to `fujimoto pane <action> --session #{session_name}` via `run-shell`), `f` (`set-option @fujimoto_pending_action fork \; detach-client` — hands the fork to the TUI), `s` (same shape, `stop` — no prompt needed), `d` (detach-client), `x` (see below), `[` (copy-mode), `?` (cheatsheet).
+  `x` branches on pane count: `if-shell -F '#{==:#{window_panes},1}'` flags `close` and detaches when claude is alone in the window (killing that pane would end the session, so the TUI asks what to do), and otherwise keeps the original `confirm-before kill-pane`. The true branch is a single string containing `set-option ... ; detach-client` — inside an `if-shell` argument a bare `;` does separate commands, unlike at `bind-key` top level where it must be `\;`. Root-level `bind-key -n <meta_key> switch-client -T fujimoto` arms the chord.
 
 **`claude/log_parser.py`** — Parse Claude Code's JSONL session logs:
 - `ClaudeLogError` — raised on empty/unreadable logs
@@ -271,7 +318,7 @@ pydantic):
 - `SessionApp` — main app class with CSS styling
 - Module-level helpers: `_claude_state_label(state)`, `_relative_time(dt)`, `_get_claude_sessions(root, worktrees)`, `_is_fork_worktree(path)`, `_build_fork_system_prompt(project, working_dir, parent_worktree, base_branch)`
 - Instance helpers: `_build_session_label(session, state_suffix)` — the single source of truth for session row text (including the 🍴 fork marker), used by `_show_home`'s initial render of worktree rows and by `_poll_session_states` for in-place updates; `_build_claude_session_items(sessions, prefix)` — shared row rendering for the resume (`rp-*`) and fork (`fp-*`) pickers
-- Views: home (sessions list), session actions submenu, finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), fork title form, fork branch select, fork session picker, conflict resolution, project switcher (with autocomplete filter), tmux install, error
+- Views: home (sessions list), session actions submenu, terminate/stop prompt (`#terminate-prompt`, opened by a pending `close` from `Ctrl-A x`; Terminate / Stop / Cancel with Terminate highlighted so Enter matches the `confirm-before` it replaces, and Cancel re-attaching via `_launch_target` so it costs nothing), finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), fork title form, fork branch select, fork session picker, conflict resolution, project switcher (with autocomplete filter), tmux install, error
 - Home screen search: `/` arms a filter box (`#home-search`) mounted above
   `#home-list`. `action_search` reveals + focuses it; `Input.Changed` re-renders
   the rows via `_refresh_home_list`; `Input.Submitted` keeps the filter and moves
@@ -282,9 +329,9 @@ pydantic):
   sections. A non-empty query hides the action/settings/switch-project rows and
   any section with no matches; an empty result set renders a disabled "no
   matching sessions" row.
-- Home screen sections: actions ("New worktree session", "New session in X", "Ad hoc session"), active sessions (with Claude state indicators), inactive worktrees (with Claude state), previous Claude sessions (resumable, capped at 5), switch project
+- Home screen sections: actions ("Restore N stopped sessions" when any exist, "New worktree session", "New session in X", "Ad hoc session"), sessions — running 🟢 *and* stopped 🟠 together, since the circle colour carries the distinction (with Claude state indicators on the running ones), inactive worktrees, previous Claude sessions (resumable, capped at 5), switch project
 - Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
-- Session actions submenu (in order): for active sessions, Connect → Fork session → Resume previous session; for inactive worktrees, Resume previous session → Fork session → Launch (resume is the more common action when picking an idle worktree). Then: Open terminal, Open in VS Code, Rename, Terminate session (active only), Finish (worktree only), Cancel. Claude-session items show just "Resume" + Open terminal/VS Code + Cancel. "Fork session" is always inserted at index 1 (`items.insert(1, ...)`) so its position holds across both layouts.
+- Session actions submenu (in order): for active sessions, Connect → Fork session → Resume previous session; for inactive worktrees, Resume previous session → Fork session → Launch (resume is the more common action when picking an idle worktree). Then: Open terminal, Open in VS Code, Rename, Stop session (active only), Terminate session (active or stopped), Finish (worktree only), Cancel. Stop and Terminate are two menu items rather than one item plus a prompt — a menu is already a choice — but both route into the single `_end_session(session, terminate=...)` handler, which is also what the `Ctrl-A x` prompt calls. Claude-session items show just "Resume" + Open terminal/VS Code + Cancel. "Fork session" is always inserted at index 1 (`items.insert(1, ...)`) so its position holds across both layouts.
 - "Resume previous session" auto-launches the sole candidate when only one previous Claude session exists for the path, skipping the picker. Two or more sessions still show the picker.
 - Fork flow: `sa-fork` → `#fork-title-input` → `#fork-branch-list` (parent branch (default) / parent's base / another branch → the shared `_show_branch_picker`) → conversation picker `#fork-picker` (`fp-{i}`, only when >1 candidate) → the shared `_finalize_create` / `_do_create_and_launch`. Offered for worktree *and* direct sessions that have at least one previous Claude session.
 - Finish flow: Push & Create PR (background Claude), Cherry-pick to base, Discard & Delete
@@ -318,6 +365,7 @@ Three custom exception types, all caught in `main()`:
 - **TUI loop with tmux detach**: The TUI runs in a `while True` loop. After tmux detach (subprocess.run returns), the loop restarts and the TUI reappears. The loop breaks when the user quits without selecting a session.
 - **Per-session tmux config**: Prefix defaults to `Ctrl-B` (tmux's standard default; configurable via `FUJIMOTO_TMUX_PREFIX`), status bar with shortcut hints — all set via `tmux set-option -t` so the user's global config is untouched. The attach flow is silent (no pre-attach banner) to reduce noise when launching sessions repeatedly.
 - **Global install via `uv tool`**: Requires `--force --reinstall` to rebuild the wheel from source. Plain `--force` reuses cached builds.
+- **Remembering sessions across a restart**: `session_state.py` records every session as open at launch — in `main()`, **before** `launch_claude_in_tmux` blocks on the attach, so a host that dies mid-session still has a record to restore from. `_init_git_info` loads the pruned state into `_open_sessions`; `_stopped_records()` derives the open-but-not-running set for the current project; `_build_home_items` renders those in the *sessions* section as 🟠 and excludes them from *inactive worktrees*. A **Restore N stopped sessions** row relaunches them all via `create_session` (detached, resuming each path's latest transcript, attaching to none) — deliberately without `_apply_worktree_config`, which would run N `init` blocks up front; config still runs when the user actually attaches. `_end_session(session, terminate=...)` is the single handler behind both menu items and both outcomes of the `Ctrl-A x` prompt; it tolerates a `kill_session` failure only when `session_exists` confirms the session is already gone (otherwise marking a live session closed would hide it). `_do_delete_worktree` and `on_rename_submitted` keep the store honest via `mark_closed` / `rename`.
 - **Session metadata**: `.fujimoto/meta.json` stored in worktree directory records the base branch for cherry-pick targeting, the `source_root` (main repo) for project-config source resolution, and — for forks — `forked_from_session_id` plus `forked_from_worktree`. The `.fujimoto/` directory contains a `.gitignore` with `*` so its contents are automatically ignored by git.
 - **Project config (`.fujimoto.yaml`)**: An optional, committed per-project file (`project_config.py`) declaring files to copy/link into a worktree and init commands to run. Applied centrally in `main()`'s launch loop (parent process, **before** `tmux attach`) by `_apply_worktree_config(working_dir)`, for **every** worktree connection mode (new, reconnect-to-live, relaunch/resume) — so copy/link/init run on each connect, not just creation. `_do_create_and_launch` no longer applies config; it only creates the worktree and stores meta. Key mechanics:
   - **Config is read from the source root (main clone), not the worktree.** `.fujimoto.yaml` is a local, uncommitted file in the main clone, so it isn't present in a worktree checkout — `_apply_worktree_config` calls `load_project_config(source_root)`. (`--create-config` writes it to the main clone's root.)
@@ -408,6 +456,8 @@ Things discovered during development that are easy to forget:
 - **Shift+Enter in tmux requires `extended-keys always` globally** — tmux strips modifier info by default, making Shift+Enter identical to Enter. The fix requires two server/global-level settings: `set-option -g extended-keys always` and `set-option -s -a terminal-features xterm*:extkeys`. Per-session (`-t`) doesn't work. `extended-keys on` (vs `always`) doesn't work because Claude Code doesn't send the kitty keyboard protocol activation sequence. Requires tmux 3.2+. See `_ensure_extended_keys()` in `tmux.py`.
 - **fujimoto never creates `.venv` — `uv` does.** `create_worktree` only runs `git worktree add`; there is no venv/copy logic in the worktree lifecycle. A `.venv` appears in a worktree only because `uv sync`/`uv run` was run there (each worktree is its own project root with its own `pyproject.toml`, and uv materializes a per-project environment by default unless `UV_PROJECT_ENVIRONMENT` is set — which only `noxfile.py` does). The intended way to seed an environment in a fresh worktree is an `init: [uv sync]` entry in `.fujimoto.yaml`.
 - **Bundled package data must be importable as a subpackage.** `templates/` has an `__init__.py` so `importlib.resources.files("fujimoto.templates")` resolves and hatchling ships the `.template` file in the wheel. Verify with `uv build --wheel && unzip -l dist/*.whl | grep templates` after touching packaged resources.
+- **Inside an `if-shell` argument a bare `;` separates tmux commands; at `bind-key` top level it must be `\;`.** The `x` binding's true branch is the single string `set-option @fujimoto_pending_action close ; detach-client`, which works because tmux re-parses that string; the `f` and `s` bindings pass `"\\;"` as its own argv element because the outer `bind-key` invocation would otherwise consume a bare `;` itself and run `detach-client` at bind time. Both forms are exercised in `tests/test_tmux.py`, and both were verified against a real tmux via a pty before being wired up.
+- **`kill_session` raises when the session is already gone**, so any code path that ends a session has to decide what that means. `_end_session` re-raises only if `session_exists` still reports the session — a session that died between being listed and being acted on is already in the state the kill was aiming for, while a kill that genuinely failed must not silently mark a live session closed.
 - **OSC escape writes during a Textual run must go to `sys.__stdout__`, not `sys.stdout`.** Textual replaces `sys.stdout` with an internal capture while the app runs, so an OSC sequence (e.g. the `set_terminal_title` iTerm2/window-title escape) written to `sys.stdout` from inside a running app — such as `_init_git_info` updating the title on project switch — never reaches the terminal. `sys.__stdout__` stays connected to the real tty, so writing there works both before and during `app.run()`. This is why the session-manager title set at `main()` (pre-run) worked but the in-app update initially did not.
 
 ## Releases

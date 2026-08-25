@@ -73,8 +73,10 @@ from fujimoto.version import get_version
 from fujimoto.version_check import check_for_update, dismiss as dismiss_update_version
 from fujimoto.vscode import open_vscode
 from fujimoto.settings import Settings, load_settings, save_settings
+from fujimoto import session_state
 from fujimoto.tmux import (
     TmuxError,
+    create_session,
     create_session_with_command,
     disable_quick_terminal_binding,
     display_message,
@@ -85,10 +87,14 @@ from fujimoto.tmux import (
     kill_session,
     launch_claude_in_tmux,
     list_all_sessions,
+    session_exists,
     list_project_sessions,
+    meta_key,
     quick_terminal_key,
     rename_session,
+    PENDING_CLOSE,
     PENDING_FORK,
+    PENDING_STOP,
     session_name,
     set_terminal_title,
     take_pending_action,
@@ -100,6 +106,7 @@ ICON_SHIELD = "\U0001f6e1\ufe0f"
 ICON_GEAR = "\u2699"
 ICON_ZZZ = "\U0001f4a4"
 ICON_GREEN_CIRCLE = "\U0001f7e2"
+ICON_ORANGE_CIRCLE = "\U0001f7e0"
 ICON_BLACK_CIRCLE = "\u26ab"
 ICON_HLINE = "\u2500"
 ICON_WIZARD = "\U0001f9d9\U0001f3fd\u200d\u2642\ufe0f"
@@ -593,6 +600,9 @@ class SessionInfo:
     tmux_session: str
     is_active: bool
     branch: str
+    # Not running, but the user never terminated it through fujimoto — so it
+    # is still theirs to come back to. Renders orange, resumes by default.
+    is_stopped: bool = field(default=False)
     claude_session_id: str | None = field(default=None)
     claude_state: SessionState | None = field(default=None)
     is_fork: bool = field(default=False)
@@ -629,11 +639,20 @@ class SessionApp(App):
         Binding("slash", "search", "Search", show=True),
     ]
 
-    def __init__(self, pending_fork: Path | None = None) -> None:
+    def __init__(
+        self,
+        pending_fork: Path | None = None,
+        pending_close: LaunchTarget | None = None,
+    ) -> None:
         super().__init__()
         # Set when an in-session `Ctrl-A f` detached to hand the fork over to
         # the TUI; the home screen then opens straight onto the fork flow.
         self._pending_fork: Path | None = pending_fork
+        # Set when an in-session `Ctrl-A x` detached to ask whether the session
+        # should be terminated or merely stopped. Carries enough to re-attach
+        # if the user cancels.
+        self._pending_close: LaunchTarget | None = pending_close
+        self._pending_close_target: LaunchTarget | None = None
         self._project_cwd: Path | None = None
         self._project_name: str = ""
         self._current_branch: str = ""
@@ -647,6 +666,10 @@ class SessionApp(App):
         self._project_root: Path | None = None
         self._existing_worktrees: list[Path] = []
         self._session_map: dict[str, SessionInfo] = {}
+        # Sessions the user still considers open, keyed by tmux name. Loaded
+        # once per `_init_git_info` rather than per render, so search keystrokes
+        # don't re-read the cache file.
+        self._open_sessions: dict[str, session_state.SessionRecord] = {}
         self._available_projects: list[Path] = []
         self._project_dir_paths: dict[str, Path] = {}
         self._selected_session: SessionInfo | None = None
@@ -688,6 +711,7 @@ class SessionApp(App):
             self._start_update_check()
             await self._show_home()
             await self._open_pending_fork()
+            await self._open_pending_close()
             config_error = self._project_config_error()
             if config_error is not None:
                 self.push_screen(ConfigErrorDialog(config_error))
@@ -726,6 +750,7 @@ class SessionApp(App):
         self._current_branch = get_current_branch(cwd)
         self._default_branch = get_default_branch(cwd)
         self._active_sessions = set(list_project_sessions(self._project_name))
+        self._open_sessions = session_state.prune()
         self._available_projects = list_projects()
         self.sub_title = self._project_name
         set_terminal_title(_session_manager_title(self._project_name))
@@ -856,6 +881,19 @@ class SessionApp(App):
             self.query_one("#home-list").focus()
         self._poll_timer = self.set_interval(3, self._poll_session_states)
 
+    def _stopped_records(self) -> dict[str, session_state.SessionRecord]:
+        """Open records for this project with no live tmux session behind them.
+
+        These are the sessions a restart (or any out-of-band kill) took away.
+        Ad hoc sessions are excluded because they are not project-scoped and so
+        never appear on a project's home screen.
+        """
+        return {
+            name: rec
+            for name, rec in self._open_sessions.items()
+            if name not in self._active_sessions and rec.project == self._project_name
+        }
+
     def _search_matches(self, *fields: str) -> bool:
         """Case-insensitive substring match of the search query against `fields`.
 
@@ -885,9 +923,24 @@ class SessionApp(App):
         }
         claimed_claude_ids: set[str] = set()
 
+        stopped_records = self._stopped_records()
+
         items: list[ListItem] = []
         if not searching:
-            items = [
+            if stopped_records:
+                count = len(stopped_records)
+                plural = "s" if count != 1 else ""
+                items.append(
+                    ListItem(
+                        Label(
+                            f"[bold]{ICON_ORANGE_CIRCLE} Restore {count} stopped "
+                            f"session{plural}[/]",
+                            markup=True,
+                        ),
+                        id="action-restore",
+                    ),
+                )
+            items += [
                 ListItem(
                     Label("[bold]+ New worktree session[/]", markup=True),
                     id="action-create",
@@ -988,11 +1041,47 @@ class SessionApp(App):
             label_text = self._build_session_label(info, state_suffix)
             active_items.append(ListItem(Label(label_text, markup=True), id=item_id))
 
+        # Stopped sessions sit in the same section as running ones: the circle
+        # colour carries the distinction, so there is no need to split them out.
+        for sname, rec in sorted(stopped_records.items()):
+            display_name = sname.split("/", 1)[1] if "/" in sname else sname
+            is_worktree = rec.session_type == "worktree"
+            branch = rec.branch or (
+                f"worktree/{display_name}" if is_worktree else self._current_branch
+            )
+            if not self._search_matches(display_name, sname, branch):
+                continue
+            item_id = (
+                f"wt-{display_name}"
+                if is_worktree
+                else f"ds-{sname.replace('/', '--')}"
+            )
+            cs = path_to_latest.get(str(rec.path))
+            cs_id = cs.session_id if cs else rec.claude_session_id
+            if cs_id:
+                claimed_claude_ids.add(cs_id)
+            info = SessionInfo(
+                name=display_name,
+                session_type=rec.session_type,
+                project=rec.project,
+                path=rec.path,
+                tmux_session=sname,
+                is_active=False,
+                is_stopped=True,
+                branch=branch,
+                claude_session_id=cs_id,
+                claude_state=cs.state if cs else None,
+                is_fork=is_worktree and _is_fork_worktree(rec.path),
+            )
+            self._session_map[item_id] = info
+            label_text = self._build_session_label(info, "")
+            active_items.append(ListItem(Label(label_text, markup=True), id=item_id))
+
         if active_items:
             items.append(
                 ListItem(
                     Static(
-                        "───── active sessions ─────",
+                        "───── sessions ─────",
                         classes="separator-item",
                     ),
                     disabled=True,
@@ -1000,11 +1089,13 @@ class SessionApp(App):
             )
             items.extend(active_items)
 
-        # Inactive worktrees section
+        # Inactive worktrees: no live session, and none the user still wants.
+        # A worktree with an open record is stopped, and was rendered above.
         inactive_worktrees = [
             wt
             for wt in self._existing_worktrees
             if session_name(self._project_name, wt.name) not in self._active_sessions
+            and session_name(self._project_name, wt.name) not in stopped_records
         ]
 
         inactive_items: list[ListItem] = []
@@ -1256,10 +1347,156 @@ class SessionApp(App):
                 f"{ICON_GREEN_CIRCLE} {session.name}{fork}"
                 f"  [dim]({BRANCH_ICON} {session.branch})[/]{state_suffix}"
             )
-        return (
-            f"{ICON_BLACK_CIRCLE} {session.name}{fork}"
-            f"  [dim]({BRANCH_ICON} {session.branch})[/]"
+        icon = ICON_ORANGE_CIRCLE if session.is_stopped else ICON_BLACK_CIRCLE
+        return f"{icon} {session.name}{fork}  [dim]({BRANCH_ICON} {session.branch})[/]"
+
+    # -- Stopping and terminating --
+
+    async def _end_session(self, session: SessionInfo, *, terminate: bool) -> None:
+        """Kill a session's tmux session, and set its intent.
+
+        The single handler behind both menu items and both outcomes of the
+        `Ctrl-A x` prompt. Stopping leaves the record open so the session comes
+        back orange; terminating forgets it, which is the only way a session
+        stops being open.
+        """
+        try:
+            if session.is_active:
+                try:
+                    kill_session(session.tmux_session)
+                except TmuxError:
+                    # A session that died between listing it and acting on it
+                    # is already in the state we wanted. Anything else means it
+                    # is still running, and silently marking it closed would
+                    # hide a live session.
+                    if session_exists(session.tmux_session):
+                        raise
+                self._active_sessions.discard(session.tmux_session)
+            if terminate:
+                session_state.mark_closed(session.tmux_session)
+            else:
+                session_state.touch(session.tmux_session, session.claude_session_id)
+            self._init_git_info()
+            await self._show_home()
+        except (TmuxError, ConfigError, GitError) as e:
+            await self._show_error(str(e))
+
+    async def _open_pending_close(self) -> None:
+        """Ask what `Ctrl-A x` should do, for a session that just detached."""
+        target = self._pending_close
+        self._pending_close = None
+        if target is None or target.tmux_name is None:
+            return
+        await self._show_terminate_prompt(target)
+
+    async def _show_terminate_prompt(self, target: LaunchTarget) -> None:
+        """Terminate / stop / cancel, defaulting to terminate.
+
+        Three options, not two: the `confirm-before` this replaces could be
+        answered `n`, and losing that would be a regression. Cancel re-attaches
+        immediately rather than dropping the user on the home screen, so it is
+        a true no-op.
+        """
+        self._pending_close_target = target
+        await self._clear_main()
+        main = self.query_one("#main")
+        name = target.tmux_name or ""
+        display_name = name.split("/", 1)[1] if "/" in name else name
+        await main.mount(
+            Container(
+                Label(f"Terminate {display_name}?", classes="form-label"),
+                Static(str(target.working_dir), classes="session-info"),
+                ListView(
+                    ListItem(
+                        Label(
+                            "Terminate  [dim]— close it and mark it done[/]",
+                            markup=True,
+                        ),
+                        id="tp-terminate",
+                    ),
+                    ListItem(
+                        Label(
+                            f"Stop  [dim]— keep it for later "
+                            f"{ICON_ORANGE_CIRCLE}, history preserved[/]",
+                            markup=True,
+                        ),
+                        id="tp-stop",
+                    ),
+                    ListItem(
+                        Label("[dim]Cancel — go back to the session[/]", markup=True),
+                        id="tp-cancel",
+                    ),
+                    id="terminate-prompt",
+                ),
+                Static(
+                    f"[dim]Tip: {_friendly_key_label(meta_key())} s stops "
+                    f"without asking.[/]"
+                    if meta_key()
+                    else "",
+                    markup=True,
+                    classes="hint",
+                ),
+                id="actions-panel",
+            )
         )
+        self.query_one("#terminate-prompt").focus()
+
+    @on(ListView.Selected, "#terminate-prompt")
+    async def on_terminate_prompt_selected(self, event: ListView.Selected) -> None:
+        target = self._pending_close_target
+        if target is None or target.tmux_name is None:
+            return  # pragma: no cover
+        if event.item.id == "tp-cancel":
+            # Re-attach rather than returning home, so cancelling costs nothing.
+            self._launch_target = target
+            self.exit()
+            return
+        session = SessionInfo(
+            name=target.tmux_name,
+            session_type=target.session_type,
+            project=target.project,
+            path=target.working_dir,
+            tmux_session=target.tmux_name,
+            is_active=True,
+            branch="",
+        )
+        self._pending_close_target = None
+        await self._end_session(session, terminate=event.item.id == "tp-terminate")
+
+    async def _restore_stopped_sessions(self) -> None:
+        """Relaunch every stopped session in this project, attaching to none.
+
+        Each comes back resuming its most recent conversation, so a forced
+        restart costs the user one keypress. Project config is deliberately not
+        applied here — it runs when the user actually attaches to one.
+        """
+        failures: list[str] = []
+        for name, rec in sorted(self._stopped_records().items()):
+            sessions = get_sessions_for_path(rec.path)
+            resume_id = sessions[0].session_id if sessions else rec.claude_session_id
+            try:
+                create_session(
+                    name,
+                    rec.path,
+                    system_prompt=(
+                        None
+                        if resume_id
+                        else _build_system_prompt(
+                            rec.session_type, rec.project, rec.path
+                        )
+                    ),
+                    resume_session_id=resume_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                failures.append(f"{name}: {e}")
+        if failures:
+            await self._show_error("Could not restore:\n" + "\n".join(failures))
+            return
+        try:
+            self._init_git_info()
+            await self._show_home()
+        except (ConfigError, GitError) as e:  # pragma: no cover
+            await self._show_error(str(e))
 
     # -- Session actions submenu --
 
@@ -1303,8 +1540,14 @@ class SessionApp(App):
         if session.session_type != "claude":
             items.append(ListItem(Label("Rename"), id="sa-rename"))
 
-        if session.session_type != "claude" and session.is_active:
-            items.append(ListItem(Label("Terminate session"), id="sa-terminate"))
+        # Stop keeps the session's record open (orange, resumable); terminate
+        # forgets it. Two items rather than one item plus a prompt: a menu is
+        # already a choice. Both land in one handler, as the tmux prompt does.
+        if session.session_type != "claude":
+            if session.is_active:
+                items.append(ListItem(Label("Stop session"), id="sa-stop"))
+            if session.is_active or session.is_stopped:
+                items.append(ListItem(Label("Terminate session"), id="sa-terminate"))
 
         if session.session_type == "worktree":
             items.append(ListItem(Label("Finish (cleanup/merge)"), id="sa-finish"))
@@ -1324,7 +1567,12 @@ class SessionApp(App):
             type_label = (
                 session.project if session.session_type == "direct" else "worktree"
             )
-            status_label = "active" if session.is_active else "inactive"
+            if session.is_active:
+                status_label = "active"
+            elif session.is_stopped:
+                status_label = "stopped"
+            else:
+                status_label = "inactive"
         info_text = f"{type_label} | {status_label} | {BRANCH_ICON} {session.branch}"
 
         await main.mount(
@@ -2056,7 +2304,9 @@ class SessionApp(App):
     @on(ListView.Selected, "#home-list")
     async def on_home_selected(self, event: ListView.Selected) -> None:
         item_id = event.item.id
-        if item_id == "action-create":
+        if item_id == "action-restore":
+            await self._restore_stopped_sessions()
+        elif item_id == "action-create":
             await self._show_create_form()
         elif item_id == "action-direct":
             await self._launch_direct_session()
@@ -2161,14 +2411,8 @@ class SessionApp(App):
             await self._show_resume_session_picker(session)
         elif action == "sa-fork":
             await self._show_fork_title_form(session)
-        elif action == "sa-terminate":
-            try:
-                kill_session(session.tmux_session)
-                self._active_sessions.discard(session.tmux_session)
-                self._init_git_info()
-                await self._show_home()
-            except (TmuxError, ConfigError, GitError) as e:
-                await self._show_error(str(e))
+        elif action in ("sa-stop", "sa-terminate"):
+            await self._end_session(session, terminate=action == "sa-terminate")
         elif action == "sa-terminal":
             await self._show_terminal_mode(session)
         elif action == "sa-vscode":
@@ -2288,12 +2532,14 @@ class SessionApp(App):
     async def _do_delete_worktree(
         self, session: SessionInfo, remove_remote: bool
     ) -> None:
-        # Terminate session if active
+        # Removing the worktree ends the session for good, so forget it too —
+        # otherwise it would come back as a stopped row pointing at nothing.
         if session.is_active:
             try:
                 kill_session(session.tmux_session)
             except TmuxError:
                 pass
+        session_state.mark_closed(session.tmux_session)
 
         # Remove git worktree
         try:
@@ -2357,6 +2603,7 @@ class SessionApp(App):
             return
         try:
             rename_session(session.tmux_session, new_tmux_name)
+            session_state.rename(session.tmux_session, new_tmux_name)
             self._init_git_info()
             await self._show_home()
         except TmuxError as e:
@@ -2521,6 +2768,14 @@ def _check_prerequisites() -> list[str]:
         )
 
     return issues
+
+
+def _session_branch(working_dir: Path) -> str:
+    """Branch a session's directory is on, for display on a stopped row."""
+    try:
+        return get_current_branch(working_dir)
+    except GitError:
+        return ""
 
 
 def _build_system_prompt(session_type: str, project: str, working_dir: Path) -> str:
@@ -2800,10 +3055,12 @@ def main() -> None:
             sys.exit(1)
 
         pending_fork: Path | None = None
+        pending_close: LaunchTarget | None = None
         while True:
             set_terminal_title(f"{ICON_WIZARD} fujimoto")
-            app = SessionApp(pending_fork=pending_fork)
+            app = SessionApp(pending_fork=pending_fork, pending_close=pending_close)
             pending_fork = None
+            pending_close = None
             app.run()
 
             if app._launch_target:
@@ -2837,6 +3094,20 @@ def main() -> None:
                 )
                 if not _apply_worktree_config(working_dir):
                     continue  # setup failed and on_error=abort -> reopen the TUI
+                resolved_name = tmux_name or session_name(
+                    project_name, working_dir.name
+                )
+                # Record the session as open *before* attaching: if the host
+                # goes down while it is attached, the record is what brings the
+                # session back.
+                session_state.mark_open(
+                    resolved_name,
+                    cwd=working_dir,
+                    project=project_name,
+                    session_type=session_type,
+                    branch=_session_branch(working_dir),
+                    claude_session_id=resume_id,
+                )
                 launch_claude_in_tmux(
                     project_name,
                     working_dir,
@@ -2845,13 +3116,23 @@ def main() -> None:
                     resume_session_id=resume_id,
                     fork_session=bool(fork_id),
                 )
-                # `Ctrl-A f` inside the session flags it and detaches, handing
-                # the fork over to the TUI (which can show pickers).
-                resolved_name = tmux_name or session_name(
-                    project_name, working_dir.name
-                )
-                if take_pending_action(resolved_name) == PENDING_FORK:
+                # `Ctrl-A f` / `s` / `x` inside the session flag it and detach,
+                # handing the work to the TUI (which can show pickers/prompts).
+                action = take_pending_action(resolved_name)
+                if action == PENDING_FORK:
                     pending_fork = working_dir
+                elif action == PENDING_STOP:
+                    # Stop needs no prompt: the record stays open, so the
+                    # session reappears as a stopped row ready to resume.
+                    try:
+                        kill_session(resolved_name)
+                    except TmuxError:  # pragma: no cover
+                        pass
+                    session_state.touch(resolved_name)
+                elif action == PENDING_CLOSE:
+                    pending_close = LaunchTarget(
+                        project_name, working_dir, resolved_name, session_type
+                    )
             else:
                 break
         set_terminal_title("")

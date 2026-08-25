@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from fujimoto import tmux
 from fujimoto.tmux import (
     TmuxError,
     _configure_session,
@@ -374,14 +375,14 @@ class TestConfigureSession:
                 for c in cmds
                 if c[:3] == ["tmux", "set-option", "-t"] and c[4] == "status-right"
             )
-            assert "Fujimoto: ^A t/T/w/v/f/d/x/[" in status_cmd[5]
+            assert "Fujimoto: ^A t/T/w/v/f/s/d/x/[" in status_cmd[5]
             assert "^A t toggles" in status_cmd[5]
             assert "help: ^A ?" in status_cmd[5]
             # fujimoto-table bindings present (server-global, no -t)
             table_keys = [
                 c[4] for c in cmds if c[:4] == ["tmux", "bind-key", "-T", "fujimoto"]
             ]
-            assert set(table_keys) == {"t", "T", "v", "w", "f", "d", "x", "[", "?"}
+            assert set(table_keys) == {"t", "T", "v", "w", "f", "s", "d", "x", "[", "?"}
             # The fork binding must prompt for both name and base branch, and
             # thread the client tty through so switch-client has a target.
             fork_cmd = next(
@@ -789,3 +790,51 @@ class TestQuickTerminalBinding:
         ):
             _apply_quick_terminal_setting()
             mock_run.assert_not_called()
+
+
+class TestStopAndTerminateBindings:
+    def _table_cmds(self, mock_run) -> dict[str, list[str]]:
+        cmds = [c.args[0] for c in mock_run.call_args_list]
+        return {
+            c[4]: c[5:] for c in cmds if c[:4] == ["tmux", "bind-key", "-T", "fujimoto"]
+        }
+
+    def test_stop_flags_the_session_and_detaches(self) -> None:
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            tmux._configure_session("proj/test")
+            table = self._table_cmds(mock_run)
+        # Same shape as the fork binding: no -t on set-option, literal `\;`.
+        assert table["s"] == [
+            "set-option",
+            "@fujimoto_pending_action",
+            "stop",
+            "\\;",
+            "detach-client",
+        ]
+
+    def test_kill_branches_on_pane_count(self) -> None:
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            tmux._configure_session("proj/test")
+            table = self._table_cmds(mock_run)
+        cmd = table["x"]
+        assert cmd[:3] == ["if-shell", "-F", "#{==:#{window_panes},1}"]
+        # One pane: killing it ends the session, so hand over to the TUI.
+        assert cmd[3] == "set-option @fujimoto_pending_action close ; detach-client"
+        # A split open: `x` keeps its original meaning.
+        assert cmd[4] == 'confirm-before -p "kill pane #P? (y/n)" kill-pane'
+
+    def test_cheatsheet_mentions_stop(self) -> None:
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            tmux._configure_session("proj/test")
+            table = self._table_cmds(mock_run)
+        assert "s=stop" in table["?"][-1]
+        assert "x=terminate" in table["?"][-1]
+
+    def test_meta_key_is_publicly_readable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FUJIMOTO_META_KEY", "C-g")
+        assert tmux.meta_key() == "C-g"

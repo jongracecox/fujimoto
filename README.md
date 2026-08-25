@@ -190,8 +190,9 @@ via `FUJIMOTO_META_KEY`) to enter a one-shot "fujimoto mode", then:
 | `v` | Open VS Code at the session's working directory. |
 | `w` | Open a native terminal window at the session's working directory. |
 | `f` | Fork this session — detaches back to the fujimoto TUI and opens the **Fork session** flow for this worktree, so you get the usual name prompt, base-branch menu and conversation picker. |
+| `s` | Stop this session — closes claude but keeps the session in your list as 🟠, ready to resume. No prompt. |
 | `d` | Detach the tmux session (returns you to the fujimoto TUI). |
-| `x` | Kill the current pane (with confirmation prompt). |
+| `x` | End this session. With a split open it kills just that pane (with confirmation), as before. With claude alone in the window it detaches to the fujimoto TUI and asks whether to **terminate** (default) or merely **stop** it. |
 | `[` | Enter copy mode (scrollback / selection). |
 | `?` | Flash the binding cheatsheet in the status bar. |
 
@@ -258,12 +259,15 @@ fujimoto
 ### Home Screen
 
 ```
+🟠 Restore 2 stopped sessions
 + New worktree session
 + New session in <project>
 + Ad hoc session
-───── active sessions ─────
+───── sessions ─────
 🟢 20260309-cleanup-ui          (worktree)
 🟢 direct-1                     (direct @ main)
+🟠 20260307-parser-rewrite      (worktree)
+🟠 direct-2                     (direct @ main)
 ───── inactive worktrees ─────
 ⚫ 20260308-old-experiment      (worktree)
 ⚫ 20260309-cleanup-ui-alt 🍴   (worktree)
@@ -273,12 +277,39 @@ fujimoto
 
 Worktrees created with **Fork session** are marked with 🍴.
 
+#### Sessions are remembered across a restart
+
+A force restart kills every tmux session, and without help every piece of work
+in flight comes back looking like an abandoned worktree. Fujimoto remembers
+what you had open instead:
+
+| | Meaning |
+|---|---|
+| 🟢 | Running right now. |
+| 🟠 | **Stopped** — not running, but you never told fujimoto you were done with it. Resume it and carry on. |
+| ⚫ | An inactive worktree: terminated through fujimoto, or never launched from it. |
+
+The rule is simply that fujimoto is the only thing that changes a session's
+status. Terminating one *through fujimoto* marks it done; anything else — a
+host restart, `tmux kill-session` from another terminal, closing the window,
+`exit` in the pane — leaves it stopped and resumable. There is no guessing
+about why a session went away.
+
+**Restore** appears at the top of the home screen whenever something is
+stopped. It relaunches every stopped session in the project at once, each
+resuming its most recent conversation, and attaches to none of them — pick the
+one you want to sit in from the list.
+
+**Stop** ends the claude process but keeps the session history: the transcript
+is untouched and the conversation resumes where it left off. Any task claude
+was part-way through is interrupted, so stop at a natural break.
+
 #### Searching sessions
 
 Press `/` on the home screen to open a search box, then type to filter. Matching
 is live and case-insensitive, against session names and branch names, and covers
-the **active sessions**, **inactive worktrees** and **previous claude sessions**
-lists at once. While a filter is active the action rows (`+ New …`, settings,
+the **sessions** (running and stopped), **inactive worktrees** and **previous
+claude sessions** lists at once. While a filter is active the action rows (`+ New …`, settings,
 switch project) are hidden so only matches remain.
 
 | Key | While searching |
@@ -302,9 +333,14 @@ Select any session to see contextual options:
 
 | Session State | Options |
 |--------------|---------|
-| Active worktree | Connect, Fork session, Resume previous session, Terminate, Finish |
+| Active worktree | Connect, Fork session, Resume previous session, Stop, Terminate, Finish |
+| Stopped worktree | Resume previous session, Fork session, Launch, Terminate, Finish |
 | Inactive worktree | Resume previous session, Fork session, Launch, Finish |
-| Active direct | Connect, Fork session, Resume previous session, Terminate |
+| Active direct | Connect, Fork session, Resume previous session, Stop, Terminate |
+
+**Stop** keeps the session in your list as 🟠; **Terminate** marks it done and
+drops it to ⚫. Both close claude — the difference is only whether fujimoto
+offers it back to you.
 
 All session types also offer **Open terminal**, **Open in VS Code** and
 **Rename**.

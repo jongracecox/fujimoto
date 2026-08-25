@@ -6,14 +6,17 @@ from unittest.mock import patch
 
 import pytest
 
-from textual.widgets import Input, Label, ListItem, ListView
+from textual.widgets import Input, Label, ListItem, ListView, Static
 
 from fujimoto.claude import ClaudeSession, SessionState
 from fujimoto.claude.log_parser import EntryType, StopReason
+from types import SimpleNamespace
+
 from fujimoto.cli import (
     ICON_EYES,
     ICON_FORK,
     ICON_GEAR,
+    ICON_ORANGE_CIRCLE,
     ICON_SHIELD,
     LaunchTarget,
     SessionApp,
@@ -42,6 +45,7 @@ def _patch_git_info(
     worktrees: list[Path] | None = None,
     projects: list[Path] | None = None,
     claude_sessions_fn: object | None = None,
+    open_sessions: dict[str, object] | None = None,
 ):
     """Return a context manager that patches git/tmux info for TUI tests."""
     import contextlib
@@ -90,6 +94,10 @@ def _patch_git_info(
                 return_value=(None, False),
             ),
             patch(
+                "fujimoto.session_state.prune",
+                return_value=open_sessions or {},
+            ),
+            patch(
                 "fujimoto.cli.load_settings",
                 return_value=__import__(
                     "fujimoto.settings", fromlist=["Settings"]
@@ -107,6 +115,16 @@ def _patch_git_info(
 @pytest.fixture(autouse=True)
 def _clean_argv(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("sys.argv", ["fujimoto"])
+
+
+@pytest.fixture(autouse=True)
+def _isolate_session_state(tmp_path: Path):
+    """Keep the TUI tests off the real ~/.cache/fujimoto/sessions.json."""
+    with patch(
+        "fujimoto.session_state._state_path",
+        return_value=tmp_path / "session-state" / "sessions.json",
+    ):
+        yield
 
 
 class TestPaneSubcommand:
@@ -4344,3 +4362,667 @@ class TestFriendlyKeyLabel:
 
     def test_no_prefix_returned_as_is(self) -> None:
         assert _friendly_key_label("Space") == "Space"
+
+
+# -- Stopped sessions (remembered across a restart) --
+
+
+def _list_text(app: SessionApp) -> str:
+    """All text currently rendered in the home list."""
+    parts: list[str] = []
+    for widget in app.query("#home-list").first(ListView).query(Label):
+        parts.append(str(widget.render()))
+    for widget in app.query("#home-list").first(ListView).query(Static):
+        parts.append(str(widget.render()))
+    return "\n".join(parts)
+
+
+def _record(
+    tmp_path: Path,
+    name: str = "wt-a",
+    project: str = "test-proj",
+    session_type: str = "worktree",
+    claude_session_id: str | None = None,
+):
+    """Build an open-session record whose directory actually exists."""
+    from fujimoto.session_state import SessionRecord
+
+    cwd = tmp_path / name
+    cwd.mkdir(exist_ok=True)
+    return SessionRecord(
+        cwd=str(cwd),
+        project=project,
+        session_type=session_type,
+        branch=f"worktree/{name}" if session_type == "worktree" else "feat/test",
+        claude_session_id=claude_session_id,
+    )
+
+
+class TestStoppedSessions:
+    @pytest.mark.asyncio
+    async def test_renders_orange_in_sessions_section(self, tmp_path: Path) -> None:
+        records = {"test-proj/wt-a": _record(tmp_path)}
+        with _patch_git_info(open_sessions=records):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                info = app._session_map["wt-wt-a"]
+                assert info.is_stopped is True
+                assert info.is_active is False
+                label = app._build_session_label(info, "")
+                assert label.startswith(ICON_ORANGE_CIRCLE)
+                text = _list_text(app)
+                assert "───── sessions ─────" in text
+
+    @pytest.mark.asyncio
+    async def test_running_session_is_not_stopped(self, tmp_path: Path) -> None:
+        # The record exists but tmux still has the session: it is simply live.
+        records = {"test-proj/wt-a": _record(tmp_path)}
+        with _patch_git_info(
+            sessions=["test-proj/wt-a"],
+            worktrees=[Path("wt-a")],
+            open_sessions=records,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert app._session_map["wt-wt-a"].is_active is True
+                assert app._session_map["wt-wt-a"].is_stopped is False
+                assert "Restore" not in _list_text(app)
+
+    @pytest.mark.asyncio
+    async def test_stopped_worktree_leaves_inactive_section(
+        self, tmp_path: Path
+    ) -> None:
+        # A worktree with an open record must appear once, as stopped — not
+        # again under "inactive worktrees".
+        records = {"test-proj/wt-a": _record(tmp_path)}
+        with _patch_git_info(worktrees=[Path("wt-a")], open_sessions=records):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert "inactive worktrees" not in _list_text(app)
+                assert app._session_map["wt-wt-a"].is_stopped is True
+
+    @pytest.mark.asyncio
+    async def test_untracked_worktree_stays_inactive(self, tmp_path: Path) -> None:
+        # No record at all means the user never had it open, or terminated it.
+        # Either way it is dim — this is what keeps an upgrade from turning
+        # every existing worktree orange.
+        with _patch_git_info(worktrees=[Path("wt-a")], open_sessions={}):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert "inactive worktrees" in _list_text(app)
+                assert app._session_map["wt-wt-a"].is_stopped is False
+
+    @pytest.mark.asyncio
+    async def test_other_projects_records_are_ignored(self, tmp_path: Path) -> None:
+        records = {"other/wt-a": _record(tmp_path, project="other")}
+        with _patch_git_info(open_sessions=records):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert app._stopped_records() == {}
+                assert "Restore" not in _list_text(app)
+
+    @pytest.mark.asyncio
+    async def test_stopped_direct_session_renders(self, tmp_path: Path) -> None:
+        records = {
+            "test-proj/direct-1": _record(
+                tmp_path, name="direct-1", session_type="direct"
+            )
+        }
+        with _patch_git_info(open_sessions=records):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                info = app._session_map["ds-test-proj--direct-1"]
+                assert info.is_stopped is True
+                assert info.session_type == "direct"
+
+    @pytest.mark.asyncio
+    async def test_search_filters_stopped_rows(self, tmp_path: Path) -> None:
+        records = {
+            "test-proj/wt-a": _record(tmp_path, name="wt-a"),
+            "test-proj/wt-b": _record(tmp_path, name="wt-b"),
+        }
+        with _patch_git_info(open_sessions=records):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app._search_query = "wt-b"
+                await app._refresh_home_list()
+                await pilot.pause()
+                assert "wt-b" in _list_text(app)
+                assert "wt-a" not in _list_text(app)
+
+
+class TestRestoreStoppedSessions:
+    @pytest.mark.asyncio
+    async def test_row_shows_count_and_pluralises(self, tmp_path: Path) -> None:
+        records = {"test-proj/wt-a": _record(tmp_path)}
+        with _patch_git_info(open_sessions=records):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert "Restore 1 stopped session" in _list_text(app)
+                assert "sessions" not in _list_text(app).split("Restore 1")[1][:20]
+
+        records["test-proj/wt-b"] = _record(tmp_path, name="wt-b")
+        with _patch_git_info(open_sessions=records):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert "Restore 2 stopped sessions" in _list_text(app)
+
+    @pytest.mark.asyncio
+    async def test_creates_detached_sessions_resuming_conversations(
+        self, tmp_path: Path
+    ) -> None:
+        records = {"test-proj/wt-a": _record(tmp_path, claude_session_id="rec-id")}
+        cs = _fake_claude_session(tmp_path / "wt-a", session_id="live-id")
+        with _patch_git_info(open_sessions=records, claude_sessions_fn=lambda _p: [cs]):
+            with patch("fujimoto.cli.create_session") as create:
+                app = SessionApp()
+                async with app.run_test() as pilot:
+                    await pilot.pause()
+                    await app._restore_stopped_sessions()
+        create.assert_called_once()
+        args, kwargs = create.call_args
+        assert args[0] == "test-proj/wt-a"
+        # The live transcript wins over the id recorded at launch time.
+        assert kwargs["resume_session_id"] == "live-id"
+        assert kwargs["system_prompt"] is None
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_recorded_id(self, tmp_path: Path) -> None:
+        records = {"test-proj/wt-a": _record(tmp_path, claude_session_id="rec-id")}
+        with _patch_git_info(open_sessions=records):
+            with patch("fujimoto.cli.create_session") as create:
+                app = SessionApp()
+                async with app.run_test() as pilot:
+                    await pilot.pause()
+                    await app._restore_stopped_sessions()
+        assert create.call_args.kwargs["resume_session_id"] == "rec-id"
+
+    @pytest.mark.asyncio
+    async def test_no_conversation_launches_fresh(self, tmp_path: Path) -> None:
+        records = {"test-proj/wt-a": _record(tmp_path)}
+        with _patch_git_info(open_sessions=records):
+            with patch("fujimoto.cli.create_session") as create:
+                app = SessionApp()
+                async with app.run_test() as pilot:
+                    await pilot.pause()
+                    await app._restore_stopped_sessions()
+        assert create.call_args.kwargs["resume_session_id"] is None
+        assert create.call_args.kwargs["system_prompt"] is not None
+
+    @pytest.mark.asyncio
+    async def test_selecting_the_row_restores(self, tmp_path: Path) -> None:
+        records = {"test-proj/wt-a": _record(tmp_path)}
+        with _patch_git_info(open_sessions=records):
+            with patch("fujimoto.cli.create_session") as create:
+                app = SessionApp()
+                async with app.run_test() as pilot:
+                    await pilot.pause()
+                    event = SimpleNamespace(item=SimpleNamespace(id="action-restore"))
+                    await app.on_home_selected(event)  # type: ignore[arg-type]
+        create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_failure_is_surfaced(self, tmp_path: Path) -> None:
+        records = {"test-proj/wt-a": _record(tmp_path)}
+        with _patch_git_info(open_sessions=records):
+            with patch("fujimoto.cli.create_session", side_effect=RuntimeError("nope")):
+                app = SessionApp()
+                async with app.run_test() as pilot:
+                    await pilot.pause()
+                    await app._restore_stopped_sessions()
+                    await pilot.pause()
+                    text = " ".join(
+                        str(w.render())
+                        for w in app.query("#main").first().query(Static)
+                    )
+                    assert "Could not restore" in text
+
+
+class TestStopAndTerminate:
+    def _session(self, tmp_path: Path, active: bool = True, stopped: bool = False):
+        return SessionInfo(
+            name="wt-a",
+            session_type="worktree",
+            project="test-proj",
+            path=tmp_path / "wt-a",
+            tmux_session="test-proj/wt-a",
+            is_active=active,
+            is_stopped=stopped,
+            branch="worktree/wt-a",
+            claude_session_id="cid",
+        )
+
+    @pytest.mark.asyncio
+    async def test_active_session_offers_both(self, tmp_path: Path) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await app._show_session_actions(self._session(tmp_path))
+                await pilot.pause()
+                ids = [
+                    i.id for i in app.query("#session-actions").first(ListView).children
+                ]
+                assert "sa-stop" in ids
+                assert "sa-terminate" in ids
+
+    @pytest.mark.asyncio
+    async def test_stopped_session_offers_terminate_only(self, tmp_path: Path) -> None:
+        # There is nothing left to stop, but the user still needs a way to
+        # dismiss an orange row without launching it first.
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await app._show_session_actions(
+                    self._session(tmp_path, active=False, stopped=True)
+                )
+                await pilot.pause()
+                ids = [
+                    i.id for i in app.query("#session-actions").first(ListView).children
+                ]
+                assert "sa-stop" not in ids
+                assert "sa-terminate" in ids
+                info = " ".join(
+                    str(w.render()) for w in app.query("#main").first().query(Static)
+                )
+                assert "stopped" in info
+
+    @pytest.mark.asyncio
+    async def test_inactive_worktree_offers_neither(self, tmp_path: Path) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await app._show_session_actions(self._session(tmp_path, active=False))
+                await pilot.pause()
+                ids = [
+                    i.id for i in app.query("#session-actions").first(ListView).children
+                ]
+                assert "sa-stop" not in ids
+                assert "sa-terminate" not in ids
+
+    @pytest.mark.asyncio
+    async def test_stop_keeps_record_open(self, tmp_path: Path) -> None:
+        from fujimoto import session_state
+
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                session_state.mark_open(
+                    "test-proj/wt-a",
+                    cwd=tmp_path,
+                    project="test-proj",
+                    session_type="worktree",
+                )
+                with patch("fujimoto.cli.kill_session") as kill:
+                    await app._end_session(self._session(tmp_path), terminate=False)
+                kill.assert_called_once_with("test-proj/wt-a")
+                state = session_state.load_state()
+                assert "test-proj/wt-a" in state
+                assert state["test-proj/wt-a"].claude_session_id == "cid"
+
+    @pytest.mark.asyncio
+    async def test_terminate_forgets_record(self, tmp_path: Path) -> None:
+        from fujimoto import session_state
+
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                session_state.mark_open(
+                    "test-proj/wt-a",
+                    cwd=tmp_path,
+                    project="test-proj",
+                    session_type="worktree",
+                )
+                with patch("fujimoto.cli.kill_session") as kill:
+                    await app._end_session(self._session(tmp_path), terminate=True)
+                kill.assert_called_once()
+                assert session_state.load_state() == {}
+
+    @pytest.mark.asyncio
+    async def test_terminating_a_stopped_session_kills_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                with patch("fujimoto.cli.kill_session") as kill:
+                    await app._end_session(
+                        self._session(tmp_path, active=False, stopped=True),
+                        terminate=True,
+                    )
+                kill.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_kill_failure_on_a_live_session_is_surfaced(
+        self, tmp_path: Path
+    ) -> None:
+        from fujimoto import session_state
+
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                session_state.mark_open(
+                    "test-proj/wt-a",
+                    cwd=tmp_path,
+                    project="test-proj",
+                    session_type="worktree",
+                )
+                with (
+                    patch("fujimoto.cli.kill_session", side_effect=TmuxError("boom")),
+                    patch("fujimoto.cli.session_exists", return_value=True),
+                ):
+                    await app._end_session(self._session(tmp_path), terminate=True)
+                await pilot.pause()
+                text = " ".join(
+                    str(w.render()) for w in app.query("#main").first().query(Static)
+                )
+                assert "boom" in text
+                # Marking a still-running session closed would hide it.
+                assert "test-proj/wt-a" in session_state.load_state()
+
+    @pytest.mark.asyncio
+    async def test_kill_failure_on_a_vanished_session_proceeds(
+        self, tmp_path: Path
+    ) -> None:
+        from fujimoto import session_state
+
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                session_state.mark_open(
+                    "test-proj/wt-a",
+                    cwd=tmp_path,
+                    project="test-proj",
+                    session_type="worktree",
+                )
+                # It died between being listed and being acted on — which is
+                # the state the kill was aiming for anyway.
+                with (
+                    patch("fujimoto.cli.kill_session", side_effect=TmuxError("gone")),
+                    patch("fujimoto.cli.session_exists", return_value=False),
+                ):
+                    await app._end_session(self._session(tmp_path), terminate=True)
+                assert session_state.load_state() == {}
+
+    @pytest.mark.asyncio
+    async def test_menu_items_route_to_one_handler(self, tmp_path: Path) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app._selected_session = self._session(tmp_path)
+                with patch.object(app, "_end_session") as end:
+                    for item_id, terminate in (
+                        ("sa-stop", False),
+                        ("sa-terminate", True),
+                    ):
+                        event = SimpleNamespace(item=SimpleNamespace(id=item_id))
+                        await app.on_session_action_selected(event)  # type: ignore[arg-type]
+                        assert end.call_args.kwargs["terminate"] is terminate
+
+
+class TestTerminatePrompt:
+    def _target(self, tmp_path: Path) -> LaunchTarget:
+        return LaunchTarget(
+            "test-proj", tmp_path / "wt-a", "test-proj/wt-a", "worktree"
+        )
+
+    @pytest.mark.asyncio
+    async def test_opens_on_mount_with_terminate_default(self, tmp_path: Path) -> None:
+        with _patch_git_info():
+            app = SessionApp(pending_close=self._target(tmp_path))
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                prompt = app.query("#terminate-prompt").first(ListView)
+                ids = [i.id for i in prompt.children]
+                assert ids == ["tp-terminate", "tp-stop", "tp-cancel"]
+                # Enter therefore terminates, matching the confirm it replaces.
+                assert prompt.index == 0
+
+    @pytest.mark.asyncio
+    async def test_mentions_the_stop_shortcut(self, tmp_path: Path) -> None:
+        with _patch_git_info():
+            app = SessionApp(pending_close=self._target(tmp_path))
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                text = " ".join(
+                    str(w.render()) for w in app.query("#main").first().query(Static)
+                )
+                assert "s stops without asking" in text
+
+    @pytest.mark.asyncio
+    async def test_terminate_forgets_record(self, tmp_path: Path) -> None:
+        from fujimoto import session_state
+
+        (tmp_path / "wt-a").mkdir()
+        with _patch_git_info():
+            app = SessionApp(pending_close=self._target(tmp_path))
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                session_state.mark_open(
+                    "test-proj/wt-a",
+                    cwd=tmp_path / "wt-a",
+                    project="test-proj",
+                    session_type="worktree",
+                )
+                with patch("fujimoto.cli.kill_session"):
+                    event = SimpleNamespace(item=SimpleNamespace(id="tp-terminate"))
+                    await app.on_terminate_prompt_selected(event)  # type: ignore[arg-type]
+                assert session_state.load_state() == {}
+
+    @pytest.mark.asyncio
+    async def test_stop_keeps_record(self, tmp_path: Path) -> None:
+        from fujimoto import session_state
+
+        (tmp_path / "wt-a").mkdir()
+        with _patch_git_info():
+            app = SessionApp(pending_close=self._target(tmp_path))
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                session_state.mark_open(
+                    "test-proj/wt-a",
+                    cwd=tmp_path / "wt-a",
+                    project="test-proj",
+                    session_type="worktree",
+                )
+                with patch("fujimoto.cli.kill_session") as kill:
+                    event = SimpleNamespace(item=SimpleNamespace(id="tp-stop"))
+                    await app.on_terminate_prompt_selected(event)  # type: ignore[arg-type]
+                kill.assert_called_once_with("test-proj/wt-a")
+                assert "test-proj/wt-a" in session_state.load_state()
+
+    @pytest.mark.asyncio
+    async def test_cancel_reattaches(self, tmp_path: Path) -> None:
+        target = self._target(tmp_path)
+        with _patch_git_info():
+            app = SessionApp(pending_close=target)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                with patch("fujimoto.cli.kill_session") as kill:
+                    event = SimpleNamespace(item=SimpleNamespace(id="tp-cancel"))
+                    await app.on_terminate_prompt_selected(event)  # type: ignore[arg-type]
+                # Cancel must cost nothing: nothing killed, session re-attached.
+                kill.assert_not_called()
+                assert app._launch_target == target
+
+    @pytest.mark.asyncio
+    async def test_no_pending_close_opens_home(self, tmp_path: Path) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert not app.query("#terminate-prompt")
+                assert app.query("#home-list")
+
+
+class TestMainPendingStopAndClose:
+    def _app(self, target: LaunchTarget | None) -> SessionApp:
+        app = SessionApp.__new__(SessionApp)
+        app._launch_target = target
+        return app
+
+    def test_records_session_as_open_before_attaching(self, tmp_path: Path) -> None:
+        from fujimoto import session_state
+
+        wt = tmp_path / "wt-a"
+        wt.mkdir()
+        app1 = self._app(LaunchTarget("proj", wt, "proj/wt-a", "worktree"))
+        app2 = self._app(None)
+        seen: list[dict] = []
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]),
+            patch.object(app1, "run"),
+            patch.object(app2, "run"),
+            # The record must exist before the attach blocks, or a host that
+            # dies mid-session leaves nothing to restore.
+            patch(
+                "fujimoto.cli.launch_claude_in_tmux",
+                side_effect=lambda *a, **k: seen.append(session_state.load_state()),
+            ),
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
+            patch("fujimoto.cli.take_pending_action", return_value=None),
+        ):
+            main()
+        assert "proj/wt-a" in seen[0]
+
+    def test_stop_kills_session_without_prompting(self, tmp_path: Path) -> None:
+        from fujimoto import session_state
+
+        wt = tmp_path / "wt-a"
+        wt.mkdir()
+        app1 = self._app(LaunchTarget("proj", wt, "proj/wt-a", "worktree"))
+        app2 = self._app(None)
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]) as mock_cls,
+            patch.object(app1, "run"),
+            patch.object(app2, "run"),
+            patch("fujimoto.cli.launch_claude_in_tmux"),
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
+            patch("fujimoto.cli.take_pending_action", return_value="stop"),
+            patch("fujimoto.cli.kill_session") as kill,
+        ):
+            main()
+        kill.assert_called_once_with("proj/wt-a")
+        # No prompt, and the record stays open so it comes back orange.
+        assert mock_cls.call_args_list[1].kwargs["pending_close"] is None
+        assert "proj/wt-a" in session_state.load_state()
+
+    def test_stop_tolerates_a_session_already_gone(self, tmp_path: Path) -> None:
+        wt = tmp_path / "wt-a"
+        wt.mkdir()
+        app1 = self._app(LaunchTarget("proj", wt, "proj/wt-a", "worktree"))
+        app2 = self._app(None)
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]),
+            patch.object(app1, "run"),
+            patch.object(app2, "run"),
+            patch("fujimoto.cli.launch_claude_in_tmux"),
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
+            patch("fujimoto.cli.take_pending_action", return_value="stop"),
+            patch("fujimoto.cli.kill_session", side_effect=TmuxError("gone")),
+        ):
+            main()  # must not raise
+
+    def test_close_hands_the_prompt_to_the_next_app(self, tmp_path: Path) -> None:
+        wt = tmp_path / "wt-a"
+        wt.mkdir()
+        app1 = self._app(LaunchTarget("proj", wt, "proj/wt-a", "worktree"))
+        app2 = self._app(None)
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]) as mock_cls,
+            patch.object(app1, "run"),
+            patch.object(app2, "run"),
+            patch("fujimoto.cli.launch_claude_in_tmux"),
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
+            patch("fujimoto.cli.take_pending_action", return_value="close"),
+            patch("fujimoto.cli.kill_session") as kill,
+        ):
+            main()
+        # The TUI asks first; nothing is killed by main().
+        kill.assert_not_called()
+        pending = mock_cls.call_args_list[1].kwargs["pending_close"]
+        assert pending == LaunchTarget("proj", wt, "proj/wt-a", "worktree")
+
+
+class TestSessionStateBookkeeping:
+    @pytest.mark.asyncio
+    async def test_rename_follows_the_record(self, tmp_path: Path) -> None:
+        from fujimoto import session_state
+
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                session_state.mark_open(
+                    "test-proj/old",
+                    cwd=tmp_path,
+                    project="test-proj",
+                    session_type="worktree",
+                )
+                app._selected_session = SessionInfo(
+                    name="old",
+                    session_type="worktree",
+                    project="test-proj",
+                    path=tmp_path,
+                    tmux_session="test-proj/old",
+                    is_active=True,
+                    branch="worktree/old",
+                )
+                with patch("fujimoto.cli.rename_session"):
+                    event = SimpleNamespace(value="new")
+                    await app.on_rename_submitted(event)  # type: ignore[arg-type]
+                # A renamed session must not be orphaned as a stale record.
+                assert set(session_state.load_state()) == {"test-proj/new"}
+
+    @pytest.mark.asyncio
+    async def test_deleting_a_worktree_forgets_the_record(self, tmp_path: Path) -> None:
+        from fujimoto import session_state
+
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                session_state.mark_open(
+                    "test-proj/wt-a",
+                    cwd=tmp_path,
+                    project="test-proj",
+                    session_type="worktree",
+                )
+                session = SessionInfo(
+                    name="wt-a",
+                    session_type="worktree",
+                    project="test-proj",
+                    path=tmp_path,
+                    tmux_session="test-proj/wt-a",
+                    is_active=True,
+                    branch="worktree/wt-a",
+                )
+                with (
+                    patch("fujimoto.cli.kill_session"),
+                    patch("fujimoto.cli.remove_worktree"),
+                    patch("fujimoto.cli.delete_branch"),
+                ):
+                    await app._do_delete_worktree(session, remove_remote=False)
+                # Otherwise it would come back as a stopped row pointing at a
+                # directory that no longer exists.
+                assert session_state.load_state() == {}

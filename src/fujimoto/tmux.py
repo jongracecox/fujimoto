@@ -20,6 +20,11 @@ def _meta_key() -> str:
     return os.environ.get(META_KEY_ENV, DEFAULT_META_KEY)
 
 
+def meta_key() -> str:
+    """Public accessor for the fujimoto meta key (empty when disabled)."""
+    return _meta_key()
+
+
 def _prefix_key() -> str:
     """Return the configured tmux prefix key."""
     return os.environ.get(PREFIX_KEY_ENV, DEFAULT_PREFIX_KEY)
@@ -261,6 +266,8 @@ def disable_quick_terminal_binding() -> None:
 
 PENDING_ACTION_OPTION = "@fujimoto_pending_action"
 PENDING_FORK = "fork"
+PENDING_STOP = "stop"
+PENDING_CLOSE = "close"
 
 
 def _configure_session(name: str) -> None:
@@ -277,7 +284,7 @@ def _configure_session(name: str) -> None:
     if meta_key:
         meta_label = _meta_key_label(meta_key)
         status_right = (
-            f'"Fujimoto: {meta_label} t/T/w/v/f/d/x/[ ({meta_label} t toggles) | '
+            f'"Fujimoto: {meta_label} t/T/w/v/f/s/d/x/[ ({meta_label} t toggles) | '
             f'help: {meta_label} ?"'
         )
         status_len = "120"
@@ -357,16 +364,37 @@ def _configure_fujimoto_key_table(name: str, meta_key: str) -> None:
             "\\;",
             "detach-client",
         ],
+        # Stopping keeps the session's record open, so it comes back as a
+        # stopped (orange) row that can be resumed. No prompt: `s` is the fast
+        # path for a user who already knows they want the session back.
+        [
+            "s",
+            "set-option",
+            PENDING_ACTION_OPTION,
+            PENDING_STOP,
+            "\\;",
+            "detach-client",
+        ],
         ["d", "detach-client"],
-        ["x", "confirm-before", "-p", "kill pane #P? (y/n)", "kill-pane"],
+        # With one pane, killing it ends the session — so hand over to the TUI,
+        # which asks whether to terminate (forget it) or merely stop it. With a
+        # split open, `x` keeps its original meaning: kill just this pane.
+        [
+            "x",
+            "if-shell",
+            "-F",
+            "#{==:#{window_panes},1}",
+            f"set-option {PENDING_ACTION_OPTION} {PENDING_CLOSE} ; detach-client",
+            'confirm-before -p "kill pane #P? (y/n)" kill-pane',
+        ],
         ["[", "copy-mode"],
         [
             "?",
             "display-message",
             "-d",
             "5000",
-            "F-mode: t/T=split  v=code  w=window  f=fork  d=detach  x=kill  "
-            "[=copy  ?=help",
+            "F-mode: t/T=split  v=code  w=window  f=fork  s=stop  "
+            "d=detach  x=terminate  [=copy  ?=help",
         ],
     ]
     for key, *cmd in fujimoto_bindings:
