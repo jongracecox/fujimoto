@@ -387,6 +387,11 @@ Three custom exception types, all caught in `main()`:
   - The flag is cleared on read, so a later ordinary detach of the same session can't re-trigger the fork. `main()` keys it on `tmux_name or session_name(project, working_dir.name)` — the same name `launch_claude_in_tmux` derives — so a freshly created worktree (whose `tmux_name` is `None`) is matched correctly.
   - The whole flow funnels into the shared `_finalize_create` / `_do_create_and_launch`, so forks inherit the directory-conflict handling (`_show_conflict`, `conflict-suffix`) for free. A non-`None` `_fork_source` is the only difference; `_show_create_form` clears the fork state so a cancelled fork can't leak into the next plain create.
 - **Resume previous session — tmux naming**: When resuming from an inactive worktree, the resumed session reuses the worktree's existing tmux session name (e.g., `project/20260101-feature`) instead of generating a new `direct-N` name. This keeps the session correctly identified as a worktree item on subsequent TUI views, so its path and Claude session lookup remain tied to the worktree directory. For active worktrees (original session still alive), a `direct-N` name is used because the worktree name is occupied. The working directory for resumed sessions always comes from `cs.cwd` (the directory recorded in the Claude session log) rather than `session.path`.
+- **Home list fills the screen**: `#home-panel` and `#home-list` are both
+  `height: 1fr`, so the session list expands to whatever vertical space `#main`
+  leaves after the header, update banner, search box and bottom bar, and scrolls
+  internally beyond that. It used to be `height: auto; max-height: 24`, which
+  capped the visible rows at 24 no matter how tall the terminal was.
 - **Home search rebuilds rows, not the screen**: `_show_home` mounts the panel;
   all row construction (and the population of `_session_map` /
   `_claude_state_snapshot`) lives in `_build_home_items()`, which applies the
