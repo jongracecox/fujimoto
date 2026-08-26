@@ -118,7 +118,8 @@ src/fujimoto/
 │   └── fujimoto.yaml.template  # commented scaffold written by `fujimoto --create-config`
 └── claude/
     ├── __init__.py      # Re-exports public API
-    └── log_parser.py    # Parse Claude JSONL session logs (state, metadata, session lookup)
+    ├── log_parser.py    # Parse Claude JSONL session logs (state, metadata, session lookup)
+    └── search.py        # Full-text search across JSONL transcripts (batched, cancellable)
 ```
 
 ## Architecture
@@ -309,17 +310,31 @@ pydantic):
 - `ClaudeSession` — frozen dataclass: session_id, state, cwd, git_branch, last_activity, etc.
 - `encode_project_path(path)` — `str(path).replace("/", "-")` (matches Claude's directory encoding)
 - `get_claude_projects_dir()` — `~/.claude/projects`
-- `parse_session(jsonl_path)` — reads JSONL, tracks last meaningful (non-sidechain) entry, derives state
+- `parse_session(jsonl_path)` — reads JSONL, tracks last meaningful (non-sidechain) entry, derives state. Skips lines that parse to a non-dict (a bare list or string is valid JSON but has no entry type), which previously raised `AttributeError` out of `get_sessions_for_path` and into the home screen.
 - `get_sessions_for_path(project_path)` — encodes path, globs `*.jsonl`, returns sorted sessions
+
+**`claude/search.py`** — Full-text search over transcript *contents* (as opposed
+to the home screen's name filter). UI-free and synchronous; the caller is
+responsible for running it off the event loop.
+- Three orthogonal axes. **Pattern**: literal (query is `re.escape`d) or regex — both compile to one `re.Pattern`, so there is a single scanning path. **Case**: `case_sensitive=False` (default) applies `re.IGNORECASE`, so the choice costs nothing at scan time and is honoured by the whole-file reject as well as by snippet spans. **Content** (`ContentMode`): `RAW` scans the transcript bytes as written (tool inputs, tool output, file contents, paths, commands all match); `TEXT` parses each entry and scans only string content and `text` blocks — deliberately *excluding* `tool_use` input and `tool_result` output, since including them would erase the distinction between the modes. `compile_matcher`'s own default is `RAW` (it is the primitive — "scan the bytes I gave you"); the *search view* opens in `TEXT`, which is the user-facing default and lives in `SessionApp.__init__`.
+- `ContentMode` has `.label` (for the status line) and `.toggled()` (for the one-key toggle), so the UI holds no mode-name strings.
+- `compile_matcher(query, *, regex, mode)` → `Matcher`; raises `SearchError` on a regex that won't compile. `Matcher.present_in(text)` is the whole-file predicate.
+- `list_session_logs(project_root, worktrees)` — encoded dirs for the root and each worktree, globbed and returned **mtime-descending**, deduplicated. The ordering is the feature: a caller rendering results as they arrive shows recently used sessions first.
+- `search_log(path, matcher)` → `SearchHit | None`. **Reads the file and rejects it with a single `re.search` before any JSON parsing** — that fast path is what makes scanning hundreds of logs viable, since almost none contain the query. Returns `None` for an unreadable log, for a `ClaudeLogError` from `parse_session`, and (in `TEXT` mode) when the whole-file hit turned out to be in JSON scaffolding rather than in anything anyone said.
+- `iter_hits(logs, matcher, *, batch_size=10, is_cancelled=None)` — generator yielding `(scanned_so_far, hits_in_batch)` every `batch_size` logs plus once at the end. `is_cancelled` is polled before each log; a cancelled scan yields nothing further. An empty log list yields exactly one `(0, ())` batch so the caller can report "no transcripts".
+- `SearchHit(session, match_count, snippets)` where each snippet is a `Snippet(text, spans)`. Snippets are capped at `MAX_SNIPPETS` (3) per session, each a whitespace-collapsed, single-line window of `SNIPPET_RADIUS` (60) chars either side of the match with `…` elision markers.
+- **`Snippet.spans` are the match offsets *within* `text`**, so the UI can highlight them without re-running the pattern — which it could not do reliably anyway, since `text` has had its whitespace collapsed and may no longer match a query that spanned a line break. `_collapse(window)` returns the collapsed text plus a `len(window) + 1` offset map, and `_snippet` maps every match in the window through it: a half-open window span `(a, b)` becomes `(offsets[a], offsets[b])`. Reporting *all* matches in the window (not just the anchor one) is what lets a dense passage highlight each hit.
+- `_collect(source, matcher, count, snippets)` counts every match but skips snippetting one that falls inside a window already emitted — so `MAX_SNIPPETS` buys three *different* places rather than three near-identical views of one dense paragraph. Counts are unaffected.
 
 **`cli.py`** — Textual TUI with async view management:
 - `SessionInfo` — dataclass for session state (type, project, path, tmux name, active status, claude_session_id, claude_state, is_fork)
 - `LaunchTarget` — `NamedTuple` describing what `main()` should launch: `(project, working_dir, tmux_name, session_type, resume_session_id, forked_from_session_id, forked_from_worktree)`. A `NamedTuple` rather than a dataclass so existing index-based access keeps working.
 - `SessionApp` — main app class with CSS styling
-- Module-level helpers: `_claude_state_label(state)`, `_relative_time(dt)`, `_get_claude_sessions(root, worktrees)`, `_is_fork_worktree(path)`, `_build_fork_system_prompt(project, working_dir, parent_worktree, base_branch)`
+- Module-level helpers: `_claude_state_label(state)`, `_relative_time(dt)`, `_get_claude_sessions(root, worktrees)`, `_is_fork_worktree(path)`, `_build_fork_system_prompt(project, working_dir, parent_worktree, base_branch)`, `_fit_snippet(snippet, max_width)` / `_render_snippet(snippet, max_width)` (search-result snippet rendering — see the `Content.assemble` gotcha)
 - Instance helpers: `_build_session_label(session, state_suffix)` — the single source of truth for session row text (including the 🍴 fork marker), used by `_show_home`'s initial render of worktree rows and by `_poll_session_states` for in-place updates; `_build_claude_session_items(sessions, prefix)` — shared row rendering for the resume (`rp-*`) and fork (`fp-*`) pickers
 - Views: home (sessions list), session actions submenu, terminate/stop prompt (`#terminate-prompt`, opened by a pending `close` from `Ctrl-A x`; Terminate / Stop / Cancel with Terminate highlighted so Enter matches the `confirm-before` it replaces, and Cancel re-attaching via `_launch_target` so it costs nothing), finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), fork title form, fork branch select, fork session picker, conflict resolution, project switcher (with autocomplete filter), tmux install, error
-- Home screen search: `/` arms a filter box (`#home-search`) mounted above
+- Transcript search (`s`) — see the dedicated section below.
+- Home screen name filter: `/` arms a filter box (`#home-search`) mounted above
   `#home-list`. `action_search` reveals + focuses it; `Input.Changed` re-renders
   the rows via `_refresh_home_list`; `Input.Submitted` keeps the filter and moves
   focus to the list; Escape (in the box, or on a filtered list via
@@ -392,7 +407,78 @@ Three custom exception types, all caught in `main()`:
   leaves after the header, update banner, search box and bottom bar, and scrolls
   internally beyond that. It used to be `height: auto; max-height: 24`, which
   capped the visible rows at 24 no matter how tall the terminal was.
-- **Home search rebuilds rows, not the screen**: `_show_home` mounts the panel;
+- **Transcript search (`s`)** — the counterpart to `/`: `/` matches session
+  *names* from data already in memory, `s` matches transcript *contents*, which
+  means reading every JSONL log for the project root and its worktrees. Scoped to
+  the current project (not every project on the machine), because a result has to
+  resolve to a session this home screen can act on. View is `#search-panel`
+  (`#search-input`, `#search-status`, `#search-results`), opened by
+  `action_session_search` from the home screen only.
+  - **The scan cannot live in a `_build_*_items()` helper.** It runs in a
+    `@work(thread=True, exclusive=True, group="transcript-search")` worker
+    (`_run_transcript_search`) driving `claude_search.iter_hits`, handing each
+    batch of 10 back with `call_from_thread(self._apply_search_batch, ...)`, which
+    appends rows and updates the progress line. Results therefore appear while
+    the scan is still running, and the event loop only ever does row appends.
+  - **`_search_token` is the correctness mechanism, not `exclusive=True`.**
+    Cancellation isn't instantaneous: a batch can already be queued on the event
+    loop when the query changes or the view is torn down. Every scan bumps the
+    token; `_apply_search_batch` / `_search_failed` drop anything carrying a stale
+    one. `_start_transcript_search` bumps *before* cancelling the group, and
+    `_stop_transcript_search` (called from `_clear_main`) bumps again and cancels.
+  - Measured on 302 transcripts / 222 MB (every log on one machine, i.e. far
+    beyond a single project): first results at ~50 ms, full scan 1.2–2.2 s, all
+    off the event loop. A realistic single project is a handful of logs and
+    finishes in tens of milliseconds. Re-measure with
+    `search.iter_hits` over `~/.claude/projects/**/*.jsonl` if you change the
+    scanning path.
+  - `Input.Changed` is **debounced** (`SEARCH_DEBOUNCE = 0.3`) with a minimum
+    query length (`SEARCH_MIN_QUERY = 2`); without both, a scan spends most of its
+    life being cancelled by the next keystroke. As with `#home-search`, mounting
+    the box with a preserved value fires a spurious `Changed`, ignored when the
+    value matches `_transcript_query` and hits are already on screen.
+  - Three live toggles, all Ctrl chords because they must fire while the `Input`
+    holds focus (a plain letter would be typed into it): `ctrl+r`
+    (`action_toggle_search_regex`), `ctrl+t` (`action_toggle_search_mode`) and
+    `ctrl+i` (`action_toggle_search_case`). Each rescans via
+    `_restart_transcript_search`; all three are rendered by
+    `_search_status_text`, and none is reset by `_show_session_search`, so a
+    choice sticks for the session.
+  - **`ctrl+i` is the same byte (0x09) as Tab in a legacy terminal.** It only
+    arrives as a distinct key under the kitty keyboard protocol, which Textual
+    requests via `ESC [>1u` in its driver: the parser then reads `CSI 105;5u` as
+    `ctrl+i` and `CSI 9u` as `tab`. Without that protocol (macOS Terminal.app,
+    older iTerm2) Ctrl+I is delivered as `tab` and the binding never fires —
+    verified by feeding both sequences to `XTermParser`. Textual's
+    `KEY_ALIASES` maps `tab → ["ctrl+i"]`, but the alias does not make a `tab`
+    press trigger a `ctrl+i` binding, so there is no false-positive risk (there
+    is a test for that). If this needs to work everywhere, move it to a chord
+    with no legacy collision.
+  - **Snippet rendering** is two module-level helpers. `_fit_snippet` trims a
+    snippet to the panel width by *sliding* the window to keep the first match
+    visible (a plain right-truncation would cut it off, since the snippet is
+    centred on the match with 60 chars of lead-in), shifting the spans and
+    dropping any that fall outside; it reserves a column for an elision marker
+    at both ends whether or not both are needed, because the alternative is a
+    fixed-point loop — adding a marker narrows the body, which can move the
+    window, which changes whether a marker is needed. `_render_snippet` then
+    assembles `(text, style)` pairs into a `Content`: dim for context,
+    `SNIPPET_MATCH_STYLE` (`b $warning`, theme-resolved) for each match.
+  - **The view opens in `ContentMode.TEXT`.** Message text is quieter (a common
+    word cannot hit a JSON key, a session uuid or tool output) and in practice
+    faster than raw: the whole-file `re.search` reject runs first either way, so
+    `TEXT` only pays for JSON parsing on the files that already matched, while
+    `RAW` pays for snippet building on far more lines. Neither toggle is reset by
+    `_show_session_search`, so a switch to raw sticks for the session.
+  - Selecting a result opens the **existing** session-actions menu with a
+    `session_type="claude"` `SessionInfo` (path from `cs.cwd`), so Resume / Open
+    terminal / Open in VS Code come for free. `_show_session_actions(...,
+    from_search=True)` records where it was opened from in
+    `_actions_from_search`, so `sa-cancel` and `action_go_back` return to
+    `_show_session_search(restore=True)` — re-rendering the collected
+    `_search_hits` rather than throwing a completed scan away. Opening the menu
+    from the home screen clears the flag, so that path still returns home.
+- **Home name filter rebuilds rows, not the screen**: `_show_home` mounts the panel;
   all row construction (and the population of `_session_map` /
   `_claude_state_snapshot`) lives in `_build_home_items()`, which applies the
   current `_search_query`. Filtering therefore only clears and re-appends the
@@ -405,6 +491,15 @@ Three custom exception types, all caught in `main()`:
   keys while the box is focused are handled in `_on_key` and skip disabled
   separator rows (as does the post-filter default highlight, via
   `_first_selectable_index`).
+- **Nothing in the home render path may touch the disk.** `_build_home_items`
+  runs on every `/` keystroke, and it used to call `_get_claude_sessions`
+  directly — re-parsing every JSONL transcript per character typed, which is what
+  made the filter lag behind typing. It now reads `_claude_session_data()`
+  (memoized in `_claude_cache`; invalidated by `_init_git_info` on project switch
+  and by `_show_home` on re-entry, and *refreshed* rather than bypassed by
+  `_poll_session_states` so the next keystroke renders from freshly polled data)
+  and `_is_fork()` (memoizes `_is_fork_worktree`'s `meta.json` read in
+  `_fork_marker_cache`; fork provenance never changes).
 - **Live polling**: The home screen uses `set_interval(3s)` to poll Claude JSONL logs for state changes. When a session's state changes, labels are updated in-place via `label.update()` — the screen is never cleared or rebuilt, which avoids blank-screen flicker. A snapshot dict (`path → (session_id, state)`) is compared each tick to detect changes efficiently. The timer is stopped when navigating away (`_clear_main` cancels it) and restarted by `_show_home`.
 
 ## Testing
@@ -463,6 +558,9 @@ Things discovered during development that are easy to forget:
 - **Bundled package data must be importable as a subpackage.** `templates/` has an `__init__.py` so `importlib.resources.files("fujimoto.templates")` resolves and hatchling ships the `.template` file in the wheel. Verify with `uv build --wheel && unzip -l dist/*.whl | grep templates` after touching packaged resources.
 - **Inside an `if-shell` argument a bare `;` separates tmux commands; at `bind-key` top level it must be `\;`.** The `x` binding's true branch is the single string `set-option @fujimoto_pending_action close ; detach-client`, which works because tmux re-parses that string; the `f` and `s` bindings pass `"\\;"` as its own argv element because the outer `bind-key` invocation would otherwise consume a bare `;` itself and run `detach-client` at bind time. Both forms are exercised in `tests/test_tmux.py`, and both were verified against a real tmux via a pty before being wired up.
 - **`kill_session` raises when the session is already gone**, so any code path that ends a session has to decide what that means. `_end_session` re-raises only if `session_exists` still reports the session — a session that died between being listed and being acted on is already in the state the kill was aiming for, while a kill that genuinely failed must not silently mark a live session closed.
+- **Never splice arbitrary text into a console-markup string — assemble a `Content` instead.** Search snippets are raw transcript bytes cut at arbitrary offsets, and both of these silently corrupt the row: a fragment ending in `[` swallows the tag that follows it (`[dim]{"a": [[/]` renders the literal text `{"a": [[/]`), and a fragment ending in `\` escapes it (`[dim]path\[/]` renders `path[/]`). `rich.markup.escape` does **not** save you — it only escapes a `[` that still looks like a tag *in the fragment it is given*, so `escape('{"a": [')` returns the string unchanged. `Content.assemble(("text", "style"), ...)` never parses the text at all, resolves `$theme-variables` in the style, and — unlike a nested `[b]` inside `[dim]` — does not inherit the surrounding `dim` into the highlight. See `_render_snippet`.
+- **`Static`/`Label` text in tests is read with `str(widget.render())`, not `.renderable`** — Textual 8 dropped the attribute. `render()` returns the *resolved* content, so console markup (`[dim]`, `[b]`) is gone from the string; assert on the plain text. And a `ListItem`'s own children are composed when the item mounts, so `item.query(Label)` needs an `await pilot.pause()` after a non-awaited `ListView.append`.
+- **A worker's `is_cancelled` is not a synchronisation primitive.** Cancelling a Textual worker (or letting `exclusive=True` supersede it) does not unwind work already queued on the event loop via `call_from_thread`. Anything a worker hands back must carry a generation token the handler checks — see `_search_token`. Bump the token *before* cancelling, so a batch in flight is stale from the moment the decision is made.
 - **OSC escape writes during a Textual run must go to `sys.__stdout__`, not `sys.stdout`.** Textual replaces `sys.stdout` with an internal capture while the app runs, so an OSC sequence (e.g. the `set_terminal_title` iTerm2/window-title escape) written to `sys.stdout` from inside a running app — such as `_init_git_info` updating the title on project switch — never reaches the terminal. `sys.__stdout__` stays connected to the real tty, so writing there works both before and during `app.run()`. This is why the session-manager title set at `main()` (pre-run) worked but the in-app update initially did not.
 
 ## Releases

@@ -4,11 +4,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from rich.console import Console
+
 import pytest
 
 from textual.widgets import Input, Label, ListItem, ListView, Static
 
-from fujimoto.claude import ClaudeSession, SessionState
+from fujimoto.claude import ClaudeSession, ContentMode, SessionState, Snippet
 from fujimoto.claude.log_parser import EntryType, StopReason
 from types import SimpleNamespace
 
@@ -25,8 +27,11 @@ from fujimoto.cli import (
     _claude_state_label,
     _format_prompt_lines,
     _friendly_key_label,
+    SNIPPET_MATCH_STYLE,
+    _fit_snippet,
     _get_claude_sessions,
     _relative_time,
+    _render_snippet,
     main,
 )
 from fujimoto.config import ConfigError
@@ -5041,3 +5046,1031 @@ class TestHomeListHeight:
             async with app.run_test(size=(100, rows)) as pilot:
                 await pilot.pause()
                 assert app.query_one("#home-list", ListView).size.height == expected
+
+
+# -- Transcript search (`s`) --
+
+
+_SNIPPET_TEXT = "a snippet with the needle in it"
+_SNIPPET_SPAN = (
+    _SNIPPET_TEXT.index("needle"),
+    _SNIPPET_TEXT.index("needle") + len("needle"),
+)
+
+
+def _make_hit(
+    session_id: str = "abcdef12",
+    *,
+    matches: int = 2,
+    cwd: str = "/repo/wt",
+    snippets: tuple[object, ...] | None = None,
+):
+    """A SearchHit with just enough of a ClaudeSession to render a row."""
+    from fujimoto.claude.search import SearchHit
+
+    return SearchHit(
+        session=ClaudeSession(
+            jsonl_path=Path(f"/logs/{session_id}.jsonl"),
+            session_id=session_id,
+            state=SessionState.IDLE,
+            last_entry_type=EntryType.USER,
+            stop_reason=None,
+            cwd=Path(cwd),
+            git_branch="worktree/x",
+            last_activity=datetime.now(tz=timezone.utc),
+        ),
+        match_count=matches,
+        snippets=snippets
+        if snippets is not None
+        else (Snippet(text=_SNIPPET_TEXT, spans=(_SNIPPET_SPAN,)),),
+    )
+
+
+def _write_transcript(directory: Path, name: str, text: str) -> Path:
+    import json
+
+    directory.mkdir(parents=True, exist_ok=True)
+    log = directory / f"{name}.jsonl"
+    log.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "cwd": "/repo",
+                "gitBranch": "main",
+                "timestamp": "2026-08-26T10:00:00Z",
+                "message": {"content": text},
+            }
+        )
+        + "\n"
+    )
+    return log
+
+
+class TestTranscriptSearchView:
+    @pytest.mark.asyncio
+    async def test_s_opens_the_search_view(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                assert app._on_search is True
+                assert len(app.query("#search-input")) == 1
+                assert len(app.query("#search-results")) == 1
+                assert app.focused is not None
+                assert app.focused.id == "search-input"
+
+    @pytest.mark.asyncio
+    async def test_s_is_ignored_away_from_the_home_screen(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await app._show_create_form()
+                await pilot.press("s")
+                await pilot.pause()
+                assert app._on_search is False
+
+    @pytest.mark.asyncio
+    async def test_escape_returns_to_the_home_screen(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                await app.action_go_back()
+                await pilot.pause()
+                assert app._on_search is False
+                assert len(app.query("#home-list")) == 1
+
+    @pytest.mark.asyncio
+    async def test_query_survives_leaving_and_reopening(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app.query_one("#search-input", Input).value = "needle"
+                await pilot.pause()
+                await app.action_go_back()
+                await pilot.pause()
+                await pilot.press("s")
+                await pilot.pause()
+                assert app.query_one("#search-input", Input).value == "needle"
+
+    @pytest.mark.asyncio
+    async def test_status_line_shows_the_default_modes(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                status = str(app.query_one("#search-status", Static).render())
+                assert "literal" in status
+                assert "message text" in status
+                assert app._transcript_mode is ContentMode.TEXT
+
+
+class TestTranscriptSearchModeToggles:
+    @pytest.mark.asyncio
+    async def test_ctrl_r_toggles_regex(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                await app.action_toggle_search_regex()
+                await pilot.pause()
+                assert app._transcript_regex is True
+                assert "regex" in str(app.query_one("#search-status", Static).render())
+                await app.action_toggle_search_regex()
+                await pilot.pause()
+                assert app._transcript_regex is False
+
+    @pytest.mark.asyncio
+    async def test_ctrl_t_toggles_content_mode(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                await app.action_toggle_search_mode()
+                await pilot.pause()
+                assert app._transcript_mode is ContentMode.RAW
+                assert "raw" in str(app.query_one("#search-status", Static).render())
+                await app.action_toggle_search_mode()
+                await pilot.pause()
+                assert app._transcript_mode is ContentMode.TEXT
+
+    @pytest.mark.asyncio
+    async def test_content_mode_sticks_across_reopening_the_view(self) -> None:
+        """`ctrl+t` is a preference for the session, not for one visit."""
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                await app.action_toggle_search_mode()
+                await app.action_go_back()
+                await pilot.pause()
+                await pilot.press("s")
+                await pilot.pause()
+                assert app._transcript_mode is ContentMode.RAW
+
+    @pytest.mark.asyncio
+    async def test_toggles_are_ignored_off_the_search_view(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test():
+                await app.action_toggle_search_regex()
+                await app.action_toggle_search_mode()
+                assert app._transcript_regex is False
+                assert app._transcript_mode is ContentMode.TEXT
+
+    @pytest.mark.asyncio
+    async def test_toggling_clears_stale_results(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._apply_search_batch(app._search_token, 1, 1, (_make_hit(),))
+                assert len(app.query_one("#search-results", ListView)) == 1
+                await app.action_toggle_search_regex()
+                await pilot.pause()
+                assert app._search_hits == []
+                assert len(app.query_one("#search-results", ListView)) == 0
+
+
+class TestTranscriptSearchBatches:
+    @pytest.mark.asyncio
+    async def test_batch_appends_rows_and_reports_progress(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._apply_search_batch(
+                    app._search_token, 10, 40, (_make_hit("aaa"), _make_hit("bbb"))
+                )
+                results = app.query_one("#search-results", ListView)
+                assert len(results) == 2
+                status = str(app.query_one("#search-status", Static).render())
+                assert "10/40" in status
+                assert "2 found" in status
+                # First row is highlighted so Enter works straight away.
+                assert results.index == 0
+
+    @pytest.mark.asyncio
+    async def test_final_batch_reports_a_summary(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._apply_search_batch(app._search_token, 7, 7, (_make_hit(),))
+                status = str(app.query_one("#search-status", Static).render())
+                assert "1 session of 7 matched" in status
+
+    @pytest.mark.asyncio
+    async def test_no_transcripts_is_reported(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._apply_search_batch(app._search_token, 0, 0, ())
+                status = str(app.query_one("#search-status", Static).render())
+                assert "no transcripts" in status
+
+    @pytest.mark.asyncio
+    async def test_stale_batches_are_dropped(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._apply_search_batch(app._search_token - 1, 5, 5, (_make_hit(),))
+                assert len(app.query_one("#search-results", ListView)) == 0
+
+    @pytest.mark.asyncio
+    async def test_batches_are_dropped_after_leaving_the_view(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                token = app._search_token
+                await app.action_go_back()
+                await pilot.pause()
+                app._apply_search_batch(token, 5, 5, (_make_hit(),))
+                assert app._search_hits == []
+
+    @pytest.mark.asyncio
+    async def test_row_shows_match_count_branch_and_snippet(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._apply_search_batch(
+                    app._search_token, 1, 1, (_make_hit("abcdef12", matches=3),)
+                )
+                await pilot.pause()
+                item = app.query_one("#search-results", ListView).children[0]
+                text = " ".join(str(label.render()) for label in item.query(Label))
+                assert "wt" in text
+                assert "3 matches" in text
+                assert "worktree/x" in text
+                assert "needle" in text
+
+    @pytest.mark.asyncio
+    async def test_single_match_is_not_pluralised(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._apply_search_batch(
+                    app._search_token, 1, 1, (_make_hit(matches=1),)
+                )
+                await pilot.pause()
+                item = app.query_one("#search-results", ListView).children[0]
+                text = " ".join(str(label.render()) for label in item.query(Label))
+                assert "1 match" in text
+                assert "1 matches" not in text
+
+    @pytest.mark.asyncio
+    async def test_long_snippets_are_truncated_to_the_panel_width(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                long_hit = _make_hit(
+                    matches=1,
+                    snippets=(Snippet(text="z" * 500, spans=((0, 1),)),),
+                )
+                app._apply_search_batch(app._search_token, 1, 1, (long_hit,))
+                await pilot.pause()
+                item = app.query_one("#search-results", ListView).children[0]
+                snippet_label = str(item.query(Label)[1].render())
+                assert snippet_label.endswith("…")
+                assert len(snippet_label) < 500
+
+
+class TestTranscriptSearchQuery:
+    @pytest.mark.asyncio
+    async def test_short_query_does_not_start_a_scan(self) -> None:
+        app = SessionApp()
+        with (
+            _patch_git_info(),
+            patch("fujimoto.cli.claude_search.list_session_logs") as mock_list,
+        ):
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app.query_one("#search-input", Input).value = "n"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                mock_list.assert_not_called()
+                status = str(app.query_one("#search-status", Static).render())
+                assert "at least 2 characters" in status
+
+    @pytest.mark.asyncio
+    async def test_keystrokes_are_debounced_into_one_scan(self) -> None:
+        app = SessionApp()
+        with (
+            _patch_git_info(),
+            patch(
+                "fujimoto.cli.claude_search.list_session_logs", return_value=[]
+            ) as mock_list,
+        ):
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                search_input = app.query_one("#search-input", Input)
+                for value in ("ne", "nee", "need", "needle"):
+                    search_input.value = value
+                    await pilot.pause()
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert mock_list.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_invalid_regex_is_reported_without_crashing(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._transcript_regex = True
+                app.query_one("#search-input", Input).value = "(unclosed"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                status = str(app.query_one("#search-status", Static).render())
+                assert "invalid regex" in status
+
+    @pytest.mark.asyncio
+    async def test_enter_moves_focus_to_the_results(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._apply_search_batch(app._search_token, 1, 1, (_make_hit(),))
+                app.query_one("#search-input", Input).focus()
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app.focused is not None
+                assert app.focused.id == "search-results"
+
+
+class TestTranscriptSearchEndToEnd:
+    @pytest.mark.asyncio
+    async def test_matching_transcript_becomes_a_result_row(
+        self, tmp_path: Path
+    ) -> None:
+        projects = tmp_path / "projects"
+        _write_transcript(projects / "-fake-repo", "sess-a", "the needle is here")
+        _write_transcript(projects / "-fake-repo", "sess-b", "only hay in this one")
+
+        app = SessionApp()
+        with (
+            _patch_git_info(),
+            patch(
+                "fujimoto.claude.search.get_claude_projects_dir",
+                return_value=projects,
+            ),
+        ):
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app.query_one("#search-input", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert len(app._search_hits) == 1
+                assert app._search_hits[0].session.session_id == "sess-a"
+                status = str(app.query_one("#search-status", Static).render())
+                assert "1 session of 2 matched" in status
+
+    @pytest.mark.asyncio
+    async def test_default_mode_excludes_json_scaffolding_and_ctrl_t_finds_it(
+        self, tmp_path: Path
+    ) -> None:
+        projects = tmp_path / "projects"
+        _write_transcript(projects / "-fake-repo", "sess-a", "nothing relevant")
+
+        app = SessionApp()
+        with (
+            _patch_git_info(),
+            patch(
+                "fujimoto.claude.search.get_claude_projects_dir",
+                return_value=projects,
+            ),
+        ):
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                # `gitBranch` exists only as a JSON key, so the default
+                # message-text mode must not match it.
+                app.query_one("#search-input", Input).value = "gitBranch"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert app._search_hits == []
+
+                # ctrl+t drops to raw, which sees the scaffolding.
+                await app.action_toggle_search_mode()
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert len(app._search_hits) == 1
+
+    @pytest.mark.asyncio
+    async def test_worktree_transcripts_are_searched_too(self, tmp_path: Path) -> None:
+        projects = tmp_path / "projects"
+        worktree = tmp_path / "wt" / "20260826-thing"
+        _write_transcript(
+            projects / str(worktree).replace("/", "-"), "wt-sess", "needle in worktree"
+        )
+
+        app = SessionApp()
+        with (
+            _patch_git_info(worktrees=[worktree]),
+            patch(
+                "fujimoto.claude.search.get_claude_projects_dir",
+                return_value=projects,
+            ),
+        ):
+            async with app.run_test() as pilot:
+                # `_patch_git_info` materializes worktrees under its own root,
+                # so point the app at the path the transcript was written for.
+                app._existing_worktrees = [worktree]
+                await pilot.press("s")
+                await pilot.pause()
+                app.query_one("#search-input", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert [h.session.session_id for h in app._search_hits] == ["wt-sess"]
+
+
+class TestTranscriptSearchSelection:
+    @pytest.mark.asyncio
+    async def test_selecting_a_result_opens_the_session_actions_menu(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._apply_search_batch(app._search_token, 1, 1, (_make_hit("abc123"),))
+                results = app.query_one("#search-results", ListView)
+                results.focus()
+                results.index = 0
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#session-actions")) == 1
+                assert app._actions_from_search is True
+                assert app._selected_session is not None
+                assert app._selected_session.claude_session_id == "abc123"
+                assert app._selected_session.session_type == "claude"
+                assert app._selected_session.path == Path("/repo/wt")
+
+    @pytest.mark.asyncio
+    async def test_cancel_returns_to_the_results(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._apply_search_batch(app._search_token, 1, 1, (_make_hit(),))
+                await app._show_session_actions(
+                    app._search_result_map["sr-0"], from_search=True
+                )
+                await pilot.pause()
+                actions = app.query_one("#session-actions", ListView)
+                actions.index = [
+                    i
+                    for i, item in enumerate(actions.children)
+                    if item.id == "sa-cancel"
+                ][0]
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._on_search is True
+                # The hits are re-rendered rather than rescanned.
+                assert len(app.query_one("#search-results", ListView)) == 1
+                status = str(app.query_one("#search-status", Static).render())
+                assert "1 session matched" in status
+
+    @pytest.mark.asyncio
+    async def test_escape_from_actions_returns_to_the_results(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._apply_search_batch(app._search_token, 1, 1, (_make_hit(),))
+                await app._show_session_actions(
+                    app._search_result_map["sr-0"], from_search=True
+                )
+                await pilot.pause()
+                await app.action_go_back()
+                await pilot.pause()
+                assert app._on_search is True
+                assert len(app.query_one("#search-results", ListView)) == 1
+
+    @pytest.mark.asyncio
+    async def test_actions_opened_from_home_still_return_home(self) -> None:
+        app = SessionApp()
+        session = SessionInfo(
+            name="direct-1",
+            session_type="direct",
+            project="test-proj",
+            path=Path("/fake/repo"),
+            tmux_session="test-proj/direct-1",
+            is_active=True,
+            branch="feat/test",
+        )
+        with _patch_git_info(sessions=["test-proj/direct-1"]):
+            async with app.run_test() as pilot:
+                await app._show_session_actions(session)
+                await pilot.pause()
+                assert app._actions_from_search is False
+                await app.action_go_back()
+                await pilot.pause()
+                assert len(app.query("#home-list")) == 1
+
+    @pytest.mark.asyncio
+    async def test_resuming_a_result_launches_with_its_session_id(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._apply_search_batch(app._search_token, 1, 1, (_make_hit("xyz789"),))
+                await app._show_session_actions(
+                    app._search_result_map["sr-0"], from_search=True
+                )
+                await pilot.pause()
+                actions = app.query_one("#session-actions", ListView)
+                actions.index = [
+                    i
+                    for i, item in enumerate(actions.children)
+                    if item.id == "sa-resume"
+                ][0]
+                await pilot.press("enter")
+                await pilot.pause()
+        assert app._launch_target is not None
+        assert app._launch_target.resume_session_id == "xyz789"
+        assert app._launch_target.working_dir == Path("/repo/wt")
+
+
+class TestHomeFilterCaching:
+    @pytest.mark.asyncio
+    async def test_filter_keystrokes_do_not_reparse_transcripts(self) -> None:
+        """The `/` filter must not re-read every JSONL log per keystroke."""
+        calls: list[Path] = []
+
+        def _sessions_for(path: Path) -> list[ClaudeSession]:
+            calls.append(path)
+            return []
+
+        app = SessionApp()
+        with _patch_git_info(claude_sessions_fn=_sessions_for):
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app._stop_polling()  # keep the 3s poller out of the count
+                baseline = len(calls)
+                await pilot.press("slash")
+                await pilot.pause()
+                search = app.query_one("#home-search", Input)
+                for value in ("a", "ab", "abc"):
+                    search.value = value
+                    await pilot.pause()
+                assert len(calls) == baseline
+
+    @pytest.mark.asyncio
+    async def test_reopening_home_refetches_transcripts(self) -> None:
+        calls: list[Path] = []
+
+        def _sessions_for(path: Path) -> list[ClaudeSession]:
+            calls.append(path)
+            return []
+
+        app = SessionApp()
+        with _patch_git_info(claude_sessions_fn=_sessions_for):
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app._stop_polling()
+                baseline = len(calls)
+                await app._show_create_form()
+                await app._show_home()
+                app._stop_polling()
+                await pilot.pause()
+                assert len(calls) > baseline
+
+    @pytest.mark.asyncio
+    async def test_poller_refreshes_the_render_cache(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app._claude_cache = None
+                await app._poll_session_states()
+                assert app._claude_cache is not None
+
+    @pytest.mark.asyncio
+    async def test_fork_marker_is_read_once_per_worktree(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260826-thing"
+        wt.mkdir()
+        app = SessionApp()
+        with (
+            _patch_git_info(worktrees=[wt]),
+            patch("fujimoto.cli._is_fork_worktree", return_value=False) as mock_fork,
+        ):
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app._stop_polling()
+                baseline = mock_fork.call_count
+                assert baseline >= 1
+                await app._refresh_home_list()
+                await app._refresh_home_list()
+                await pilot.pause()
+                assert mock_fork.call_count == baseline
+
+
+class TestTranscriptSearchGuards:
+    @pytest.mark.asyncio
+    async def test_action_is_a_no_op_off_the_home_screen(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await app._show_create_form()
+                await pilot.pause()
+                await app.action_session_search()
+                await pilot.pause()
+                assert app._on_search is False
+                assert len(app.query("#search-input")) == 0
+
+    @pytest.mark.asyncio
+    async def test_restore_does_not_rescan_the_same_query(self) -> None:
+        """Remounting the box with a preserved query must not wipe the hits."""
+        app = SessionApp()
+        with (
+            _patch_git_info(),
+            patch(
+                "fujimoto.cli.claude_search.list_session_logs", return_value=[]
+            ) as mock_list,
+        ):
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._transcript_query = "needle"
+                app._apply_search_batch(app._search_token, 1, 1, (_make_hit(),))
+                await pilot.pause()
+                await app._show_session_search(restore=True)
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert len(app._search_hits) == 1
+                mock_list.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_batch_arriving_after_the_list_is_gone_is_ignored(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                # Still "on search" as far as the flags go, but the widget has
+                # been removed — as happens between a teardown and its batch.
+                await app.query_one("#search-results").remove()
+                app._apply_search_batch(app._search_token, 1, 1, (_make_hit(),))
+                assert app._search_hits == []
+
+    @pytest.mark.asyncio
+    async def test_stale_regex_error_is_not_shown(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._search_failed(app._search_token - 1, "invalid regex: nope")
+                status = str(app.query_one("#search-status", Static).render())
+                assert "invalid regex" not in status
+
+
+# -- Snippet highlighting --
+
+
+def _styled(content) -> list[tuple[str, str]]:
+    """(text, style) pairs of a Content, in reading order."""
+    return [(content.plain[sp.start : sp.end], sp.style) for sp in content.spans]
+
+
+class TestRenderSnippet:
+    def test_match_is_highlighted_and_context_is_dimmed(self) -> None:
+        content = _render_snippet(Snippet(text="say needle now", spans=((4, 10),)), 80)
+        assert content.plain == "say needle now"
+        assert _styled(content) == [
+            ("say ", "dim"),
+            ("needle", SNIPPET_MATCH_STYLE),
+            (" now", "dim"),
+        ]
+
+    def test_every_span_is_highlighted(self) -> None:
+        content = _render_snippet(
+            Snippet(text="needle and needle", spans=((0, 6), (11, 17))), 80
+        )
+        highlighted = [
+            t for t, style in _styled(content) if style == SNIPPET_MATCH_STYLE
+        ]
+        assert highlighted == ["needle", "needle"]
+
+    def test_match_at_the_start_emits_no_leading_context(self) -> None:
+        content = _render_snippet(Snippet(text="needle b", spans=((0, 6),)), 80)
+        assert _styled(content)[0] == ("needle", SNIPPET_MATCH_STYLE)
+
+    def test_match_at_the_end_emits_no_trailing_context(self) -> None:
+        content = _render_snippet(Snippet(text="a needle", spans=((2, 8),)), 80)
+        assert _styled(content)[-1] == ("needle", SNIPPET_MATCH_STYLE)
+
+    def test_snippet_with_no_spans_is_all_dim(self) -> None:
+        content = _render_snippet(Snippet(text="no match here", spans=()), 80)
+        assert _styled(content) == [("no match here", "dim")]
+
+    def test_empty_snippet_renders_nothing(self) -> None:
+        assert _render_snippet(Snippet(text="", spans=()), 80).plain == ""
+
+    def test_text_is_never_parsed_as_markup(self) -> None:
+        """Transcript bytes are full of brackets; none of it may become a tag."""
+        raw = '{"a": [needle]}'
+        content = _render_snippet(Snippet(text=raw, spans=((7, 13),)), 80)
+        assert content.plain == raw
+        assert ("needle", SNIPPET_MATCH_STYLE) in _styled(content)
+
+    def test_a_fragment_ending_in_a_bracket_keeps_its_styling(self) -> None:
+        """The failure mode markup splicing has: `[` swallows the closing tag."""
+        content = _render_snippet(Snippet(text="x[needle", spans=((2, 8),)), 80)
+        assert content.plain == "x[needle"
+        assert _styled(content) == [("x[", "dim"), ("needle", SNIPPET_MATCH_STYLE)]
+
+    def test_a_fragment_ending_in_a_backslash_keeps_its_styling(self) -> None:
+        """The other markup-splicing failure mode: `\\` escapes the closing tag."""
+        content = _render_snippet(Snippet(text="path\\ needle", spans=((6, 12),)), 80)
+        assert content.plain == "path\\ needle"
+        assert ("needle", SNIPPET_MATCH_STYLE) in _styled(content)
+
+
+class TestFitSnippet:
+    def test_short_snippet_is_untouched(self) -> None:
+        snippet = Snippet(text="a needle b", spans=((2, 8),))
+        assert _fit_snippet(snippet, 80) == ("a needle b", ((2, 8),))
+
+    def test_match_beyond_the_width_is_kept_on_screen(self) -> None:
+        """A plain right-truncation would cut the match off entirely."""
+        text = "x" * 100 + "needle" + "y" * 100
+        fitted, spans = _fit_snippet(Snippet(text=text, spans=((100, 106),)), 40)
+        assert len(fitted) <= 40
+        assert len(spans) == 1
+        start, end = spans[0]
+        assert fitted[start:end] == "needle"
+
+    def test_truncation_marks_both_elided_ends(self) -> None:
+        text = "x" * 100 + "needle" + "y" * 100
+        fitted, _ = _fit_snippet(Snippet(text=text, spans=((100, 106),)), 40)
+        assert fitted.startswith("…")
+        assert fitted.endswith("…")
+
+    def test_match_near_the_start_keeps_the_left_edge(self) -> None:
+        text = "needle" + "y" * 200
+        fitted, spans = _fit_snippet(Snippet(text=text, spans=((0, 6),)), 40)
+        assert not fitted.startswith("…")
+        assert fitted.endswith("…")
+        assert fitted[spans[0][0] : spans[0][1]] == "needle"
+
+    def test_match_near_the_end_keeps_the_right_edge(self) -> None:
+        text = "x" * 200 + "needle"
+        fitted, spans = _fit_snippet(Snippet(text=text, spans=((200, 206),)), 40)
+        assert fitted.startswith("…")
+        assert not fitted.endswith("…")
+        assert fitted[spans[0][0] : spans[0][1]] == "needle"
+
+    def test_spans_scrolled_out_of_the_window_are_dropped(self) -> None:
+        text = "needle" + "-" * 300 + "needle"
+        fitted, spans = _fit_snippet(Snippet(text=text, spans=((0, 6), (306, 312))), 40)
+        assert len(spans) == 1
+        assert fitted[spans[0][0] : spans[0][1]] == "needle"
+
+    def test_no_spans_still_truncates(self) -> None:
+        fitted, spans = _fit_snippet(Snippet(text="z" * 200, spans=()), 40)
+        assert len(fitted) <= 40
+        assert spans == ()
+
+    @pytest.mark.parametrize("width", [10, 20, 40, 80, 120])
+    def test_every_span_remains_inside_the_fitted_text(self, width: int) -> None:
+        """Whatever the window, a span must never index past the text."""
+        import re
+
+        text = "".join("needle" if i % 7 == 0 else "-" * 6 for i in range(40))
+        spans = tuple((m.start(), m.end()) for m in re.finditer("needle", text))
+        fitted, fitted_spans = _fit_snippet(Snippet(text=text, spans=spans), width)
+        assert len(fitted) <= width
+        for start, end in fitted_spans:
+            assert 0 <= start < end <= len(fitted)
+            assert fitted[start:end] == "needle"
+
+    @pytest.mark.parametrize("width", [10, 20, 40, 80])
+    def test_the_first_match_is_always_visible(self, width: int) -> None:
+        text = "-" * 500 + "needle" + "-" * 500
+        fitted, spans = _fit_snippet(Snippet(text=text, spans=((500, 506),)), width)
+        assert spans, f"first match lost at width {width}"
+        assert fitted[spans[0][0] : spans[0][1]] == "needle"
+
+
+class TestHighlightedResultRows:
+    @pytest.mark.asyncio
+    async def test_result_row_highlights_the_match(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._apply_search_batch(app._search_token, 1, 1, (_make_hit(),))
+                await pilot.pause()
+                item = app.query_one("#search-results", ListView).children[0]
+                content = item.query(Label)[1].render()
+                assert content.plain == _SNIPPET_TEXT
+                # Resolve through a real render so the assertion covers the
+                # theme lookup of `$warning`, not just the style string.
+                segments = [
+                    (seg.text, seg.style)
+                    for seg in Console().render(content)
+                    if seg.text.strip()
+                ]
+                highlighted = [t for t, style in segments if style and style.bold]
+                assert highlighted == ["needle"]
+                for text, style in segments:
+                    if text == "needle":
+                        # The highlight must not inherit the surrounding dim,
+                        # which would wash its colour out.
+                        assert not style.dim
+                        assert style.color is not None
+                    else:
+                        assert style.dim
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_scan_highlights_the_typed_term(
+        self, tmp_path: Path
+    ) -> None:
+        projects = tmp_path / "projects"
+        _write_transcript(projects / "-fake-repo", "sess-a", "the NeEdLe is here")
+
+        app = SessionApp()
+        with (
+            _patch_git_info(),
+            patch(
+                "fujimoto.claude.search.get_claude_projects_dir",
+                return_value=projects,
+            ),
+        ):
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app.query_one("#search-input", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert len(app._search_hits) == 1
+                snippet = app._search_hits[0].snippets[0]
+                start, end = snippet.spans[0]
+                # Matching is case-insensitive, so the span covers the text as
+                # it was written, not as it was typed.
+                assert snippet.text[start:end] == "NeEdLe"
+
+
+class TestTranscriptSearchCaseToggle:
+    @pytest.mark.asyncio
+    async def test_default_is_case_insensitive(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                assert app._transcript_case_sensitive is False
+                assert "ignore case" in str(
+                    app.query_one("#search-status", Static).render()
+                )
+
+    @pytest.mark.asyncio
+    async def test_ctrl_i_toggles_case_sensitivity(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                await pilot.press("ctrl+i")
+                await pilot.pause()
+                assert app._transcript_case_sensitive is True
+                assert "match case" in str(
+                    app.query_one("#search-status", Static).render()
+                )
+                await pilot.press("ctrl+i")
+                await pilot.pause()
+                assert app._transcript_case_sensitive is False
+
+    @pytest.mark.asyncio
+    async def test_tab_does_not_toggle_case(self) -> None:
+        """Ctrl+I shares a byte with Tab; a Tab must not flip the mode."""
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                await pilot.press("tab")
+                await pilot.pause()
+                assert app._transcript_case_sensitive is False
+
+    @pytest.mark.asyncio
+    async def test_toggle_is_ignored_off_the_search_view(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test():
+                await app.action_toggle_search_case()
+                assert app._transcript_case_sensitive is False
+
+    @pytest.mark.asyncio
+    async def test_toggling_case_clears_stale_results(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._apply_search_batch(app._search_token, 1, 1, (_make_hit(),))
+                await pilot.pause()
+                await app.action_toggle_search_case()
+                await pilot.pause()
+                assert app._search_hits == []
+
+    @pytest.mark.asyncio
+    async def test_case_choice_sticks_across_reopening_the_view(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                await app.action_toggle_search_case()
+                await app.action_go_back()
+                await pilot.pause()
+                await pilot.press("s")
+                await pilot.pause()
+                assert app._transcript_case_sensitive is True
+
+    @pytest.mark.asyncio
+    async def test_all_three_modes_are_shown_together(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                await app.action_toggle_search_regex()
+                await app.action_toggle_search_mode()
+                await app.action_toggle_search_case()
+                await pilot.pause()
+                status = str(app.query_one("#search-status", Static).render())
+                assert "regex" in status
+                assert "raw" in status
+                assert "match case" in status
+
+    @pytest.mark.asyncio
+    async def test_case_sensitive_scan_excludes_a_differently_cased_hit(
+        self, tmp_path: Path
+    ) -> None:
+        projects = tmp_path / "projects"
+        _write_transcript(projects / "-fake-repo", "sess-a", "the NeEdLe is here")
+
+        app = SessionApp()
+        with (
+            _patch_git_info(),
+            patch(
+                "fujimoto.claude.search.get_claude_projects_dir",
+                return_value=projects,
+            ),
+        ):
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app.query_one("#search-input", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert len(app._search_hits) == 1
+
+                await app.action_toggle_search_case()
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert app._search_hits == []

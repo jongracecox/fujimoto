@@ -304,19 +304,67 @@ one you want to sit in from the list.
 is untouched and the conversation resumes where it left off. Any task claude
 was part-way through is interrupted, so stop at a natural break.
 
-#### Searching sessions
+#### Filtering sessions by name — `/`
 
-Press `/` on the home screen to open a search box, then type to filter. Matching
-is live and case-insensitive, against session names and branch names, and covers
-the **sessions** (running and stopped), **inactive worktrees** and **previous
-claude sessions** lists at once. While a filter is active the action rows (`+ New …`, settings,
-switch project) are hidden so only matches remain.
+Press `/` on the home screen to open a filter box, then type. Matching is live
+and case-insensitive, against session names and branch names, and covers the
+**sessions** (running and stopped), **inactive worktrees** and **previous claude
+sessions** lists at once. While a filter is active the action rows
+(`+ New …`, settings, switch project) are hidden so only matches remain.
 
-| Key | While searching |
+| Key | While filtering |
 |-----|-----------------|
 | `Enter` | Apply the filter and move to the filtered list |
-| `↑` / `↓` | Move the highlight without leaving the search box |
+| `↑` / `↓` | Move the highlight without leaving the filter box |
 | `Escape` | Clear the filter and return to the full list |
+
+#### Searching inside conversations — `s`
+
+`/` matches session *names*. Press `s` to search what was actually *said and
+done* — the full transcript of every Claude session for the project, including
+its worktrees. Useful for "which session was I fixing the auth timeout in?"
+when you no longer remember what you called it.
+
+Because that means reading every conversation log on disk, the scan runs in the
+background in batches of ten and results appear as they are found, most recently
+used session first. Typing never waits for it: the query is debounced, and
+changing it cancels the scan in flight rather than queueing another.
+
+Each result shows the session's directory, branch, age, how many times the query
+appears, and up to three snippets of context with **every match highlighted** —
+including matches that differ in case from what you typed. Snippets are picked
+from different parts of the conversation rather than three views of the same
+paragraph, and on a narrow terminal the snippet scrolls to keep the match on
+screen instead of truncating it away. Select a result to get the usual actions —
+Resume, Open terminal, Open in VS Code — and `Escape` or Cancel comes back to
+the same results rather than throwing the scan away.
+
+Three independent modes, all toggled live (the current settings are shown above
+the results, and flipping one rescans):
+
+| Key | Toggles | Options |
+|-----|---------|---------|
+| `Ctrl+R` | how the query is read | **literal** (default) — punctuation and brackets are taken at face value · **regex** — a Python regular expression |
+| `Ctrl+T` | what is searched | **message text** (default) — only what you and Claude typed at each other · **raw** — the whole transcript, so tool commands, tool output, file contents and paths all match |
+| `Ctrl+I` | letter case | **ignore case** (default) · **match case** — applies to literal and regex queries alike |
+
+> `Ctrl+I` needs a terminal that supports the kitty keyboard protocol (kitty,
+> WezTerm, Ghostty, foot, Alacritty, recent iTerm2). Older terminals such as
+> macOS Terminal.app send Ctrl+I as a plain Tab, so the toggle won't fire there.
+
+Message text is the default because it
+is the quieter of the two — a common word won't match JSON keys, session uuids
+or tool noise — and in practice the faster, since the only files it parses are
+the ones that survive a single whole-file scan. Reach for raw (`Ctrl+T`) when you
+want a command you ran, a filename you touched, or anything a tool printed;
+the mode then sticks until you change it or restart.
+
+| Key | While searching transcripts |
+|-----|-----------------------------|
+| `Enter` (in the box) | Move to the results; the scan keeps running |
+| `Enter` (on a result) | Open that session's actions |
+| `Ctrl+R` / `Ctrl+T` / `Ctrl+I` | Toggle regex / message-text-vs-raw / match-case |
+| `Escape` | Back to the home screen (the query is kept for next time) |
 
 
 ### Three Session Types
@@ -409,8 +457,9 @@ These options are set per-session and don't affect your global tmux config.
 | Key | Action |
 |-----|--------|
 | `Enter` | Select |
-| `/` | Search sessions (home screen) |
-| `Escape` | Back (or quit from home; clears an active search first) |
+| `/` | Filter sessions by name (home screen) |
+| `s` | Search inside session transcripts (home screen) |
+| `Escape` | Back (or quit from home; clears an active filter first) |
 | `q` | Quit |
 | Arrow keys | Navigate |
 

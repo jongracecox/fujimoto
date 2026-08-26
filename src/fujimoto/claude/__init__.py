@@ -11,15 +11,37 @@ from fujimoto.claude.log_parser import (
     get_sessions_for_path,
     parse_session,
 )
+from fujimoto.claude.search import (
+    DEFAULT_BATCH_SIZE,
+    ContentMode,
+    Matcher,
+    SearchError,
+    SearchHit,
+    Snippet,
+    compile_matcher,
+    iter_hits,
+    list_session_logs,
+    search_log,
+)
 
 __all__ = [
+    "DEFAULT_BATCH_SIZE",
     "ClaudeLogError",
     "ClaudeSession",
+    "ContentMode",
     "EntryType",
+    "Matcher",
+    "SearchError",
+    "SearchHit",
+    "Snippet",
     "SessionState",
     "StopReason",
+    "compile_matcher",
     "encode_project_path",
     "get_claude_projects_dir",
     "get_sessions_for_path",
+    "iter_hits",
+    "list_session_logs",
     "parse_session",
+    "search_log",
 ]
