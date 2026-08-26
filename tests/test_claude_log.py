@@ -453,3 +453,24 @@ class TestClaudeSessionIsActive:
 
     def test_unknown_is_not_active(self) -> None:
         assert self._build_session(SessionState.UNKNOWN).is_active is False
+
+
+def test_parse_session_skips_non_object_json_lines(tmp_path):
+    """A valid JSON line that isn't an object must not crash the parse."""
+    log = tmp_path / "a.jsonl"
+    log.write_text(
+        "[1, 2, 3]\n"
+        '"a bare string"\n'
+        + json.dumps(
+            {
+                "type": "user",
+                "cwd": "/repo",
+                "timestamp": "2026-08-26T10:00:00Z",
+                "message": {"content": "hello"},
+            }
+        )
+        + "\n"
+    )
+    session = parse_session(log)
+    assert session.state == SessionState.WORKING
+    assert session.cwd == Path("/repo")

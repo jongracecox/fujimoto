@@ -149,6 +149,11 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
         except json.JSONDecodeError:
             continue
 
+        # A valid JSON line need not be an object; anything else has no entry
+        # type to dispatch on, so skip it rather than crash the whole parse.
+        if not isinstance(entry, dict):
+            continue
+
         raw_type = entry.get("type", "")
 
         if raw_type in _SESSION_END_TYPES:
