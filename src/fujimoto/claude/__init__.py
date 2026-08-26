@@ -6,10 +6,12 @@ from fujimoto.claude.log_parser import (
     EntryType,
     SessionState,
     StopReason,
+    TranscriptMessage,
     encode_project_path,
     get_claude_projects_dir,
     get_sessions_for_path,
     parse_session,
+    read_transcript,
 )
 from fujimoto.claude.search import (
     DEFAULT_BATCH_SIZE,
@@ -36,6 +38,7 @@ __all__ = [
     "Snippet",
     "SessionState",
     "StopReason",
+    "TranscriptMessage",
     "compile_matcher",
     "encode_project_path",
     "get_claude_projects_dir",
@@ -43,5 +46,6 @@ __all__ = [
     "iter_hits",
     "list_session_logs",
     "parse_session",
+    "read_transcript",
     "search_log",
 ]

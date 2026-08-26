@@ -312,6 +312,8 @@ pydantic):
 - `get_claude_projects_dir()` — `~/.claude/projects`
 - `parse_session(jsonl_path)` — reads JSONL, tracks last meaningful (non-sidechain) entry, derives state. Skips lines that parse to a non-dict (a bare list or string is valid JSON but has no entry type), which previously raised `AttributeError` out of `get_sessions_for_path` and into the home screen.
 - `get_sessions_for_path(project_path)` — encodes path, globs `*.jsonl`, returns sorted sessions
+- `TranscriptMessage` — frozen dataclass: `role`, `text`, `timestamp`. `role` is one of `user`, `assistant`, `thinking`, `tool_use`, `tool_result` — the last three come from *content blocks*, not entry types
+- `read_transcript(jsonl_path)` — reads a log into an ordered `list[TranscriptMessage]` for the read-only viewer. Skips sidechain (sub-agent), meta and unrecognized entries; clips tool inputs/results to 20 lines / 2000 chars (`_clip`) since whole-file payloads are unreadable in a TUI
 
 **`claude/search.py`** — Full-text search over transcript *contents* (as opposed
 to the home screen's name filter). UI-free and synchronous; the caller is
@@ -331,8 +333,8 @@ responsible for running it off the event loop.
 - `LaunchTarget` — `NamedTuple` describing what `main()` should launch: `(project, working_dir, tmux_name, session_type, resume_session_id, forked_from_session_id, forked_from_worktree)`. A `NamedTuple` rather than a dataclass so existing index-based access keeps working.
 - `SessionApp` — main app class with CSS styling
 - Module-level helpers: `_claude_state_label(state)`, `_relative_time(dt)`, `_get_claude_sessions(root, worktrees)`, `_is_fork_worktree(path)`, `_build_fork_system_prompt(project, working_dir, parent_worktree, base_branch)`, `_fit_snippet(snippet, max_width)` / `_render_snippet(snippet, max_width)` (search-result snippet rendering — see the `Content.assemble` gotcha)
-- Instance helpers: `_build_session_label(session, state_suffix)` — the single source of truth for session row text (including the 🍴 fork marker), used by `_show_home`'s initial render of worktree rows and by `_poll_session_states` for in-place updates; `_build_claude_session_items(sessions, prefix)` — shared row rendering for the resume (`rp-*`) and fork (`fp-*`) pickers
-- Views: home (sessions list), session actions submenu, terminate/stop prompt (`#terminate-prompt`, opened by a pending `close` from `Ctrl-A x`; Terminate / Stop / Cancel with Terminate highlighted so Enter matches the `confirm-before` it replaces, and Cancel re-attaching via `_launch_target` so it costs nothing), finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), fork title form, fork branch select, fork session picker, conflict resolution, project switcher (with autocomplete filter), tmux install, error
+- Instance helpers: `_build_session_label(session, state_suffix)` — the single source of truth for session row text (including the 🍴 fork marker), used by `_show_home`'s initial render of worktree rows and by `_poll_session_states` for in-place updates; `_build_claude_session_items(sessions, prefix)` — shared row rendering for the resume (`rp-*`), fork (`fp-*`) and log-viewer (`lp-*`) pickers
+- Views: home (sessions list), session actions submenu, terminate/stop prompt (`#terminate-prompt`, opened by a pending `close` from `Ctrl-A x`; Terminate / Stop / Cancel with Terminate highlighted so Enter matches the `confirm-before` it replaces, and Cancel re-attaching via `_launch_target` so it costs nothing), finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), fork title form, fork branch select, fork session picker, session log picker + read-only log viewer, conflict resolution, project switcher (with autocomplete filter), tmux install, error
 - Transcript search (`s`) — see the dedicated section below.
 - Home screen name filter: `/` arms a filter box (`#home-search`) mounted above
   `#home-list`. `action_search` reveals + focuses it; `Input.Changed` re-renders
@@ -346,9 +348,21 @@ responsible for running it off the event loop.
   matching sessions" row.
 - Home screen sections: actions ("Restore N stopped sessions" when any exist, "New worktree session", "New session in X", "Ad hoc session"), sessions — running 🟢 *and* stopped 🟠 together, since the circle colour carries the distinction (with Claude state indicators on the running ones), inactive worktrees, previous Claude sessions (resumable, capped at 5), switch project
 - Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
-- Session actions submenu (in order): for active sessions, Connect → Fork session → Resume previous session; for inactive worktrees, Resume previous session → Fork session → Launch (resume is the more common action when picking an idle worktree). Then: Open terminal, Open in VS Code, Rename, Stop session (active only), Terminate session (active or stopped), Finish (worktree only), Cancel. Stop and Terminate are two menu items rather than one item plus a prompt — a menu is already a choice — but both route into the single `_end_session(session, terminate=...)` handler, which is also what the `Ctrl-A x` prompt calls. Claude-session items show just "Resume" + Open terminal/VS Code + Cancel. "Fork session" is always inserted at index 1 (`items.insert(1, ...)`) so its position holds across both layouts.
+- Session actions submenu (in order): for active sessions, Connect → Fork session → Resume previous session; for inactive worktrees, Resume previous session → Fork session → Launch (resume is the more common action when picking an idle worktree). Then: View session log (whenever the path has a previous Claude session), Open terminal, Open in VS Code, Rename, Stop session (active only), Terminate session (active or stopped), Finish (worktree only), Cancel. Stop and Terminate are two menu items rather than one item plus a prompt — a menu is already a choice — but both route into the single `_end_session(session, terminate=...)` handler, which is also what the `Ctrl-A x` prompt calls. Claude-session items show just "Resume" + View session log + Open terminal/VS Code + Cancel. "Fork session" is always inserted at index 1 (`items.insert(1, ...)`) so its position holds across both layouts.
 - "Resume previous session" auto-launches the sole candidate when only one previous Claude session exists for the path, skipping the picker. Two or more sessions still show the picker.
 - Fork flow: `sa-fork` → `#fork-title-input` → `#fork-branch-list` (parent branch (default) / parent's base / another branch → the shared `_show_branch_picker`) → conversation picker `#fork-picker` (`fp-{i}`, only when >1 candidate) → the shared `_finalize_create` / `_do_create_and_launch`. Offered for worktree *and* direct sessions that have at least one previous Claude session.
+- Session log viewer: `sa-viewlog` → `_show_log_picker` → `_show_session_log`. The
+  picker (`#log-picker`, rows `lp-{i}` via the shared `_build_claude_session_items`)
+  is skipped when the path has a single transcript, and for a `claude` row, which
+  already names one (matched by `session_id`). `_show_session_log` renders
+  `read_transcript` output into `#log-panel` as a pair of `Static`s per message
+  (`.log-role` + `.log-body`, coloured per role by `_TRANSCRIPT_ROLES`); bodies are
+  `Content`, not markup, for the same reason search snippets are — transcript text
+  is arbitrary bytes. `#main` is already a `VerticalScroll`, so focusing it gives
+  arrow/page/end scrolling for free, and Escape falls through to `action_go_back`,
+  which returns to the search results when the menu came from a search and to the
+  home screen otherwise. Nothing is launched — this path never sets
+  `_launch_target`.
 - Finish flow: Push & Create PR (background Claude), Cherry-pick to base, Discard & Delete
 - Open terminal flow: sub-menu with "This window" (default; uses Textual's `App.suspend()` to pause the TUI, then runs `subprocess.run([$SHELL], cwd=session.path)` as a child process — when the user types `exit`, the TUI resumes on the session actions menu) and "New window" (spawns a new iTerm/Terminal/Linux emulator window via `open_terminal()`)
 - All view transitions are `async` — `await _clear_main()` then `await mount()`
