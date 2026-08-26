@@ -219,7 +219,7 @@ Screen {
 }
 
 #home-panel {
-    height: auto;
+    height: 1fr;
 }
 
 #home-panel .section-label {
@@ -232,8 +232,7 @@ Screen {
 }
 
 #home-list {
-    height: auto;
-    max-height: 24;
+    height: 1fr;
 }
 
 #home-list > ListItem {

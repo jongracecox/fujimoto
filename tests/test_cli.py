@@ -5026,3 +5026,18 @@ class TestSessionStateBookkeeping:
                 # Otherwise it would come back as a stopped row pointing at a
                 # directory that no longer exists.
                 assert session_state.load_state() == {}
+
+
+class TestHomeListHeight:
+    """The session list fills the available screen height (no fixed cap)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("rows", "expected"), [(30, 25), (60, 55)])
+    async def test_list_grows_with_terminal_height(
+        self, rows: int, expected: int
+    ) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test(size=(100, rows)) as pilot:
+                await pilot.pause()
+                assert app.query_one("#home-list", ListView).size.height == expected
