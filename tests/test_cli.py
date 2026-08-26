@@ -6074,3 +6074,250 @@ class TestTranscriptSearchCaseToggle:
                 await app.workers.wait_for_complete()
                 await pilot.pause()
                 assert app._search_hits == []
+
+
+def _write_log(path: Path, entries: list[dict]) -> Path:
+    """Write a minimal Claude JSONL log and return its path."""
+    import json
+
+    lines = []
+    for entry in entries:
+        entry.setdefault("timestamp", "2026-03-09T12:00:00.000Z")
+        lines.append(json.dumps(entry))
+    path.write_text("\n".join(lines))
+    return path
+
+
+def _log_session(
+    log: Path, cwd: Path, session_id: str = "abc12345", minute: int = 0
+) -> ClaudeSession:
+    return ClaudeSession(
+        jsonl_path=log,
+        session_id=session_id,
+        state=SessionState.IDLE,
+        last_entry_type=EntryType.ASSISTANT,
+        stop_reason=StopReason.END_TURN,
+        cwd=cwd,
+        git_branch="worktree/20260309-test",
+        last_activity=datetime(2026, 3, 9, 12, minute, 0, tzinfo=timezone.utc),
+        title="A chat",
+        first_prompt="Do the thing",
+    )
+
+
+class TestSessionLogViewer:
+    """Reading a transcript back without starting Claude."""
+
+    @staticmethod
+    def _action_ids(app: SessionApp) -> list[str]:
+        return [i.id for i in app.query_one("#session-actions", ListView).children]
+
+    async def _open_actions(self, app: SessionApp, pilot, item_id: str) -> None:
+        home_list = app.query_one("#home-list", ListView)
+        for i, item in enumerate(home_list.children):
+            if item.id == item_id:
+                home_list.index = i
+                break
+        await pilot.press("enter")
+        await pilot.pause()
+
+    async def _select(self, app: SessionApp, pilot, list_id: str, item_id: str) -> None:
+        lst = app.query_one(list_id, ListView)
+        for i, item in enumerate(lst.children):
+            if item.id == item_id:
+                lst.index = i
+                break
+        await pilot.press("enter")
+        await pilot.pause()
+
+    @staticmethod
+    def _body_texts(app: SessionApp) -> list[str]:
+        return [str(w.visual) for w in app.query("#log-panel .log-body")]
+
+    @pytest.mark.asyncio
+    async def test_menu_item_sits_between_resume_and_terminal(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: [_fake_claude_session(wt)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                ids = self._action_ids(app)
+                assert ids.index("sa-resume-picker") < ids.index("sa-viewlog")
+                assert ids.index("sa-viewlog") < ids.index("sa-terminal")
+
+    @pytest.mark.asyncio
+    async def test_absent_without_previous_sessions(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                assert "sa-viewlog" not in self._action_ids(app)
+
+    @pytest.mark.asyncio
+    async def test_single_transcript_opens_directly(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [
+                {"type": "user", "message": {"content": "Do the thing [brackets]"}},
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "On it."}]},
+                },
+            ],
+        )
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: [_log_session(log, wt)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                await self._select(app, pilot, "#session-actions", "sa-viewlog")
+                assert len(app.query("#log-panel")) == 1
+                assert len(app.query("#log-picker")) == 0
+                # Markup in message bodies is escaped, not interpreted.
+                assert self._body_texts(app) == ["Do the thing [brackets]", "On it."]
+                # Nothing was launched — this is a read-only view.
+                assert app._launch_target is None
+
+    @pytest.mark.asyncio
+    async def test_escape_returns_home(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "hi"}}]
+        )
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: [_log_session(log, wt)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                await self._select(app, pilot, "#session-actions", "sa-viewlog")
+                await pilot.press("escape")
+                await pilot.pause()
+                assert len(app.query("#home-list")) == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_transcript_says_so(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(tmp_path / "s.jsonl", [{"type": "file-history-snapshot"}])
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: [_log_session(log, wt)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                await self._select(app, pilot, "#session-actions", "sa-viewlog")
+                rendered = " ".join(
+                    str(w.visual) for w in app.query("#log-panel Static")
+                )
+                assert "no messages" in rendered
+
+    @pytest.mark.asyncio
+    async def test_unreadable_log_shows_error(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: [_log_session(tmp_path / "gone.jsonl", wt)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                await self._select(app, pilot, "#session-actions", "sa-viewlog")
+                assert len(app.query("#log-panel")) == 0
+                assert "Error:" in " ".join(
+                    str(w.visual) for w in app.query("#main > Static")
+                )
+
+    @pytest.mark.asyncio
+    async def test_multiple_transcripts_show_picker(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        first = _write_log(
+            tmp_path / "a.jsonl", [{"type": "user", "message": {"content": "first"}}]
+        )
+        second = _write_log(
+            tmp_path / "b.jsonl", [{"type": "user", "message": {"content": "second"}}]
+        )
+        candidates = [
+            _log_session(first, wt, "aaa11111", minute=1),
+            _log_session(second, wt, "bbb22222", minute=0),
+        ]
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: candidates,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                await self._select(app, pilot, "#session-actions", "sa-viewlog")
+                assert len(app.query("#log-picker")) == 1
+                await self._select(app, pilot, "#log-picker", "lp-1")
+                assert self._body_texts(app) == ["second"]
+
+    @pytest.mark.asyncio
+    async def test_picker_cancel_returns_to_actions(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "a.jsonl", [{"type": "user", "message": {"content": "hi"}}]
+        )
+        candidates = [
+            _log_session(log, wt, "aaa11111", minute=1),
+            _log_session(log, wt, "bbb22222", minute=0),
+        ]
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: candidates,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                await self._select(app, pilot, "#session-actions", "sa-viewlog")
+                await self._select(app, pilot, "#log-picker", "lp-cancel")
+                assert "sa-viewlog" in self._action_ids(app)
+
+    @pytest.mark.asyncio
+    async def test_claude_row_opens_its_own_transcript(self, tmp_path: Path) -> None:
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [{"type": "user", "message": {"content": "from the claude row"}}],
+        )
+        cs = _log_session(log, tmp_path, "ccc33333")
+        with _patch_git_info(claude_sessions_fn=lambda _p: [cs]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, f"cs-{cs.session_id}")
+                await self._select(app, pilot, "#session-actions", "sa-viewlog")
+                assert self._body_texts(app) == ["from the claude row"]
+
+    @pytest.mark.asyncio
+    async def test_claude_row_without_matching_log_errors(self, tmp_path: Path) -> None:
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "hi"}}]
+        )
+        cs = _log_session(log, tmp_path, "ccc33333")
+        with _patch_git_info(claude_sessions_fn=lambda _p: [cs]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, f"cs-{cs.session_id}")
+                # The row's transcript disappears between listing and viewing.
+                with patch("fujimoto.cli.get_sessions_for_path", return_value=[]):
+                    await self._select(app, pilot, "#session-actions", "sa-viewlog")
+                assert "Session log not found" in " ".join(
+                    str(w.visual) for w in app.query("#main > Static")
+                )

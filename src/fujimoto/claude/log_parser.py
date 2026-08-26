@@ -295,3 +295,117 @@ def _parse_timestamp(raw: str) -> datetime:
         return datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return datetime.fromtimestamp(0, tz=timezone.utc)
+
+
+@dataclass(frozen=True)
+class TranscriptMessage:
+    """One renderable message from a Claude session transcript."""
+
+    role: str
+    text: str
+    timestamp: datetime
+
+
+# Tool inputs and results are frequently enormous (whole files, long diffs).
+# The viewer is for reading a conversation back, so they are clipped.
+_MAX_BLOCK_CHARS = 2000
+_MAX_BLOCK_LINES = 20
+
+
+def _clip(text: str) -> str:
+    """Clip a long tool payload down to something readable."""
+    lines = text.splitlines()
+    clipped = False
+    if len(lines) > _MAX_BLOCK_LINES:
+        lines = lines[:_MAX_BLOCK_LINES]
+        clipped = True
+    text = "\n".join(lines)
+    if len(text) > _MAX_BLOCK_CHARS:
+        text = text[:_MAX_BLOCK_CHARS]
+        clipped = True
+    return f"{text.rstrip()}\n…" if clipped else text
+
+
+def _block_text(block: dict) -> str:
+    """Extract displayable text from a content block of unknown shape."""
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def read_transcript(jsonl_path: Path) -> list[TranscriptMessage]:
+    """Read a Claude session log into an ordered list of messages.
+
+    Sidechain (sub-agent) and meta entries are skipped, as are entries whose
+    type the parser does not recognize. Raises ClaudeLogError if the file
+    cannot be read.
+    """
+    try:
+        text = jsonl_path.read_text()
+    except OSError as e:
+        raise ClaudeLogError(f"Cannot read {jsonl_path}: {e}")
+
+    messages: list[TranscriptMessage] = []
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        entry_type = EntryType.from_raw(entry.get("type", ""))
+        if entry_type not in (EntryType.ASSISTANT, EntryType.USER):
+            continue
+        if entry.get("isSidechain") or entry.get("isMeta"):
+            continue
+
+        ts = _parse_timestamp(entry.get("timestamp", ""))
+        content = entry.get("message", {}).get("content")
+        role = "user" if entry_type == EntryType.USER else "assistant"
+
+        if isinstance(content, str):
+            if content.strip():
+                messages.append(TranscriptMessage(role, content.strip(), ts))
+            continue
+        if not isinstance(content, list):
+            continue
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text":
+                body = block.get("text", "").strip()
+                if body:
+                    messages.append(TranscriptMessage(role, body, ts))
+            elif block_type == "thinking":
+                body = block.get("thinking", "").strip()
+                if body:
+                    messages.append(TranscriptMessage("thinking", body, ts))
+            elif block_type == "tool_use":
+                name = block.get("name", "tool")
+                params = block.get("input")
+                summary = ""
+                if isinstance(params, dict):
+                    summary = _clip(
+                        "\n".join(f"{k}: {v}" for k, v in params.items())
+                    ).strip()
+                body = f"{name}\n{summary}" if summary else str(name)
+                messages.append(TranscriptMessage("tool_use", body, ts))
+            elif block_type == "tool_result":
+                body = _clip(_block_text(block)).strip()
+                if body:
+                    messages.append(TranscriptMessage("tool_result", body, ts))
+
+    return messages

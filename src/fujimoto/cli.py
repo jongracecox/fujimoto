@@ -32,7 +32,14 @@ from textual.widgets import (
     Static,
 )
 
-from fujimoto.claude import ClaudeSession, SessionState, get_sessions_for_path
+from fujimoto.claude import (
+    ClaudeLogError,
+    ClaudeSession,
+    SessionState,
+    TranscriptMessage,
+    get_sessions_for_path,
+    read_transcript,
+)
 from fujimoto.claude import search as claude_search
 from fujimoto.claude.search import ContentMode, SearchError, SearchHit, Snippet
 from fujimoto.config import (
@@ -252,6 +259,40 @@ def _render_snippet(snippet: Snippet, max_width: int) -> Content:
     return Content.assemble(*parts)
 
 
+# How each transcript role is labelled and styled in the log viewer.
+_TRANSCRIPT_ROLES: dict[str, tuple[str, str]] = {
+    "user": ("You", "log-user"),
+    "assistant": ("Claude", "log-assistant"),
+    "thinking": ("Thinking", "log-thinking"),
+    "tool_use": ("⚒ Tool", "log-tool"),
+    "tool_result": ("↳ Result", "log-tool"),
+}
+
+
+def _first_line(text: str, max_width: int) -> str:
+    """First non-empty line of `text`, truncated to `max_width`."""
+    for raw in text.splitlines():
+        if raw.strip():
+            line = raw.strip()
+            return line[: max_width - 1] + "…" if len(line) > max_width else line
+    return ""
+
+
+def _render_transcript(messages: list[TranscriptMessage]) -> list[Static]:
+    """Build one Static per transcript message, styled by role.
+
+    Bodies are `Content` rather than markup for the same reason snippets are:
+    transcript text is arbitrary bytes, and a stray `[` or trailing backslash
+    would otherwise be parsed as (or corrupt) a console markup tag.
+    """
+    widgets: list[Static] = []
+    for msg in messages:
+        label, css_class = _TRANSCRIPT_ROLES.get(msg.role, (msg.role, "log-assistant"))
+        widgets.append(Static(label, classes=f"log-role {css_class}"))
+        widgets.append(Static(Content(msg.text), classes="log-body"))
+    return widgets
+
+
 def _is_fork_worktree(worktree: Path) -> bool:
     """Whether this worktree was created by forking another session."""
     return bool(read_session_meta(worktree).get("forked_from_session_id"))
@@ -420,6 +461,47 @@ Screen {
 .hint {
     color: $text-muted;
     margin-top: 1;
+}
+
+#log-panel {
+    height: auto;
+    padding: 1 2;
+    border: round $primary;
+}
+
+#log-panel .form-label {
+    margin-bottom: 0;
+    text-style: bold;
+}
+
+#log-panel .session-info {
+    color: $text-muted;
+    margin-bottom: 1;
+}
+
+.log-role {
+    text-style: bold;
+    margin-top: 1;
+}
+
+.log-user {
+    color: $success;
+}
+
+.log-assistant {
+    color: $accent;
+}
+
+.log-thinking {
+    color: $text-muted;
+}
+
+.log-tool {
+    color: $warning;
+}
+
+.log-body {
+    color: $text;
 }
 
 #actions-panel {
@@ -790,6 +872,7 @@ class SessionApp(App):
         self._poll_timer: object | None = None
         self._claude_state_snapshot: dict[str, tuple[str, SessionState]] = {}
         self._resume_sessions: list[ClaudeSession] = []
+        self._log_sessions: list[ClaudeSession] = []
         # Fork state. `_fork_source` being set is what turns the shared create
         # flow into a fork; both are cleared when entering the plain create
         # flow so a cancelled fork can't leak into the next worktree.
@@ -1984,6 +2067,7 @@ class SessionApp(App):
 
         if session.session_type == "claude":
             items.append(ListItem(Label("Resume"), id="sa-resume"))
+            items.append(ListItem(Label("View session log"), id="sa-viewlog"))
         else:
             has_previous = bool(get_sessions_for_path(session.path))
             if session.is_active:
@@ -2008,6 +2092,11 @@ class SessionApp(App):
             # that have at least one previous Claude session.
             if has_previous and session.session_type in ("worktree", "direct"):
                 items.insert(1, ListItem(Label("Fork session"), id="sa-fork"))
+
+            # Reading a transcript back needs no live session, so it is offered
+            # whenever the path has one.
+            if has_previous:
+                items.append(ListItem(Label("View session log"), id="sa-viewlog"))
 
         items.append(ListItem(Label("Open terminal"), id="sa-terminal"))
         items.append(ListItem(Label("Open in VS Code"), id="sa-vscode"))
@@ -2148,6 +2237,93 @@ class SessionApp(App):
             ListItem(Label("[dim]Cancel[/]", markup=True), id=f"{prefix}-cancel")
         )
         return items
+
+    # -- Session log viewer --
+
+    async def _show_log_picker(self, session: SessionInfo) -> None:
+        """Choose which transcript to read, or open it straight away.
+
+        A `claude` row already names one transcript, and a path with a single
+        transcript needs no choice — both skip the picker.
+        """
+        self._selected_session = session
+        sessions = get_sessions_for_path(session.path)
+
+        if session.session_type == "claude":
+            match = next(
+                (c for c in sessions if c.session_id == session.claude_session_id),
+                None,
+            )
+            if match is None:
+                await self._show_error("Session log not found.")
+                return
+            await self._show_session_log(match)
+            return
+
+        self._log_sessions = sessions
+
+        if len(sessions) == 1:
+            await self._show_session_log(sessions[0])
+            return
+
+        await self._clear_main()
+        main = self.query_one("#main")
+        await main.mount(
+            Container(
+                Label(session.name, classes="form-label"),
+                Static("View which session log?", classes="session-info"),
+                ListView(
+                    *self._build_claude_session_items(sessions, "lp"), id="log-picker"
+                ),
+                id="actions-panel",
+            )
+        )
+        self.query_one("#log-picker").focus()
+
+    async def _show_session_log(self, cs: ClaudeSession) -> None:
+        """Render a Claude transcript read-only, without launching Claude."""
+        try:
+            messages = read_transcript(cs.jsonl_path)
+        except ClaudeLogError as e:
+            await self._show_error(str(e))
+            return
+
+        await self._clear_main()
+        main = self.query_one("#main")
+
+        header = cs.title or cs.first_prompt or cs.session_id
+        widgets: list[Static] = [
+            Label(_first_line(header, 80), classes="form-label"),
+            Static(
+                f"{cs.session_id}  ·  {_relative_time(cs.last_activity)}",
+                classes="session-info",
+            ),
+        ]
+        if messages:
+            widgets.extend(_render_transcript(messages))
+        else:
+            widgets.append(Static("[dim]This log has no messages.[/]", markup=True))
+        widgets.append(Static("[dim]Escape to go back[/]", markup=True, classes="hint"))
+
+        await main.mount(Container(*widgets, id="log-panel"))
+        main.focus()
+
+    @on(ListView.Selected, "#log-picker")
+    async def on_log_picker_selected(self, event: ListView.Selected) -> None:
+        item_id = event.item.id
+        if item_id is None:  # pragma: no cover - ListItems always carry ids here
+            return
+        if item_id in ("lp-cancel", "lp-empty"):
+            session = self._selected_session
+            if session is None:  # pragma: no cover
+                return
+            # Preserve where the actions menu came from, so backing out of it
+            # still returns to the search results rather than the home screen.
+            await self._show_session_actions(
+                session, from_search=self._actions_from_search
+            )
+            return
+        await self._show_session_log(self._log_sessions[int(item_id.split("-", 1)[1])])
 
     # -- Fork flow --
 
@@ -2886,6 +3062,8 @@ class SessionApp(App):
             await self._show_resume_session_picker(session)
         elif action == "sa-fork":
             await self._show_fork_title_form(session)
+        elif action == "sa-viewlog":
+            await self._show_log_picker(session)
         elif action in ("sa-stop", "sa-terminate"):
             await self._end_session(session, terminate=action == "sa-terminate")
         elif action == "sa-terminal":

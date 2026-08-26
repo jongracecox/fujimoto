@@ -381,10 +381,10 @@ Select any session to see contextual options:
 
 | Session State | Options |
 |--------------|---------|
-| Active worktree | Connect, Fork session, Resume previous session, Stop, Terminate, Finish |
-| Stopped worktree | Resume previous session, Fork session, Launch, Terminate, Finish |
-| Inactive worktree | Resume previous session, Fork session, Launch, Finish |
-| Active direct | Connect, Fork session, Resume previous session, Stop, Terminate |
+| Active worktree | Connect, Fork session, Resume previous session, View session log, Stop, Terminate, Finish |
+| Stopped worktree | Resume previous session, Fork session, View session log, Launch, Terminate, Finish |
+| Inactive worktree | Resume previous session, Fork session, View session log, Launch, Finish |
+| Active direct | Connect, Fork session, Resume previous session, View session log, Stop, Terminate |
 
 **Stop** keeps the session in your list as 🟠; **Terminate** marks it done and
 drops it to ⚫. Both close claude — the difference is only whether fujimoto
@@ -392,6 +392,16 @@ offers it back to you.
 
 All session types also offer **Open terminal**, **Open in VS Code** and
 **Rename**.
+
+### View Session Log
+
+**View session log** reads a session's Claude transcript back without starting
+Claude. It renders the conversation — your prompts, Claude's replies, thinking,
+tool calls and their results — in a scrollable read-only view; long tool inputs
+and results are clipped, and sub-agent (sidechain) entries are omitted. Escape
+goes back — to the search results if you got there from a transcript search,
+otherwise to the home screen. When a session has more than one transcript, a
+picker asks which to read.
 
 ### Fork Session
 

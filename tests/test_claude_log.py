@@ -17,6 +17,7 @@ from fujimoto.claude.log_parser import (
     get_claude_projects_dir,
     get_sessions_for_path,
     parse_session,
+    read_transcript,
 )
 
 
@@ -474,3 +475,191 @@ def test_parse_session_skips_non_object_json_lines(tmp_path):
     session = parse_session(log)
     assert session.state == SessionState.WORKING
     assert session.cwd == Path("/repo")
+
+
+def _line(entry: dict) -> str:
+    entry.setdefault("timestamp", "2026-03-09T12:00:00.000Z")
+    return json.dumps(entry)
+
+
+class TestReadTranscript:
+    def test_missing_file_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ClaudeLogError):
+            read_transcript(tmp_path / "missing.jsonl")
+
+    def test_empty_file_returns_no_messages(self, tmp_path: Path) -> None:
+        log = tmp_path / "s.jsonl"
+        log.write_text("")
+        assert read_transcript(log) == []
+
+    def test_plain_user_and_assistant_text(self, tmp_path: Path) -> None:
+        log = tmp_path / "s.jsonl"
+        log.write_text(
+            "\n".join(
+                [
+                    _line({"type": "user", "message": {"content": "  hello  "}}),
+                    _line(
+                        {
+                            "type": "assistant",
+                            "message": {
+                                "content": [{"type": "text", "text": "hi there"}]
+                            },
+                        }
+                    ),
+                ]
+            )
+        )
+        messages = read_transcript(log)
+        assert [(m.role, m.text) for m in messages] == [
+            ("user", "hello"),
+            ("assistant", "hi there"),
+        ]
+        assert messages[0].timestamp == datetime(2026, 3, 9, 12, 0, tzinfo=timezone.utc)
+
+    def test_skips_sidechain_meta_blank_and_unknown_entries(
+        self, tmp_path: Path
+    ) -> None:
+        log = tmp_path / "s.jsonl"
+        log.write_text(
+            "\n".join(
+                [
+                    "",
+                    "not json",
+                    _line({"type": "last-prompt"}),
+                    _line({"type": "file-history-snapshot"}),
+                    _line(
+                        {
+                            "type": "user",
+                            "isSidechain": True,
+                            "message": {"content": "sub-agent"},
+                        }
+                    ),
+                    _line(
+                        {"type": "user", "isMeta": True, "message": {"content": "meta"}}
+                    ),
+                    _line({"type": "user", "message": {"content": "   "}}),
+                    _line({"type": "user", "message": {"content": None}}),
+                    _line({"type": "user", "message": {"content": "kept"}}),
+                ]
+            )
+        )
+        assert [m.text for m in read_transcript(log)] == ["kept"]
+
+    def test_thinking_tool_use_and_tool_result(self, tmp_path: Path) -> None:
+        log = tmp_path / "s.jsonl"
+        log.write_text(
+            "\n".join(
+                [
+                    _line(
+                        {
+                            "type": "assistant",
+                            "message": {
+                                "content": [
+                                    "not-a-dict",
+                                    {"type": "thinking", "thinking": " pondering "},
+                                    {"type": "thinking", "thinking": "  "},
+                                    {"type": "text", "text": "  "},
+                                    {
+                                        "type": "tool_use",
+                                        "name": "Bash",
+                                        "input": {"command": "ls"},
+                                    },
+                                    {"type": "unknown-block"},
+                                ]
+                            },
+                        }
+                    ),
+                    _line(
+                        {
+                            "type": "user",
+                            "message": {
+                                "content": [
+                                    {"type": "tool_result", "content": "file.txt"}
+                                ]
+                            },
+                        }
+                    ),
+                ]
+            )
+        )
+        assert [(m.role, m.text) for m in read_transcript(log)] == [
+            ("thinking", "pondering"),
+            ("tool_use", "Bash\ncommand: ls"),
+            ("tool_result", "file.txt"),
+        ]
+
+    def test_tool_use_without_input_shows_name_only(self, tmp_path: Path) -> None:
+        log = tmp_path / "s.jsonl"
+        log.write_text(
+            _line(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [{"type": "tool_use", "input": "not-a-dict"}]
+                    },
+                }
+            )
+        )
+        assert [m.text for m in read_transcript(log)] == ["tool"]
+
+    def test_tool_result_block_list_content(self, tmp_path: Path) -> None:
+        log = tmp_path / "s.jsonl"
+        log.write_text(
+            _line(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "content": [
+                                    {"type": "text", "text": "one"},
+                                    {"type": "image"},
+                                    {"type": "text", "text": "two"},
+                                ],
+                            },
+                            {"type": "tool_result", "content": 42},
+                        ]
+                    },
+                }
+            )
+        )
+        assert [m.text for m in read_transcript(log)] == ["one\ntwo"]
+
+    def test_non_list_non_string_content_skipped(self, tmp_path: Path) -> None:
+        log = tmp_path / "s.jsonl"
+        log.write_text(_line({"type": "assistant", "message": {"content": 7}}))
+        assert read_transcript(log) == []
+
+    def test_long_tool_result_is_clipped_by_lines(self, tmp_path: Path) -> None:
+        body = "\n".join(f"line {i}" for i in range(50))
+        log = tmp_path / "s.jsonl"
+        log.write_text(
+            _line(
+                {
+                    "type": "user",
+                    "message": {"content": [{"type": "tool_result", "content": body}]},
+                }
+            )
+        )
+        text = read_transcript(log)[0].text
+        assert text.endswith("…")
+        assert text.count("\n") == 20
+        assert "line 19" in text
+        assert "line 20" not in text
+
+    def test_long_tool_result_is_clipped_by_chars(self, tmp_path: Path) -> None:
+        log = tmp_path / "s.jsonl"
+        log.write_text(
+            _line(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [{"type": "tool_result", "content": "x" * 5000}]
+                    },
+                }
+            )
+        )
+        text = read_transcript(log)[0].text
+        assert text.endswith("…")
+        assert len(text) < 2100
