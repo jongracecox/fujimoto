@@ -148,6 +148,44 @@ Two things to get right when you do this:
 - Section separators are `disabled` `ListItem`s, so a filtered list must move the
   highlight past them (`_first_selectable_index`, plus the up/down handling in
   `_on_key`) or the user lands on a divider.
+- **Nothing in the `_build_*_items()` path may touch the disk.** It runs on every
+  keystroke. `_build_home_items` used to call `_get_claude_sessions` directly,
+  which re-parsed every JSONL transcript per character typed and made the filter
+  visibly lag; it now reads `_claude_session_data()` (memoized, invalidated on
+  project switch and on re-entering the home screen, refreshed by the 3s state
+  poller) and `_is_fork()` (memoized `read_session_meta`). If you add a field to a
+  row, get its value from a cache populated outside the render.
+
+### Searching Something Expensive
+
+The transcript search (`s`) is the pattern for a filter whose data does *not*
+fit in memory. Reading every conversation log takes seconds, so it cannot go in
+a `_build_*_items()` helper at all. The shape:
+
+- The scan lives in a module (`claude/search.py`), UI-free, and is exposed as a
+  **batched generator** (`iter_hits` yields `(scanned, hits)` every ten logs)
+  taking an `is_cancelled` callable. That is what makes it testable
+  synchronously and interruptible from a worker.
+- The UI drives it from a `@work(thread=True, exclusive=True, group=...)`
+  worker and hands batches back with `call_from_thread(self._apply_search_batch,
+  ...)`. `exclusive=True` cancels the previous scan when a new one starts.
+- Guard the batch handler with a **monotonic token** (`_search_token`), bumped by
+  `_start_transcript_search` and `_stop_transcript_search`. Cancellation is not
+  instantaneous: a batch can already be queued on the event loop when the query
+  changes or the view is torn down, and without the token check it would
+  interleave results for a query the user has moved on from.
+- **Debounce the `Input.Changed` handler** (`SEARCH_DEBOUNCE`) and impose a
+  minimum query length. Without both, most of the scan's life is spent being
+  cancelled by the next keystroke.
+- Cancel the group and bump the token in `_clear_main`, so navigating away
+  actually stops the work.
+- Return *structured* results, not display strings. `Snippet` carries the match
+  offsets inside its text, so the UI can highlight them; recomputing them in the
+  UI would mean re-running the pattern against text whose whitespace has already
+  been collapsed, which silently fails for any match spanning a line break.
+- Make the expensive path reject early. `search_log` reads the file and rejects
+  it with a single `re.search` over the whole text before any JSON parsing; for
+  the overwhelming majority of logs that is the only work done.
 
 ### Adding New Git/tmux Operations
 

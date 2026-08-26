@@ -13,11 +13,14 @@ from pathlib import Path
 from typing import NamedTuple
 
 from rich.markup import escape
-from textual import events, on
+from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.content import Content
 from textual.screen import ModalScreen
+from textual.timer import Timer
+from textual.worker import get_current_worker
 from textual.widgets import (
     Button,
     Footer,
@@ -30,6 +33,8 @@ from textual.widgets import (
 )
 
 from fujimoto.claude import ClaudeSession, SessionState, get_sessions_for_path
+from fujimoto.claude import search as claude_search
+from fujimoto.claude.search import ContentMode, SearchError, SearchHit, Snippet
 from fujimoto.config import (
     ConfigError,
     build_worktree_path,
@@ -178,6 +183,75 @@ def _format_prompt_lines(text: str, max_width: int) -> list[str]:
     return [lines[0], lines[1], "…", lines[-1]]
 
 
+# Style applied to a matched substring inside a search snippet. `$warning`
+# resolves against the active theme, so it reads in light and dark alike.
+SNIPPET_MATCH_STYLE = "b $warning"
+
+
+def _fit_snippet(
+    snippet: Snippet, max_width: int
+) -> tuple[str, tuple[tuple[int, int], ...]]:
+    """Trim a snippet to `max_width`, keeping its first match on screen.
+
+    A plain right-truncation would cut the match off on a narrow terminal (the
+    snippet is centred on the match with `SNIPPET_RADIUS` chars of lead-in), so
+    when the text has to lose characters the window slides to keep the match in
+    view. Spans are shifted to the new offsets, and any that fall outside the
+    window are dropped.
+
+    Room for an elision marker is reserved at *both* ends whether or not both
+    are needed. Costing at most one unused column keeps the arithmetic obvious —
+    the alternative is a fixed-point loop, because adding a marker narrows the
+    body, which can move the window, which changes whether a marker is needed.
+    """
+    text = snippet.text
+    if len(text) <= max_width:
+        return text, snippet.spans
+
+    body_width = max(1, max_width - 2)
+    first = snippet.spans[0][0] if snippet.spans else 0
+    # Lead-in before the match, clamped so the window never runs off either end.
+    low = max(0, min(first - body_width // 4, len(text) - body_width))
+    high = low + body_width
+
+    head = "…" if low > 0 else ""
+    tail = "…" if high < len(text) else ""
+    shift = len(head) - low
+    limit = len(head) + (high - low)
+
+    spans: list[tuple[int, int]] = []
+    for span_start, span_end in snippet.spans:
+        span_start = max(span_start + shift, len(head))
+        span_end = min(span_end + shift, limit)
+        if span_end > span_start:
+            spans.append((span_start, span_end))
+    return f"{head}{text[low:high]}{tail}", tuple(spans)
+
+
+def _render_snippet(snippet: Snippet, max_width: int) -> Content:
+    """Styled content for a snippet: dim context, highlighted matches.
+
+    Assembled from `(text, style)` pairs rather than a markup string, because
+    snippet text is arbitrary transcript bytes spliced at arbitrary offsets: a
+    fragment ending in `[` or `\\` swallows the very tag that closes it, and
+    `rich.markup.escape` cannot help — it only escapes a `[` that still looks
+    like a tag in the fragment it is given. `Content.assemble` never parses the
+    text at all, and styling spans separately also stops `dim` from being
+    inherited by the highlight (which would wash it out).
+    """
+    text, spans = _fit_snippet(snippet, max_width)
+    parts: list[tuple[str, str]] = []
+    cursor = 0
+    for start, end in spans:
+        if start > cursor:
+            parts.append((text[cursor:start], "dim"))
+        parts.append((text[start:end], SNIPPET_MATCH_STYLE))
+        cursor = end
+    if cursor < len(text):
+        parts.append((text[cursor:], "dim"))
+    return Content.assemble(*parts)
+
+
 def _is_fork_worktree(worktree: Path) -> bool:
     """Whether this worktree was created by forking another session."""
     return bool(read_session_meta(worktree).get("forked_from_session_id"))
@@ -233,6 +307,36 @@ Screen {
 
 #home-list {
     height: 1fr;
+}
+
+#search-panel {
+    height: 1fr;
+    padding: 1 2;
+    border: round $primary;
+}
+
+#search-panel .form-label {
+    margin-bottom: 1;
+    text-style: bold;
+}
+
+#search-status {
+    color: $text-muted;
+    height: 1;
+    margin-bottom: 1;
+}
+
+#search-results {
+    height: 1fr;
+}
+
+#search-results > ListItem {
+    padding: 0 2;
+    margin-bottom: 1;
+}
+
+#search-results:focus > ListItem.--highlight {
+    background: $accent;
 }
 
 #home-list > ListItem {
@@ -635,7 +739,16 @@ class SessionApp(App):
         Binding("ctrl+c", "quit", "Quit", show=False),
         Binding("escape", "go_back", "Back", show=True),
         Binding("d", "dismiss_update", "Dismiss update", show=False),
-        Binding("slash", "search", "Search", show=True),
+        Binding("slash", "search", "Filter", show=True),
+        Binding("s", "session_search", "Search transcripts", show=True),
+        # Mode toggles for the transcript search. They have to fire while the
+        # query Input holds focus, so they are Ctrl chords (which Input leaves
+        # alone) rather than plain letters.
+        Binding("ctrl+r", "toggle_search_regex", "Regex", show=False),
+        Binding("ctrl+t", "toggle_search_mode", "Raw/text", show=False),
+        # Ctrl+I is the same byte as Tab in a legacy terminal; it only arrives
+        # distinctly under the kitty keyboard protocol, which Textual requests.
+        Binding("ctrl+i", "toggle_search_case", "Match case", show=False),
     ]
 
     def __init__(
@@ -691,6 +804,33 @@ class SessionApp(App):
         # applied after Enter hands focus back to the list.
         self._searching: bool = False
         self._search_query: str = ""
+        # Parsed Claude transcript data for the home screen, memoized so a `/`
+        # keystroke re-filters rows instead of re-reading every JSONL log.
+        self._claude_cache: (
+            tuple[dict[str, ClaudeSession], list[ClaudeSession]] | None
+        ) = None
+        # `.fujimoto/meta.json` is read once per worktree per app run rather
+        # than once per rendered row.
+        self._fork_marker_cache: dict[Path, bool] = {}
+        # -- Transcript search (`s`) --
+        self._on_search: bool = False
+        self._transcript_query: str = ""
+        self._transcript_regex: bool = False
+        # Message text rather than raw: it is the quieter of the two (no JSON
+        # keys, uuids or tool noise) and measurably the faster, since the files
+        # it has to parse are only the ones that survive the whole-file reject.
+        # `ctrl+t` reaches raw, and the choice then sticks for the session.
+        self._transcript_mode: ContentMode = ContentMode.TEXT
+        self._transcript_case_sensitive: bool = False
+        # Bumped for every scan started; batches arriving from a superseded
+        # worker carry a stale token and are dropped.
+        self._search_token: int = 0
+        self._search_debounce: Timer | None = None
+        self._search_hits: list[SearchHit] = []
+        self._search_result_map: dict[str, SessionInfo] = {}
+        # Set when the session-actions menu was opened from a search result, so
+        # Cancel/Escape returns to the results instead of the home screen.
+        self._actions_from_search: bool = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -750,6 +890,9 @@ class SessionApp(App):
         self._default_branch = get_default_branch(cwd)
         self._active_sessions = set(list_project_sessions(self._project_name))
         self._open_sessions = session_state.prune()
+        # A different project means different transcripts and worktrees.
+        self._claude_cache = None
+        self._fork_marker_cache = {}
         self._available_projects = list_projects()
         self.sub_title = self._project_name
         set_terminal_title(_session_manager_title(self._project_name))
@@ -770,9 +913,23 @@ class SessionApp(App):
 
     async def _clear_main(self) -> None:
         self._stop_polling()
+        self._stop_transcript_search()
         self._on_home = False
         main = self.query_one("#main")
         await main.remove_children()
+
+    def _stop_transcript_search(self) -> None:
+        """Leave the search view: cancel the scan and any pending debounce.
+
+        Bumping the token as well as cancelling means a batch already queued on
+        the event loop is dropped rather than mounted into a view that has gone.
+        """
+        self._on_search = False
+        if self._search_debounce is not None:
+            self._search_debounce.stop()
+            self._search_debounce = None
+        self._search_token += 1
+        self.workers.cancel_group(self, "transcript-search")
 
     def _stop_polling(self) -> None:
         if self._poll_timer is not None:
@@ -844,6 +1001,7 @@ class SessionApp(App):
     async def _show_home(self) -> None:
         await self._clear_main()
         self._on_home = True
+        self._claude_cache = None
         main = self.query_one("#main")
 
         if self._update_banner_version is not None:
@@ -893,6 +1051,32 @@ class SessionApp(App):
             if name not in self._active_sessions and rec.project == self._project_name
         }
 
+    def _claude_session_data(
+        self,
+    ) -> tuple[dict[str, ClaudeSession], list[ClaudeSession]]:
+        """Claude transcript data for the current project, parsed at most once.
+
+        Parsing every log under `~/.claude/projects` costs real time per file,
+        and `_build_home_items` runs on every `/` keystroke — so doing the parse
+        inline made the filter box visibly lag behind typing. The cache is
+        cleared when the home screen is (re)entered or the project changes, and
+        refreshed by the 3s state poller; a filter keystroke never invalidates
+        it.
+        """
+        if self._claude_cache is None:
+            self._claude_cache = _get_claude_sessions(
+                self._project_root, self._existing_worktrees
+            )
+        return self._claude_cache
+
+    def _is_fork(self, worktree: Path) -> bool:
+        """Memoized `_is_fork_worktree` — fork provenance never changes."""
+        cached = self._fork_marker_cache.get(worktree)
+        if cached is None:
+            cached = _is_fork_worktree(worktree)
+            self._fork_marker_cache[worktree] = cached
+        return cached
+
     def _search_matches(self, *fields: str) -> bool:
         """Case-insensitive substring match of the search query against `fields`.
 
@@ -914,9 +1098,7 @@ class SessionApp(App):
         searching = bool(self._search_query.strip())
 
         # Fetch Claude session data for state indicators
-        path_to_latest, root_claude_sessions = _get_claude_sessions(
-            self._project_root, self._existing_worktrees
-        )
+        path_to_latest, root_claude_sessions = self._claude_session_data()
         self._claude_state_snapshot = {
             k: (v.session_id, v.state) for k, v in path_to_latest.items()
         }
@@ -1034,7 +1216,7 @@ class SessionApp(App):
                 branch=branch,
                 claude_session_id=cs_id,
                 claude_state=cs_state,
-                is_fork=_is_fork_worktree(wt),
+                is_fork=self._is_fork(wt),
             )
             self._session_map[item_id] = info
             label_text = self._build_session_label(info, state_suffix)
@@ -1070,7 +1252,7 @@ class SessionApp(App):
                 branch=branch,
                 claude_session_id=cs_id,
                 claude_state=cs.state if cs else None,
-                is_fork=is_worktree and _is_fork_worktree(rec.path),
+                is_fork=is_worktree and self._is_fork(rec.path),
             )
             self._session_map[item_id] = info
             label_text = self._build_session_label(info, "")
@@ -1119,7 +1301,7 @@ class SessionApp(App):
                 branch=branch,
                 claude_session_id=cs_id,
                 claude_state=cs_state,
-                is_fork=_is_fork_worktree(wt),
+                is_fork=self._is_fork(wt),
             )
             self._session_map[item_id] = info
             label_text = self._build_session_label(info, "")
@@ -1265,6 +1447,292 @@ class SessionApp(App):
         if self.query("#home-list"):
             self.query_one("#home-list").focus()
 
+    # -- Transcript search (`s`) --
+    #
+    # The `/` filter above matches session *names* from data already in memory.
+    # This searches the *contents* of every Claude transcript for the project,
+    # which means reading every JSONL log — far too slow to do between
+    # keystrokes. So the scan runs in a thread worker, in batches, and results
+    # are appended as each batch lands. Typing stays responsive because the
+    # only work on the event loop is appending rows.
+
+    SEARCH_DEBOUNCE = 0.3
+    SEARCH_MIN_QUERY = 2
+
+    async def action_session_search(self) -> None:
+        """Open the transcript search view (bound to `s` on the home screen)."""
+        if not self._on_home:
+            return
+        await self._show_session_search()
+
+    async def _show_session_search(self, *, restore: bool = False) -> None:
+        """Mount the transcript search view.
+
+        `restore` re-renders the hits already collected rather than starting a
+        fresh scan, which is what returning from a result's actions menu wants.
+        """
+        await self._clear_main()
+        self._on_search = True
+        if not restore:
+            self._search_hits = []
+        main = self.query_one("#main")
+        await main.mount(
+            Container(
+                Label(
+                    f"Search session transcripts in {self._project_name}",
+                    classes="form-label",
+                ),
+                Input(
+                    value=self._transcript_query,
+                    placeholder="Type to search every conversation...",
+                    id="search-input",
+                ),
+                Static(self._search_status_text(), id="search-status", markup=True),
+                ListView(*self._build_search_result_items(), id="search-results"),
+                Static(
+                    "[dim]ctrl+r regex · ctrl+t raw/text · ctrl+i case · "
+                    "↑↓ pick · enter open · esc back[/]",
+                    markup=True,
+                    classes="hint",
+                ),
+                id="search-panel",
+            )
+        )
+        self.query_one("#search-input", Input).focus()
+        if restore and self._search_hits:
+            count = len(self._search_hits)
+            plural = "s" if count != 1 else ""
+            self._set_search_status(f"[dim]{count} session{plural} matched[/]")
+
+    def _search_status_text(self, detail: str = "") -> str:
+        """The mode line above the results, plus an optional progress detail."""
+        pattern = "regex" if self._transcript_regex else "literal"
+        case = "match case" if self._transcript_case_sensitive else "ignore case"
+        mode = f"[b]{pattern}[/] · [b]{self._transcript_mode.label}[/] · [b]{case}[/]"
+        return f"{mode}  {detail}" if detail else mode
+
+    def _set_search_status(self, detail: str) -> None:
+        if self.query("#search-status"):
+            self.query_one("#search-status", Static).update(
+                self._search_status_text(detail)
+            )
+
+    def _build_search_result_items(self) -> list[ListItem]:
+        """Rows for the hits collected so far, newest transcript first."""
+        self._search_result_map = {}
+        if not self._search_hits:
+            return []
+
+        # List padding (2 each side) + panel border and padding.
+        max_width = max(20, self.size.width - 12)
+        items: list[ListItem] = []
+        for index, hit in enumerate(self._search_hits):
+            items.append(self._build_search_result_item(index, hit, max_width))
+        return items
+
+    def _build_search_result_item(
+        self, index: int, hit: SearchHit, max_width: int
+    ) -> ListItem:
+        cs = hit.session
+        item_id = f"sr-{index}"
+        plural = "es" if hit.match_count != 1 else ""
+        branch = f"{BRANCH_ICON} {cs.git_branch}  " if cs.git_branch else ""
+        heading = (
+            f"{escape(cs.cwd.name or str(cs.cwd))}"
+            f"  [dim]{branch}{_relative_time(cs.last_activity)}"
+            f"  ·  {hit.match_count} match{plural}[/]"
+        )
+        labels = [Label(heading, markup=True)]
+        for snippet in hit.snippets:
+            labels.append(Label(_render_snippet(snippet, max_width)))
+        self._search_result_map[item_id] = SessionInfo(
+            name=cs.session_id[:8],
+            session_type="claude",
+            project=self._project_name,
+            path=cs.cwd,
+            tmux_session="",
+            is_active=False,
+            branch=cs.git_branch or "",
+            claude_session_id=cs.session_id,
+            claude_state=cs.state,
+        )
+        return ListItem(*labels, id=item_id)
+
+    async def action_toggle_search_regex(self) -> None:
+        """Flip literal/regex matching and rerun the scan (bound to ctrl+r)."""
+        if not self._on_search:
+            return
+        self._transcript_regex = not self._transcript_regex
+        await self._restart_transcript_search()
+
+    async def action_toggle_search_mode(self) -> None:
+        """Flip message-text/raw matching and rerun the scan (bound to ctrl+t)."""
+        if not self._on_search:
+            return
+        self._transcript_mode = self._transcript_mode.toggled()
+        await self._restart_transcript_search()
+
+    async def action_toggle_search_case(self) -> None:
+        """Flip case sensitivity and rerun the scan (bound to ctrl+i)."""
+        if not self._on_search:
+            return
+        self._transcript_case_sensitive = not self._transcript_case_sensitive
+        await self._restart_transcript_search()
+
+    async def _restart_transcript_search(self) -> None:
+        """Re-render the mode line and rescan under the new settings."""
+        self._set_search_status("")
+        await self._clear_search_results()
+        self._start_transcript_search()
+
+    @on(Input.Changed, "#search-input")
+    def on_transcript_search_changed(self, event: Input.Changed) -> None:
+        # Mounting the box with a preserved query fires Changed too; when the
+        # results for it are already on screen (returning from a result's
+        # actions menu) there is nothing to redo.
+        if event.value == self._transcript_query and self._search_hits:
+            return
+        # Debounced: a scan touches every transcript, so restarting it on each
+        # keystroke would spend most of its time being cancelled.
+        self._transcript_query = event.value
+        if self._search_debounce is not None:
+            self._search_debounce.stop()
+        self._search_debounce = self.set_timer(
+            self.SEARCH_DEBOUNCE, self._debounced_transcript_search
+        )
+
+    async def _debounced_transcript_search(self) -> None:
+        self._search_debounce = None
+        await self._clear_search_results()
+        self._start_transcript_search()
+
+    @on(Input.Submitted, "#search-input")
+    def on_transcript_search_submitted(self, event: Input.Submitted) -> None:
+        # Enter hands focus to the results; the scan keeps running.
+        if self.query("#search-results"):
+            self.query_one("#search-results").focus()
+
+    async def _clear_search_results(self) -> None:
+        self._search_hits = []
+        if self.query("#search-results"):
+            await self.query_one("#search-results", ListView).clear()
+        self._search_result_map = {}
+
+    def _start_transcript_search(self) -> None:
+        """Kick off a scan, cancelling whatever was running."""
+        # Bumping the token first means in-flight batches from the previous
+        # scan are recognised as stale even before the worker notices it has
+        # been cancelled.
+        self._search_token += 1
+        self.workers.cancel_group(self, "transcript-search")
+        query = self._transcript_query.strip()
+        if len(query) < self.SEARCH_MIN_QUERY:
+            detail = (
+                f"[dim]type at least {self.SEARCH_MIN_QUERY} characters[/]"
+                if query
+                else ""
+            )
+            self._set_search_status(detail)
+            return
+        self._set_search_status("[dim]searching…[/]")
+        self._run_transcript_search(
+            query,
+            self._transcript_regex,
+            self._transcript_mode,
+            self._transcript_case_sensitive,
+            self._search_token,
+        )
+
+    @work(thread=True, exclusive=True, group="transcript-search")
+    def _run_transcript_search(
+        self,
+        query: str,
+        regex: bool,
+        mode: ContentMode,
+        case_sensitive: bool,
+        token: int,
+    ) -> None:
+        """Scan every transcript for the project in a background thread.
+
+        Results are handed back a batch at a time via `call_from_thread`, so the
+        UI fills in progressively instead of waiting for the whole scan.
+        """
+        worker = get_current_worker()
+        try:
+            matcher = claude_search.compile_matcher(
+                query, regex=regex, mode=mode, case_sensitive=case_sensitive
+            )
+        except SearchError as e:
+            self.call_from_thread(self._search_failed, token, str(e))
+            return
+
+        logs = claude_search.list_session_logs(
+            self._project_root, self._existing_worktrees
+        )
+        total = len(logs)
+        try:
+            for scanned, hits in claude_search.iter_hits(
+                logs, matcher, is_cancelled=lambda: worker.is_cancelled
+            ):
+                # Re-checked after the batch: the scan may have been
+                # superseded while this batch was being collected. Racy by
+                # nature, so `_apply_search_batch`'s token check is the
+                # guarantee and this is only an early out.
+                if worker.is_cancelled:  # pragma: no cover
+                    return
+                self.call_from_thread(
+                    self._apply_search_batch, token, scanned, total, hits
+                )
+        except RuntimeError:  # pragma: no cover - app shut down mid-scan
+            return
+
+    def _apply_search_batch(
+        self,
+        token: int,
+        scanned: int,
+        total: int,
+        hits: tuple[SearchHit, ...],
+    ) -> None:
+        """Append a batch of hits and update the progress line."""
+        # A batch from a superseded scan would interleave results for a query
+        # the user has already moved on from.
+        if token != self._search_token or not self._on_search:
+            return
+        if not self.query("#search-results"):
+            return
+        results = self.query_one("#search-results", ListView)
+        max_width = max(20, self.size.width - 12)
+        for hit in hits:
+            index = len(self._search_hits)
+            self._search_hits.append(hit)
+            results.append(self._build_search_result_item(index, hit, max_width))
+        if results.index is None and len(results) > 0:
+            results.index = 0
+
+        found = len(self._search_hits)
+        if scanned >= total:
+            if total == 0:
+                detail = "[dim]no transcripts for this project[/]"
+            else:
+                plural = "s" if found != 1 else ""
+                detail = f"[dim]{found} session{plural} of {total} matched[/]"
+        else:
+            detail = f"[dim]searching… {scanned}/{total}  ·  {found} found[/]"
+        self._set_search_status(detail)
+
+    def _search_failed(self, token: int, message: str) -> None:
+        if token != self._search_token or not self._on_search:
+            return
+        self._set_search_status(f"[red]{escape(message)}[/]")
+
+    @on(ListView.Selected, "#search-results")
+    async def on_search_result_selected(self, event: ListView.Selected) -> None:
+        item_id = event.item.id
+        if item_id and item_id in self._search_result_map:
+            await self._show_session_actions(
+                self._search_result_map[item_id], from_search=True
+            )
+
     def _build_settings_items(self) -> list[ListItem]:
         key = quick_terminal_key()
         if not key:
@@ -1288,9 +1756,12 @@ class SessionApp(App):
         if not self.query("#home-list"):
             return
 
-        new_path_to_latest, _ = _get_claude_sessions(
+        # Refresh (rather than bypass) the render cache, so the next filter
+        # keystroke renders from freshly polled data without re-parsing.
+        self._claude_cache = _get_claude_sessions(
             self._project_root, self._existing_worktrees
         )
+        new_path_to_latest, _ = self._claude_cache
         new_snapshot = {
             k: (v.session_id, v.state) for k, v in new_path_to_latest.items()
         }
@@ -1499,8 +1970,13 @@ class SessionApp(App):
 
     # -- Session actions submenu --
 
-    async def _show_session_actions(self, session: SessionInfo) -> None:
+    async def _show_session_actions(
+        self, session: SessionInfo, *, from_search: bool = False
+    ) -> None:
         self._selected_session = session
+        # Remembered so Cancel/Escape returns to the search results rather than
+        # discarding a scan the user may still want to pick through.
+        self._actions_from_search = from_search
         await self._clear_main()
         main = self.query_one("#main")
 
@@ -2424,6 +2900,9 @@ class SessionApp(App):
         elif action == "sa-finish":
             await self._show_finish(session)
         elif action == "sa-cancel":
+            if self._actions_from_search:
+                await self._show_session_search(restore=True)
+                return
             try:
                 await self._show_home()
             except (ConfigError, GitError) as e:  # pragma: no cover
@@ -2741,13 +3220,18 @@ class SessionApp(App):
 
     async def action_go_back(self) -> None:
         if len(self.query("#home-list")) > 0:
-            # On the home screen escape quits — unless a search is active, in
+            # On the home screen escape quits — unless a filter is active, in
             # which case it drops the filter first.
             if self._searching or self._search_query:
                 await self._clear_search()
                 return
             self.exit()
+        elif self._actions_from_search and not self._on_search:
+            # Back out of a result's actions menu into the results it came from.
+            await self._show_session_search(restore=True)
         else:
+            # Leaving the search view keeps `_transcript_query`, so `s` reopens
+            # on the same query (and rescans, since transcripts move on).
             try:
                 await self._show_home()
             except (ConfigError, GitError):
