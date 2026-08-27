@@ -8,13 +8,20 @@ from rich.console import Console
 
 import pytest
 
-from textual.widgets import Input, Label, ListItem, ListView, Static
+from textual.widgets import Collapsible, Input, Label, ListItem, ListView, Static
 
-from fujimoto.claude import ClaudeSession, ContentMode, SessionState, Snippet
+from fujimoto.claude import (
+    ClaudeSession,
+    ContentMode,
+    SessionState,
+    Snippet,
+    TranscriptMessage,
+)
 from fujimoto.claude.log_parser import EntryType, StopReason
 from types import SimpleNamespace
 
 from fujimoto.cli import (
+    CSS,
     ICON_EYES,
     ICON_FORK,
     ICON_GEAR,
@@ -32,6 +39,9 @@ from fujimoto.cli import (
     _get_claude_sessions,
     _relative_time,
     _render_snippet,
+    _pair_results,
+    _tool_run_title,
+    _tool_summary,
     main,
 )
 from fujimoto.config import ConfigError
@@ -6132,7 +6142,12 @@ class TestSessionLogViewer:
 
     @staticmethod
     def _body_texts(app: SessionApp) -> list[str]:
-        return [str(w.visual) for w in app.query("#log-panel .log-body")]
+        """Prose bodies only — a collapsible's body is nested, not a child."""
+        return [str(w.visual) for w in app.query("#log-panel > .log-body")]
+
+    @staticmethod
+    def _tool_body_texts(app: SessionApp) -> list[str]:
+        return [str(w.visual) for w in app.query("Collapsible .log-body")]
 
     @pytest.mark.asyncio
     async def test_menu_item_sits_between_resume_and_terminal(
@@ -6321,3 +6336,362 @@ class TestSessionLogViewer:
                 assert "Session log not found" in " ".join(
                     str(w.visual) for w in app.query("#main > Static")
                 )
+
+    @pytest.mark.asyncio
+    async def test_tool_calls_collapse_to_one_line(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "On it."},
+                            {
+                                "type": "tool_use",
+                                "name": "Bash",
+                                "input": {"command": "grep -rn needle src/"},
+                            },
+                        ]
+                    },
+                },
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {"type": "tool_result", "content": "a.txt\nb.txt\nc.txt"}
+                        ]
+                    },
+                },
+            ],
+        )
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: [_log_session(log, wt)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                await self._select(app, pilot, "#session-actions", "sa-viewlog")
+
+                collapsibles = list(app.query(Collapsible))
+                # The result is folded into its call, so there is one row, not two.
+                assert len(collapsibles) == 1
+                # Folded away by default — the prose is what the viewer is for.
+                assert collapsibles[0].collapsed is True
+                assert collapsibles[0].title == "⚒ Bash  command: grep -rn needle src/"
+                # Only the prose is rendered as an ordinary body row.
+                assert self._body_texts(app) == ["On it."]
+                # Opening the call shows its arguments and then its output.
+                assert self._tool_body_texts(app) == [
+                    "command: grep -rn needle src/",
+                    "a.txt\nb.txt\nc.txt",
+                ]
+
+    @pytest.mark.asyncio
+    async def test_expanded_tool_body_drops_the_repeated_name(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Bash",
+                                "input": {"command": "ls"},
+                            }
+                        ]
+                    },
+                }
+            ],
+        )
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: [_log_session(log, wt)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                await self._select(app, pilot, "#session-actions", "sa-viewlog")
+                # Tab reaches the collapsible's title, Enter opens it — the
+                # viewer stays usable without a mouse.
+                await pilot.press("tab")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app.query(Collapsible).first().collapsed is False
+                # The title already says "Bash"; the body carries the arguments.
+                assert self._tool_body_texts(app) == ["command: ls"]
+
+    def test_result_summary_is_singular_for_one_line(self) -> None:
+        msg = TranscriptMessage(
+            "tool_result", "just one", datetime(2026, 3, 9, tzinfo=timezone.utc)
+        )
+        assert _tool_summary(msg).startswith("↳ Result (1 line)")
+
+    def test_tool_summary_without_arguments_is_just_the_name(self) -> None:
+        msg = TranscriptMessage(
+            "tool_use", "Read", datetime(2026, 3, 9, tzinfo=timezone.utc)
+        )
+        assert _tool_summary(msg) == "⚒ Read"
+
+    def test_claude_label_is_purple(self) -> None:
+        # The role label's colour is a deliberate choice, not a theme default.
+        assert ".log-assistant {\n    color: #a78bfa;\n}" in CSS
+
+    @staticmethod
+    def _tool_run(count: int, names: list[str] | None = None) -> list[dict]:
+        """A run of `count` tool calls, each followed by its result."""
+        names = names or ["Bash"]
+        entries: list[dict] = []
+        for i in range(count):
+            entries.append(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": names[i % len(names)],
+                                "input": {"command": f"step {i}"},
+                            }
+                        ]
+                    },
+                }
+            )
+            entries.append(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [{"type": "tool_result", "content": f"out {i}"}]
+                    },
+                }
+            )
+        return entries
+
+    async def _open_log(self, app: SessionApp, pilot) -> None:
+        await self._open_actions(app, pilot, "wt-20260309-test")
+        await self._select(app, pilot, "#session-actions", "sa-viewlog")
+
+    @pytest.mark.asyncio
+    async def test_a_run_of_calls_folds_into_one_row(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [{"type": "user", "message": {"content": "go"}}]
+            + self._tool_run(10, ["Bash", "Read", "Edit"])
+            + [
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "Done."}]},
+                }
+            ],
+        )
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: [_log_session(log, wt)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(app, pilot)
+
+                # Twenty tool messages, but only one row at the top level.
+                runs = list(app.query(".log-tool-run"))
+                assert len(runs) == 1
+                run = runs[0]
+                assert isinstance(run, Collapsible)
+                assert run.collapsed is True
+                assert run.title == "⚒ 10 tool calls  Bash, Read, Edit"
+                # The prose either side is untouched.
+                assert self._body_texts(app) == ["go", "Done."]
+
+                # Opening the run reveals the calls, each still folded.
+                run.collapsed = False
+                await pilot.pause()
+                nested = list(run.query(".log-tool"))
+                # Ten calls, not ten calls plus ten results.
+                assert len(nested) == 10
+                assert all(c.collapsed for c in nested)
+
+    @pytest.mark.asyncio
+    async def test_a_lone_call_is_not_wrapped(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(tmp_path / "s.jsonl", self._tool_run(1))
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: [_log_session(log, wt)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(app, pilot)
+                # Wrapping a single row in another would only add a keystroke.
+                assert len(app.query(".log-tool-run")) == 0
+                assert len(app.query(".log-tool")) == 1
+
+    @pytest.mark.asyncio
+    async def test_runs_are_split_by_the_prose_between_them(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            self._tool_run(2)
+            + [
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "Halfway."}]},
+                }
+            ]
+            + self._tool_run(3),
+        )
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: [_log_session(log, wt)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(app, pilot)
+                runs = list(app.query(".log-tool-run"))
+                assert [r.title for r in runs] == [
+                    "⚒ 2 tool calls  Bash",
+                    "⚒ 3 tool calls  Bash",
+                ]
+
+    def test_run_title_caps_the_tool_names_it_lists(self) -> None:
+        ts = datetime(2026, 3, 9, tzinfo=timezone.utc)
+        run = [
+            TranscriptMessage("tool_use", name, ts)
+            for name in ("Bash", "Read", "Edit", "Grep", "Write", "Glob")
+        ]
+        assert _tool_run_title(run) == "⚒ 6 tool calls  Bash, Read, Edit, Grep, +2 more"
+
+    @pytest.mark.asyncio
+    async def test_parallel_calls_pair_with_their_own_results(
+        self, tmp_path: Path
+    ) -> None:
+        # Parallel calls arrive as several tool_use blocks followed by several
+        # results, so position alone would pair each call with the wrong reply.
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "t1",
+                                "name": "Read",
+                                "input": {"path": "a.py"},
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "t2",
+                                "name": "Grep",
+                                "input": {"pattern": "needle"},
+                            },
+                        ]
+                    },
+                },
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "t2",
+                                "content": "grep output",
+                            },
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "t1",
+                                "content": "read output",
+                            },
+                        ]
+                    },
+                },
+            ],
+        )
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: [_log_session(log, wt)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(app, pilot)
+                calls = list(app.query(".log-tool-run")[0].query(".log-tool"))
+                assert [c.title for c in calls] == [
+                    "⚒ Read  path: a.py",
+                    "⚒ Grep  pattern: needle",
+                ]
+                # Results are matched by tool_use_id, not by arrival order.
+                assert [str(w.visual) for w in calls[0].query(".log-body")] == [
+                    "path: a.py",
+                    "read output",
+                ]
+                assert [str(w.visual) for w in calls[1].query(".log-body")] == [
+                    "pattern: needle",
+                    "grep output",
+                ]
+
+    @pytest.mark.asyncio
+    async def test_an_unclaimed_result_still_gets_a_row(self, tmp_path: Path) -> None:
+        # A transcript can open mid-flight, with a reply whose call was never
+        # recorded. Dropping it would silently lose transcript content.
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {"type": "tool_result", "content": "orphaned output"}
+                        ]
+                    },
+                }
+            ],
+        )
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: [_log_session(log, wt)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(app, pilot)
+                rows = list(app.query(".log-tool"))
+                assert len(rows) == 1
+                assert rows[0].title.startswith("↳ Result (1 line)")
+                assert self._tool_body_texts(app) == ["orphaned output"]
+
+    def test_results_pair_positionally_when_a_log_has_no_ids(self) -> None:
+        ts = datetime(2026, 3, 9, tzinfo=timezone.utc)
+        run = [
+            TranscriptMessage("tool_use", "Bash\ncommand: one", ts),
+            TranscriptMessage("tool_result", "first out", ts),
+            TranscriptMessage("tool_use", "Bash\ncommand: two", ts),
+            TranscriptMessage("tool_result", "second out", ts),
+        ]
+        pairs = _pair_results(run)
+        assert [(call.text.splitlines()[1], result.text) for call, result in pairs] == [
+            ("command: one", "first out"),
+            ("command: two", "second out"),
+        ]
+
+    def test_a_call_with_no_result_pairs_with_none(self) -> None:
+        ts = datetime(2026, 3, 9, tzinfo=timezone.utc)
+        run = [TranscriptMessage("tool_use", "Bash\ncommand: hung", ts, "t1")]
+        assert _pair_results(run) == [(run[0], None)]

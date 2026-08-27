@@ -312,7 +312,7 @@ pydantic):
 - `get_claude_projects_dir()` — `~/.claude/projects`
 - `parse_session(jsonl_path)` — reads JSONL, tracks last meaningful (non-sidechain) entry, derives state. Skips lines that parse to a non-dict (a bare list or string is valid JSON but has no entry type), which previously raised `AttributeError` out of `get_sessions_for_path` and into the home screen.
 - `get_sessions_for_path(project_path)` — encodes path, globs `*.jsonl`, returns sorted sessions
-- `TranscriptMessage` — frozen dataclass: `role`, `text`, `timestamp`. `role` is one of `user`, `assistant`, `thinking`, `tool_use`, `tool_result` — the last three come from *content blocks*, not entry types
+- `TranscriptMessage` — frozen dataclass: `role`, `text`, `timestamp`, `tool_id`. `role` is one of `user`, `assistant`, `thinking`, `tool_use`, `tool_result` — the last three come from *content blocks*, not entry types. `tool_id` carries a `tool_use`'s `id` and a `tool_result`'s `tool_use_id`, so the viewer can pair a call with its own reply
 - `read_transcript(jsonl_path)` — reads a log into an ordered `list[TranscriptMessage]` for the read-only viewer. Skips sidechain (sub-agent), meta and unrecognized entries; clips tool inputs/results to 20 lines / 2000 chars (`_clip`) since whole-file payloads are unreadable in a TUI
 
 **`claude/search.py`** — Full-text search over transcript *contents* (as opposed
@@ -358,7 +358,27 @@ responsible for running it off the event loop.
   `read_transcript` output into `#log-panel` as a pair of `Static`s per message
   (`.log-role` + `.log-body`, coloured per role by `_TRANSCRIPT_ROLES`); bodies are
   `Content`, not markup, for the same reason search snippets are — transcript text
-  is arbitrary bytes. `#main` is already a `VerticalScroll`, so focusing it gives
+  is arbitrary bytes. Tool calls and results are the exception: they are the bulk
+  of a transcript by volume and the least of it by interest, so each becomes a
+  one-line `Collapsible` titled by `_tool_summary` (tool name + clipped first
+  argument), collapsed by default and reachable with Tab + Enter. A `tool_use`
+  body drops its first line, which the title already carries, and **its result is
+  rendered inside that same expansion** (arguments, a `↳ N lines` divider, then
+  the output) rather than as a row of its own — a call and its reply are one
+  thing to open. `_pair_results` matches them by `tool_id`, falling back to the
+  next unclaimed result for logs without ids; parallel calls arrive as several
+  `tool_use` blocks followed by several results, where position alone mis-pairs
+  them. A result nothing claims still gets its own row, so no transcript content
+  is silently dropped. **A *run* of consecutive tool messages nests inside one outer
+  `Collapsible`** (`.log-tool-run`, titled by `_tool_run_title` — call count plus
+  up to four distinct tool names) once it holds more than one call, so a session
+  that made twenty calls in a row costs one screen row rather than twenty; a lone
+  call stays unwrapped, since wrapping two rows in a third helps nobody. Runs are
+  delimited by the prose between them. `.log-tool` zeroes Textual's default
+  Collapsible `padding-bottom` and `border-top`, which otherwise read as gaps
+  between messages, and `.log-tool-run .log-tool` drops the top margin again
+  inside an opened run, where the calls are a list rather than separate
+  messages. `#main` is already a `VerticalScroll`, so focusing it gives
   arrow/page/end scrolling for free, and Escape falls through to `action_go_back`,
   which returns to the search results when the menu came from a search and to the
   home screen otherwise. Nothing is launched — this path never sets
