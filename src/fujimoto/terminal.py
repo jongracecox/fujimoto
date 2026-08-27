@@ -22,6 +22,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from fujimoto import debug
+
 # (executable, args-with-{dir}-placeholder). First match on PATH wins.
 _LINUX_TERMINALS: list[tuple[str, list[str]]] = [
     ("x-terminal-emulator", ["--working-directory={dir}"]),
@@ -113,6 +115,12 @@ def open_terminal(directory: Path) -> None:
     macOS: iTerm2 if installed, otherwise Terminal.app.
     Linux: ``FUJIMOTO_TERMINAL`` env var, or auto-detected terminal emulator.
     """
+    debug.log(
+        "terminal.open",
+        directory=debug.rp(directory),
+        platform=sys.platform,
+        fujimoto_terminal=os.environ.get("FUJIMOTO_TERMINAL", "[unset]"),
+    )
     if sys.platform == "darwin":
         if _has_iterm():
             _open_iterm(directory)

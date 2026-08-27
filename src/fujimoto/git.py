@@ -3,6 +3,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from fujimoto import debug
+
 
 class GitError(Exception):
     pass
@@ -17,11 +19,23 @@ def _run(args: list[str], cwd: Path | str | None = None) -> str:
             text=True,
             check=True,
         )
-        return result.stdout.strip()
     except subprocess.CalledProcessError as e:
+        debug.log_command(
+            "git", args, cwd=cwd, returncode=e.returncode, stderr=e.stderr or ""
+        )
         raise GitError(e.stderr.strip() or str(e)) from e
     except FileNotFoundError:
+        debug.log_command("git", args, cwd=cwd, returncode="not-found")
         raise GitError("git is not installed or not on PATH")
+    debug.log_command(
+        "git",
+        args,
+        cwd=cwd,
+        returncode=result.returncode,
+        stdout=result.stdout,
+        stderr=result.stderr,
+    )
+    return result.stdout.strip()
 
 
 def get_repo_root(cwd: Path | str | None = None) -> Path:

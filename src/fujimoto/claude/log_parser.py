@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 
+from fujimoto import debug
+
 
 class ClaudeLogError(Exception):
     pass
@@ -205,6 +207,12 @@ def _cwd_index() -> dict[str, list[Path]]:
                 dirs.append(session_dir)
 
     _cwd_index_cache = (projects_dir, mtime, index)
+    debug.log(
+        "claude.cwd_index",
+        projects_dir=debug.rp(projects_dir),
+        dirs=len(entries),
+        cwds=len(index),
+    )
     return index
 
 
@@ -217,19 +225,55 @@ def session_dirs_for_path(project_path: Path) -> list[Path]:
     """
     projects_dir = get_claude_projects_dir()
 
+    variants = _path_variants(project_path)
     candidates: list[Path] = []
-    for variant in _path_variants(project_path):
+    for variant in variants:
         session_dir = projects_dir / encode_project_path(variant)
         if session_dir not in candidates and session_dir.is_dir():
             candidates.append(session_dir)
     if candidates:
+        # Which strategy resolved the lookup is the whole diagnostic value
+        # here: path encoding is a guess at another program's convention.
+        debug.log_capped(
+            "claude.session_dirs.resolved",
+            "claude.session_dirs",
+            dedupe_key=f"claude-dirs-{project_path}",
+            path=debug.rp(project_path),
+            variants=len(variants),
+            via="encoded-name",
+            dirs=len(candidates),
+        )
         return candidates
 
     index = _cwd_index()
-    for variant in _path_variants(project_path):
+    for variant in variants:
         found = index.get(_normalize(variant))
         if found:
+            # The fallback firing is unusual enough to always be worth a line.
+            debug.log_once(
+                f"claude-dirs-{project_path}",
+                "claude.session_dirs",
+                path=debug.rp(project_path),
+                variants=len(variants),
+                via="cwd-index",
+                dirs=len(found),
+            )
             return list(found)
+    # A path with no transcripts is the normal state of an old worktree, so
+    # these are capped — but the encoded name is logged for the ones that are,
+    # since a wrong encoding is exactly what this line exists to catch.
+    debug.log_capped(
+        "claude.session_dirs.missing",
+        "claude.session_dirs",
+        dedupe_key=f"claude-dirs-{project_path}",
+        limit=5,
+        path=debug.rp(project_path),
+        variants=len(variants),
+        via="none",
+        dirs=0,
+        encoded=debug.rv(encode_project_path(project_path)),
+        indexed_cwds=len(index),
+    )
     return []
 
 
@@ -256,9 +300,16 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
     try:
         text = jsonl_path.read_text()
     except OSError as e:
+        debug.log(
+            "claude.parse_failed",
+            log=debug.rp(jsonl_path),
+            reason="unreadable",
+            error=e,
+        )
         raise ClaudeLogError(f"Cannot read {jsonl_path}: {e}")
 
     if not text.strip():
+        debug.log("claude.parse_failed", log=debug.rp(jsonl_path), reason="empty")
         raise ClaudeLogError(f"Empty session log: {jsonl_path}")
 
     last_meaningful: dict | None = None
@@ -377,7 +428,7 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
         # Last meaningful entry is USER → working
         state = SessionState.WORKING
 
-    return ClaudeSession(
+    session = ClaudeSession(
         jsonl_path=jsonl_path,
         session_id=session_id,
         state=state,
@@ -389,6 +440,22 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
         title=custom_title,
         first_prompt=first_prompt,
     )
+    debug.log_once(
+        f"claude-session-{session_id}",
+        "claude.session",
+        id=session_id,
+        state=state,
+        last_entry=entry_type,
+        stop_reason=stop_reason,
+        ended=session_ended,
+        tool_result_after_tool_use=tool_result_after_last_tool_use,
+        cwd=debug.rp(session.cwd),
+        branch=debug.rv(session.git_branch),
+        last_activity=session.last_activity.isoformat(),
+        titled=custom_title is not None,
+        bytes=len(text),
+    )
+    return session
 
 
 def get_sessions_for_path(project_path: Path) -> list[ClaudeSession]:
@@ -398,19 +465,67 @@ def get_sessions_for_path(project_path: Path) -> list[ClaudeSession]:
     Returns an empty list when no session directory resolves to the path, or
     when the ones that do hold no parseable JSONL files.
     """
+    encoded = encode_project_path(project_path)
+    session_dirs = session_dirs_for_path(project_path)
+
+    if not session_dirs:
+        debug.log_capped(
+            "claude.discovery.empty",
+            "claude.discovery",
+            dedupe_key=f"claude-dir-{encoded}",
+            limit=5,
+            path=debug.rp(project_path),
+            encoded=debug.rv(encoded),
+            projects_dir=debug.rp(get_claude_projects_dir()),
+            exists=False,
+        )
+        return []
+
     sessions: list[ClaudeSession] = []
     seen: set[Path] = set()
-    for session_dir in session_dirs_for_path(project_path):
-        for jsonl_file in session_dir.glob("*.jsonl"):
+    failed = 0
+    for session_dir in session_dirs:
+        for jsonl_file in sorted(session_dir.glob("*.jsonl")):
             if jsonl_file in seen:
                 continue
             seen.add(jsonl_file)
             try:
                 sessions.append(parse_session(jsonl_file))
             except ClaudeLogError:
+                failed += 1
                 continue
 
     sessions.sort(key=lambda s: s.last_activity, reverse=True)
+    latest = sessions[0].session_id if sessions else "none"
+    if failed:
+        # Never capped away: this is the difference between "no sessions" and
+        # "sessions fujimoto could not read". The fields are spelled out in
+        # both branches rather than unpacked from a dict, so a field can never
+        # collide with `log_capped`'s own keywords.
+        debug.log_once(
+            f"claude-dir-{encoded}",
+            "claude.discovery",
+            path=debug.rp(project_path),
+            encoded=debug.rv(encoded),
+            exists=True,
+            logs=len(seen),
+            parsed=len(sessions),
+            failed=failed,
+            latest=latest,
+        )
+    else:
+        debug.log_capped(
+            "claude.discovery.found",
+            "claude.discovery",
+            dedupe_key=f"claude-dir-{encoded}",
+            path=debug.rp(project_path),
+            encoded=debug.rv(encoded),
+            exists=True,
+            logs=len(seen),
+            parsed=len(sessions),
+            failed=failed,
+            latest=latest,
+        )
     return sessions
 
 

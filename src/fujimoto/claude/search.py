@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from fujimoto import debug
 from fujimoto.claude.log_parser import (
     ClaudeLogError,
     ClaudeSession,
@@ -158,7 +159,23 @@ def compile_matcher(
     try:
         pattern = re.compile(source, flags)
     except re.error as e:
+        debug.log(
+            "search.compile",
+            query=debug.rv(query),
+            regex=regex,
+            mode=mode,
+            case_sensitive=case_sensitive,
+            error=str(e),
+        )
         raise SearchError(f"invalid regex: {e}") from e
+    debug.log(
+        "search.compile",
+        query=debug.rv(query),
+        chars=len(query),
+        regex=regex,
+        mode=mode,
+        case_sensitive=case_sensitive,
+    )
     return Matcher(pattern=pattern, mode=mode)
 
 
@@ -188,7 +205,17 @@ def list_session_logs(
                 except OSError:  # pragma: no cover - vanished glob->stat
                     continue
 
-    return sorted(mtimes, key=lambda p: mtimes[p], reverse=True)
+    logs = sorted(mtimes, key=lambda p: mtimes[p], reverse=True)
+    # "Search found nothing" is ambiguous without knowing whether there was
+    # anything to search in the first place.
+    debug.log_once(
+        "search-logs",
+        "search.logs",
+        targets=len(targets),
+        project_root=debug.rp(project_root) if project_root else "none",
+        logs=len(logs),
+    )
+    return logs
 
 
 def search_log(log_path: Path, matcher: Matcher) -> SearchHit | None:
@@ -200,7 +227,12 @@ def search_log(log_path: Path, matcher: Matcher) -> SearchHit | None:
     """
     try:
         text = log_path.read_text(errors="replace")
-    except OSError:
+    except OSError as exc:
+        debug.log(
+            "search.log_unreadable",
+            log=debug.rp(log_path),
+            error=type(exc).__name__,
+        )
         return None
 
     if not matcher.present_in(text):
@@ -218,7 +250,15 @@ def search_log(log_path: Path, matcher: Matcher) -> SearchHit | None:
 
     try:
         session = parse_session(log_path)
-    except ClaudeLogError:
+    except ClaudeLogError as exc:
+        # The log matched but could not be parsed, so the hit is dropped —
+        # invisible to the user, and worth seeing in a debug log.
+        debug.log(
+            "search.hit_discarded",
+            log=debug.rp(log_path),
+            matches=count,
+            reason=str(exc),
+        )
         return None
 
     return SearchHit(session=session, match_count=count, snippets=tuple(snippets))
@@ -241,11 +281,13 @@ def iter_hits(
     >>> list(iter_hits([], compile_matcher("x")))
     [(0, ())]
     """
+    debug.log("search.scan", phase="start", logs=len(logs), mode=matcher.mode)
     if not logs:
         yield 0, ()
         return
 
     batch: list[SearchHit] = []
+    hits = 0
     scanned = 0
     for log in logs:
         if is_cancelled is not None and is_cancelled():
@@ -254,12 +296,21 @@ def iter_hits(
         scanned += 1
         if hit is not None:
             batch.append(hit)
+            hits += 1
         if scanned % batch_size == 0:
             yield scanned, tuple(batch)
             batch = []
 
     if scanned % batch_size:
         yield scanned, tuple(batch)
+    debug.log(
+        "search.scan",
+        phase="done",
+        logs=len(logs),
+        scanned=scanned,
+        hits=hits,
+        mode=matcher.mode,
+    )
 
 
 def _scan_raw(text: str, matcher: Matcher) -> tuple[int, list[Snippet]]:

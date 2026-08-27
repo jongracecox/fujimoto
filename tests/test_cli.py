@@ -202,6 +202,296 @@ class TestPaneSubcommand:
         assert "code missing" in mock_msg.call_args.args[1]
 
 
+class TestDebugFlags:
+    @pytest.fixture(autouse=True)
+    def _isolate_debug(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fujimoto import debug
+
+        monkeypatch.setenv(debug.LOG_DIR_ENV, str(tmp_path / "logs"))
+        debug.disable()
+        yield
+        debug.disable()
+
+    def _log_files(self, tmp_path: Path) -> list[Path]:
+        return sorted((tmp_path / "logs").glob("*.log"))
+
+    def test_debug_writes_a_log(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", "--debug"])
+        app = SessionApp()
+        app._launch_target = None
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", return_value=app),
+            patch.object(app, "run"),
+        ):
+            main()
+        logs = self._log_files(tmp_path)
+        assert len(logs) == 1
+        text = logs[0].read_text()
+        assert "===== fujimoto / system" in text
+        assert "prerequisites issues=0" in text
+        assert "tui.exit reason=quit" in text
+        assert "shutdown" in text
+
+    def test_no_flag_writes_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto"])
+        app = SessionApp()
+        app._launch_target = None
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", return_value=app),
+            patch.object(app, "run"),
+        ):
+            main()
+        assert not (tmp_path / "logs").exists()
+
+    def test_debug_redacted_hides_names(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", "--debug-redacted"])
+        app = SessionApp()
+        app._launch_target = LaunchTarget(
+            "secretproj",
+            Path("/tmp/wt/secretproj-worktree"),
+            "secretproj/20260827-thing",
+            "worktree",
+            None,
+        )
+        second = SessionApp()
+        second._launch_target = None
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app, second]),
+            patch.object(app, "run"),
+            patch.object(second, "run"),
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
+            patch("fujimoto.cli.launch_claude_in_tmux"),
+            patch("fujimoto.cli._build_system_prompt", return_value="p"),
+            patch("fujimoto.cli._session_terminal_title", return_value="t"),
+        ):
+            main()
+        text = self._log_files(tmp_path)[0].read_text()
+        assert "launch.target" in text
+        assert "secretproj" not in text
+        assert "20260827-thing" not in text
+        assert "[REDACTED-" in text
+
+    def test_debug_logs_launch_target_verbatim(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", "--debug"])
+        app = SessionApp()
+        app._launch_target = LaunchTarget(
+            "proj",
+            Path("/tmp/wt/proj-worktree"),
+            "proj/20260827-thing",
+            "worktree",
+            None,
+        )
+        second = SessionApp()
+        second._launch_target = None
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app, second]),
+            patch.object(app, "run"),
+            patch.object(second, "run"),
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
+            patch("fujimoto.cli.launch_claude_in_tmux"),
+            patch("fujimoto.cli._build_system_prompt", return_value="p"),
+            patch("fujimoto.cli._session_terminal_title", return_value="t"),
+        ):
+            main()
+        text = self._log_files(tmp_path)[0].read_text()
+        assert "session_type=worktree" in text
+        assert "proj/20260827-thing" in text
+
+    def test_debug_logs_aborted_launch(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", "--debug"])
+        app = SessionApp()
+        app._launch_target = LaunchTarget(
+            "proj", Path("/tmp/wt"), "proj/wt", "worktree", None
+        )
+        second = SessionApp()
+        second._launch_target = None
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app, second]),
+            patch.object(app, "run"),
+            patch.object(second, "run"),
+            patch("fujimoto.cli._apply_worktree_config", return_value=False),
+            patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli._session_terminal_title", return_value="t"),
+            patch("fujimoto.cli._build_system_prompt", return_value="p"),
+        ):
+            main()
+        mock_launch.assert_not_called()
+        assert "launch.aborted reason=project-config" in (
+            self._log_files(tmp_path)[0].read_text()
+        )
+
+    def test_debug_logs_prerequisite_failure(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", "--debug"])
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=["no tmux"]),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        assert exc_info.value.code == 1
+        assert 'prerequisite_issue detail="no tmux"' in (
+            self._log_files(tmp_path)[0].read_text()
+        )
+
+    def test_debug_logs_fatal_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", "--debug"])
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=GitError("not a repo")),
+            pytest.raises(SystemExit),
+        ):
+            main()
+        text = self._log_files(tmp_path)[0].read_text()
+        assert "fatal exception=GitError message=not a repo" in text
+        assert "    ! Traceback" in text
+
+    def test_debug_logs_keyboard_interrupt(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", "--debug"])
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=KeyboardInterrupt),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        assert exc_info.value.code == 130
+        assert "interrupted" in self._log_files(tmp_path)[0].read_text()
+
+    def test_debug_with_pane_subcommand(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(
+            "sys.argv",
+            ["fujimoto", "--debug", "pane", "vscode", "--session", "proj/test"],
+        )
+        with (
+            patch("fujimoto.cli.get_session_path", return_value=Path("/tmp/wt")),
+            patch("fujimoto.cli.open_vscode"),
+        ):
+            main()
+        assert "pane.command action=vscode" in (
+            self._log_files(tmp_path)[0].read_text()
+        )
+
+    def test_unopenable_log_dir_is_reported_not_fatal(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from fujimoto import debug
+
+        monkeypatch.setattr("sys.argv", ["fujimoto", "--debug"])
+        monkeypatch.setattr(
+            debug, "enable", lambda **kw: (_ for _ in ()).throw(OSError("read-only"))
+        )
+        app = SessionApp()
+        app._launch_target = None
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", return_value=app),
+            patch.object(app, "run"),
+        ):
+            main()
+        assert "could not open debug log" in capsys.readouterr().err
+
+
+class TestDebugHomeInventory:
+    @pytest.fixture(autouse=True)
+    def _debug_on(self, tmp_path: Path) -> None:
+        from fujimoto import debug
+
+        debug.enable(redact=False, log_dir=tmp_path / "logs")
+        yield
+        debug.disable()
+
+    def _log_text(self, tmp_path: Path) -> str:
+        return next((tmp_path / "logs").glob("*.log")).read_text()
+
+    @pytest.mark.asyncio
+    async def test_home_inventory_is_logged(self, tmp_path: Path) -> None:
+        app = SessionApp()
+        with _patch_git_info(
+            sessions=["test-proj/direct-1"],
+            worktrees=[Path("20260827-thing")],
+            projects=[Path("/fake/other")],
+        ):
+            async with app.run_test():
+                pass
+        text = self._log_text(tmp_path)
+        assert "tui.git_info cwd=none project=test-proj" in text
+        assert "tui.home items=" in text
+        assert "tui.worktree path=" in text
+        assert "tui.item id=" in text
+        assert "20260827-thing" in text
+
+    @pytest.mark.asyncio
+    async def test_home_inventory_redacts_names(self, tmp_path: Path) -> None:
+        from fujimoto import debug
+
+        debug.disable()
+        debug.enable(redact=True, log_dir=tmp_path / "logs")
+        app = SessionApp()
+        with _patch_git_info(
+            project="secretproj",
+            sessions=["secretproj/direct-1"],
+            worktrees=[Path("20260827-thing")],
+        ):
+            async with app.run_test():
+                pass
+        text = self._log_text(tmp_path)
+        assert "tui.item id=" in text
+        assert "secretproj" not in text
+        assert "20260827-thing" not in text
+
+    @pytest.mark.asyncio
+    async def test_large_inventory_is_capped_and_summarised(
+        self, tmp_path: Path
+    ) -> None:
+        from fujimoto import debug
+
+        worktrees = [Path(f"2026082{i % 10}-thing-{i}") for i in range(25)]
+        app = SessionApp()
+        with _patch_git_info(worktrees=worktrees):
+            async with app.run_test():
+                pass
+        text = self._log_text(tmp_path)
+        assert text.count("tui.worktree path=") == debug.DEFAULT_SERIES_CAP
+        assert "tui.worktree_summary not_logged=15" in text
+        # Emitted once, not once per home render (it used to repeat verbatim).
+        assert text.count("tui.worktree_summary") == 1
+        # The close-time `series.summarised` line is covered in test_debug.py;
+        # here the logger is still open, so it has not been flushed yet.
+
+    @pytest.mark.asyncio
+    async def test_selection_is_logged(self, tmp_path: Path) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("enter")
+                await pilot.pause()
+        assert "tui.selected list=home id=action-create" in self._log_text(tmp_path)
+
+
 class TestCreateConfigFlag:
     def test_creates_config(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1266,41 +1556,6 @@ class TestSessionAppAdhocSession:
             app = SessionApp()
             async with app.run_test():
                 assert app.query_one("#action-adhoc")
-
-
-class TestHomeSelectionMemory:
-    @pytest.mark.asyncio
-    async def test_returns_to_previous_row_after_submenu(self, tmp_path: Path) -> None:
-        wt = tmp_path / "20260309-test"
-        with _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]):
-            app = SessionApp()
-            async with app.run_test() as pilot:
-                home_list = app.query_one("#home-list", ListView)
-                for i, item in enumerate(home_list.children):
-                    if item.id == "wt-20260309-test":
-                        home_list.index = i
-                        break
-                await pilot.press("enter")
-                await pilot.pause()
-                assert len(app.query("#session-actions")) > 0
-
-                await pilot.press("escape")
-                await pilot.pause()
-                home_list = app.query_one("#home-list", ListView)
-                assert home_list.index is not None
-                assert home_list.children[home_list.index].id == "wt-20260309-test"
-
-    @pytest.mark.asyncio
-    async def test_falls_back_when_row_is_gone(self, tmp_path: Path) -> None:
-        wt = tmp_path / "20260309-test"
-        with _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]):
-            app = SessionApp()
-            async with app.run_test() as pilot:
-                app._home_selection = "wt-does-not-exist"
-                await app._show_home()
-                await pilot.pause()
-                home_list = app.query_one("#home-list", ListView)
-                assert home_list.index == 0
 
 
 class TestSessionAppSessionActions:

@@ -26,6 +26,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from fujimoto import debug
+
 
 def _state_path() -> Path:
     return Path.home() / ".cache" / "fujimoto" / "sessions.json"
@@ -57,24 +59,56 @@ def load_state() -> dict[str, SessionRecord]:
     """Read the open-session records, tolerating a missing or corrupt file."""
     path = _state_path()
     if not path.exists():
+        debug.log_once(
+            "session-state-load",
+            "session_state.load",
+            path=debug.rp(path),
+            found=False,
+        )
         return {}
     try:
         data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        debug.log(
+            "session_state.load",
+            path=debug.rp(path),
+            found=True,
+            error=type(exc).__name__,
+        )
         return {}
     if not isinstance(data, dict):
+        debug.log(
+            "session_state.load",
+            path=debug.rp(path),
+            found=True,
+            error="not-an-object",
+        )
         return {}
 
     records: dict[str, SessionRecord] = {}
+    skipped = 0
     fields = {"cwd", "project", "session_type", "branch", "claude_session_id"}
     for name, raw in data.items():
         if not isinstance(raw, dict) or not isinstance(raw.get("cwd"), str):
+            # A malformed record is silently dropped, which otherwise looks
+            # exactly like a session that was never launched.
+            skipped += 1
+            debug.log("session_state.skipped", session=debug.rv(name))
             continue
         kwargs = {k: v for k, v in raw.items() if k in fields}
         records[name] = SessionRecord(
             **kwargs,
             last_seen=raw.get("last_seen") or "",
         )
+    debug.log_once(
+        "session-state-load",
+        "session_state.load",
+        path=debug.rp(path),
+        found=True,
+        records=len(records),
+        skipped=skipped,
+        sessions=",".join(debug.rv(n) for n in sorted(records)),
+    )
     return records
 
 
@@ -86,8 +120,10 @@ def save_state(state: dict[str, SessionRecord]) -> None:
         path.write_text(
             json.dumps({name: asdict(rec) for name, rec in state.items()}, indent=2)
         )
-    except OSError:
-        pass
+    except OSError as exc:
+        debug.log("session_state.save", path=debug.rp(path), error=type(exc).__name__)
+        return
+    debug.log("session_state.save", path=debug.rp(path), records=len(state))
 
 
 def mark_open(
@@ -114,13 +150,25 @@ def mark_open(
         claude_session_id=claude_session_id,
         last_seen=_now(),
     )
+    debug.log(
+        "session_state.mark_open",
+        session=debug.rv(tmux_name),
+        cwd=debug.rp(cwd),
+        project=debug.rv(project),
+        session_type=session_type,
+        branch=debug.rref(branch),
+        claude_session=claude_session_id or "none",
+        new_record=existing is None,
+    )
     save_state(state)
 
 
 def mark_closed(tmux_name: str) -> None:
     """Forget a session. The only path by which a session stops being open."""
     state = load_state()
-    if state.pop(tmux_name, None) is not None:
+    removed = state.pop(tmux_name, None) is not None
+    debug.log("session_state.mark_closed", session=debug.rv(tmux_name), removed=removed)
+    if removed:
         save_state(state)
 
 
@@ -129,7 +177,14 @@ def touch(tmux_name: str, claude_session_id: str | None = None) -> None:
     state = load_state()
     record = state.get(tmux_name)
     if record is None:
+        debug.log("session_state.touch", session=debug.rv(tmux_name), found=False)
         return
+    debug.log(
+        "session_state.touch",
+        session=debug.rv(tmux_name),
+        found=True,
+        claude_session=claude_session_id or "unchanged",
+    )
     record.last_seen = _now()
     if claude_session_id is not None:
         record.claude_session_id = claude_session_id
@@ -140,6 +195,12 @@ def rename(old_name: str, new_name: str) -> None:
     """Follow a tmux session rename so its record isn't orphaned."""
     state = load_state()
     record = state.pop(old_name, None)
+    debug.log(
+        "session_state.rename",
+        old=debug.rv(old_name),
+        new=debug.rv(new_name),
+        found=record is not None,
+    )
     if record is None:
         return
     state[new_name] = record
@@ -154,6 +215,21 @@ def prune() -> dict[str, SessionRecord]:
     """
     state = load_state()
     live = {name: rec for name, rec in state.items() if rec.path.exists()}
+    dropped = [name for name in state if name not in live]
+    for name in dropped:
+        # The usual cause of a session vanishing from the home screen.
+        debug.log(
+            "session_state.pruned",
+            session=debug.rv(name),
+            cwd=debug.rp(state[name].cwd),
+        )
+    debug.log_once(
+        "session-state-prune",
+        "session_state.prune",
+        records=len(state),
+        live=len(live),
+        dropped=len(dropped),
+    )
     if len(live) != len(state):
         save_state(live)
     return live

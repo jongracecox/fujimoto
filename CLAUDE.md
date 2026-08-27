@@ -24,6 +24,7 @@ export FUJIMOTO_WINDOW_TITLE="{git_project} - {worktree_name}"   # Optional: ter
 export FUJIMOTO_META_KEY="C-a"                                   # Optional: in-session fujimoto chord (blank to disable)
 export FUJIMOTO_TMUX_PREFIX="C-b"                                # Optional: tmux prefix key (default: C-b)
 export FUJIMOTO_QUICK_TERMINAL_KEY="C-\`"                        # Optional: global quick-terminal toggle key (blank to disable)
+export FUJIMOTO_LOG_DIR=~/.fujimoto/logs                         # Optional: where --debug logs are written
 ```
 
 `FUJIMOTO_TERMINAL` only applies on Linux. Use `{dir}` as a placeholder for the
@@ -112,6 +113,7 @@ src/fujimoto/
 ├── version_check.py  # daily PyPI update check, dismissal cache (~/.cache/fujimoto/)
 ├── settings.py   # persistent user settings (~/.cache/fujimoto/settings.json)
 ├── session_state.py   # which sessions the user still considers open
+├── debug.py      # --debug / --debug-redacted diagnostic logging + redaction
 ├── project_config.py  # optional per-project .fujimoto.yaml (copy/link/init worktree setup)
 ├── templates/
 │   ├── __init__.py
@@ -129,6 +131,7 @@ src/fujimoto/
 `cli.py:main()` is the package entry point (`pyproject.toml` `[project.scripts]`). It parses CLI args:
 - `--version`/`-V` prints `fujimoto {version}` and exits
 - `--create-config` writes a commented `.fujimoto.yaml` template to the repo root (via `project_config.write_config_template`) and exits; errors (already exists, not a git repo) print to stderr and exit 1.
+- `--debug` / `--debug-redacted` turn on diagnostic logging (see `debug.py`) before anything else runs, via `_start_debug_log(redact=...)`; `_finish_debug_log()` closes the log on every exit path (normal quit, prerequisite failure, fatal error, KeyboardInterrupt, and the `pane` subcommand). Both flags work alongside `pane`.
 - `fujimoto pane <vscode|terminal> --session <name>` dispatches to `_run_pane_command`, used by the in-session tmux key table (`Ctrl-A v` / `Ctrl-A w`). Resolves the session's working directory via `tmux display-message -p '#{session_path}'` and calls the existing `open_vscode` / `open_terminal` helpers; errors are surfaced via `tmux display-message` so they appear in the session's status bar.
 
 Otherwise it:
@@ -281,6 +284,73 @@ pydantic):
   `templates/fujimoto.yaml.template` (via `importlib.resources`) and scaffold it
   into a repo (refusing to overwrite an existing file).
 
+**`debug.py`** — Diagnostic logging for support (`--debug` / `--debug-redacted`):
+- Owns a process-wide optional `DebugLogger`. Every helper (`log`, `log_once`,
+  `log_section`, `log_command`, `log_exception`, `rv`, `rp`) is a cheap no-op
+  when debug mode is off, so call sites log unconditionally.
+- `enable(redact=..., log_dir=None)` opens
+  `<log_dir>/fujimoto-<YYYYMMDD-HHMMSS>-<pid>.log`, where `log_dir` defaults to
+  `$FUJIMOTO_LOG_DIR` (`LOG_DIR_ENV`) or `~/.fujimoto/logs`, and writes a header
+  documenting the redaction mode. `disable()` closes it. `is_enabled()` guards
+  expensive collection.
+- `log_environment()` records fujimoto/Python/platform versions, `argv`, cwd,
+  tty state, the versions of `tmux`/`git`/`claude`/`gh`/`code`/`uv`/`brew` on
+  PATH (`_tool_version` keeps the executable basename readable), and every
+  `FUJIMOTO_*`/`CLAUDE_*`/`ANTHROPIC_*` plus curated terminal/shell env var.
+  Values whose name matches `is_secret_name()` become `[SECRET-<len>]`
+  **regardless of redaction mode** — secrets are never logged.
+- `log_once(key, event, **fields)` writes only when the payload for `key`
+  changed; used for polled state (Claude discovery, tmux session lists) so a
+  long-lived run doesn't drown in repeats.
+- `log_capped(series, event, *, limit=DEFAULT_SERIES_CAP, dedupe_key=None, ...)`
+  logs the first `limit` items of a repeating series and counts the rest;
+  `close()` then writes one `series.summarised series=… logged=… not_logged=…
+  total=…` line per series, so the log always states what it left out and no
+  call site has to remember to summarise. Passing `dedupe_key` composes the cap
+  with `log_once` semantics, so re-renders spend the budget on *distinct*
+  subjects — 47 worktrees over three home renders is 141 calls but `total=47`.
+  Used by the home inventory (`tui.worktree`, `tui.item`), `config.read_meta`
+  and Claude discovery; the caller may add its own richer summary of the
+  remainder (`tui.worktree_summary`, `tui.item_summary`) since it knows what
+  the items were — but that summary needs `log_once`, or it repeats verbatim on
+  every home render. Order the loop so the interesting items come first — the
+  home inventory logs running sessions before idle ones, and worktrees
+  newest-first.
+- **Split a series by outcome, and never cap a failure.** `claude.session_dirs`
+  and `claude.discovery` fire once per worktree, and on a machine with ~50 of
+  them that was 96 of a 290-line log — three quarters of it "no transcripts
+  here", which is the normal state of an old worktree. They now use separate
+  series per outcome (`.resolved`/`.missing`, `.found`/`.empty`) so the routine
+  case cannot crowd out the interesting one, with a tighter limit on the routine
+  one. A discovery with `failed>0` — a transcript fujimoto could not read —
+  bypasses the cap entirely, since that is the difference between "no sessions"
+  and "sessions I could not parse". The `cwd-index` fallback is likewise never
+  capped: it firing at all is the diagnostic.
+- Redaction: `redact_text` → `[REDACTED-<fingerprint>-<len>[-CONTAINS<chars>]]`
+  (shape-preserving; the fingerprint is **salted per run** by `enable()` and the
+  salt is never logged, so equal values correlate within one log and a
+  fingerprint is meaningless outside it);
+  `redact_path` keeps separators/depth, collapses `$HOME` to `~`, preserves
+  `_SAFE_PATH_COMPONENTS` (OS directories and *dotted* config dirs — components
+  that cannot be a name the user chose) and, **only under an owned parent**,
+  `_OWNED_NAMES` (`~/.cache/fujimoto/sessions.json` reads plainly while
+  `~/git/fujimoto` does not). `redact_arg` keeps flags, lowercase subcommands
+  and git's ref vocabulary (`_SAFE_REF_COMPONENTS` via `_is_git_ref`);
+  `redact_ref`/`rref` keep `main`/`HEAD` where a value is known to be a ref;
+  `redact_id`/`rid` keep a widget id's kind prefix (`ds-`, `sa-`) and redact the
+  tail. Captured command output is redacted token-by-token with `redact_arg`.
+- Instrumented call sites: `git._run` (every command + rc + output),
+  `tmux` (install/list/create/attach/kill/rename/configure/quick-terminal),
+  `claude/log_parser` (which lookup strategy resolved a path — encoded name,
+  cwd-index or nothing — plus discovery counts, per-session parse results and
+  failures), `claude/search` (query compile, logs available, scan start/finish
+  with scanned/hit counts, unreadable logs, discarded hits),
+  `session_state` (load/save, mark_open/closed, touch, rename, and every
+  skipped or pruned record), `config` (resolved roots, session meta),
+  `project_config` (load, apply, actions, warnings), `settings`, `terminal`,
+  `vscode`, and `cli` (git info, home inventory, selections, launch target,
+  prerequisites, fatals).
+
 **`tmux.py`** — tmux session management:
 - `is_tmux_installed()` / `install_tmux()` — detection and install. macOS: brew install. Linux: raises `TmuxError` with a distro-appropriate install command (apt-get/dnf/pacman/zypper/apk) — does not invoke sudo automatically.
 - `list_all_sessions()` — lists all active tmux session names
@@ -423,6 +493,14 @@ Three custom exception types, all caught in `main()`:
   - **`once` vs `always`**: trigger is `CREATE` only on the worktree's first launch — tracked by the `.fujimoto/config_once_applied` marker (`config.config_once_applied` / `mark_config_once_applied`); every later connection uses `LAUNCH` (only `always` entries). The marker is set after a successful (or `on_error=continue`) CREATE application, so `once` truly runs once.
   - **Syntax errors are surfaced when the TUI opens.** `on_mount` calls `_project_config_error()` (which parses `load_project_config(self._project_root)`) and, on a `ConfigError`, pushes a `ConfigErrorDialog` modal (OK button; Enter/Escape to dismiss) over the home screen. It's informational only — dismissing it doesn't block any action, since you may need to launch a session to fix the file. Shown once per TUI appearance (per `SessionApp` instance / loop iteration). At launch time `_apply_worktree_config` simply skips a malformed config (no pause), since it's already been surfaced. The dialog (and `_show_error`) render the message with `markup=False` / `rich.markup.escape` because pydantic validation text contains brackets that would otherwise be parsed as console markup.
   - **Errors**: copy/link issues are non-fatal warnings printed to stderr. A non-`continue_on_error` init failure is governed by the config's `on_error`: `abort` returns `False` (main `continue`s the loop → TUI reopens, launch skipped) and `continue` attaches anyway. Either way `_pause_for_key` shows the error and waits for a keypress so it isn't wiped by `tmux attach`.
+- **Debug logging (`--debug` / `--debug-redacted`)**: instrumentation lives at
+  the call sites that matter (subprocess wrappers, discovery functions, TUI
+  state) rather than in a wrapper layer, so it covers every code path
+  including ones the TUI can't reach. It is opt-in and no-op by default, which
+  keeps the normal path free of I/O. `--debug-redacted` exists so a user can
+  hand over a log without leaking project/branch/path names, while still
+  showing lengths and special characters — enough to diagnose bugs caused by
+  odd characters in a project name.
 - **Background PR creation**: Uses `claude -p --allowedTools "Bash(git:*) Bash(gh:*)"` in a tmux session for unattended PR creation.
 - **Claude session integration**: The home screen fetches Claude session state from `~/.claude/projects/` JSONL logs via the log parser. Session states: 👀 awaiting input (`WAITING_FOR_USER`), 🛡️ approve tool (`WAITING_FOR_TOOL_APPROVAL`), ⚙ working (`WORKING`), 💤 idle (`IDLE`), no indicator (`UNKNOWN`). State logic: `last-prompt` marker → `IDLE` (session ended). For assistant entries: `stop_reason=tool_use` without a following `tool_result` → `WAITING_FOR_TOOL_APPROVAL` (pending user approval), `stop_reason=tool_use` with `tool_result` → `WORKING`, any other stop reason or no stop reason → `WAITING_FOR_USER`. Last entry is user → `WORKING`. Previous Claude sessions (from the project root, capped at 5) appear as resumable items. Resuming launches `claude --resume SESSION_ID` in a new tmux session. The latest Claude session per path is "claimed" by the corresponding tmux/worktree item to avoid duplication.
 - **Forking a session**: "Fork session" creates a new worktree *and* forks the conversation in one step — `git worktree add -b worktree/<new> <path> <base>` followed by `claude --resume <parent-id> --fork-session` in the new directory. Notes:
@@ -513,15 +591,6 @@ Three custom exception types, all caught in `main()`:
     `_show_session_search(restore=True)` — re-rendering the collected
     `_search_hits` rather than throwing a completed scan away. Opening the menu
     from the home screen clears the flag, so that path still returns home.
-- **The home highlight survives a round trip through a submenu**:
-  `@on(ListView.Highlighted, "#home-list")` records the highlighted row's id in
-  `_home_selection`; `_show_home` captures that id *before* rebuilding (mounting
-  rows fires `Highlighted` for the first one, which would clobber it) and
-  `_restore_home_selection` re-highlights the matching row afterwards, falling
-  back to `_first_selectable_index` when the row is gone — a terminated session,
-  a deleted worktree. `_init_git_info` clears it, since row ids are
-  project-scoped. Filtering with `/` still resets to the first match:
-  `_refresh_home_list` is unchanged.
 - **Home name filter rebuilds rows, not the screen**: `_show_home` mounts the panel;
   all row construction (and the population of `_session_map` /
   `_claude_state_snapshot`) lives in `_build_home_items()`, which applies the
@@ -577,6 +646,65 @@ TUI tests follow this pattern:
 - Navigate to items by setting `list.index` directly (more reliable than repeated `pilot.press("down")`)
 - Assert on app state (`_launch_target`, `_base_branch`, `_session_map`) and DOM queries (`app.query()`)
 
+## Diagnostic Logging
+
+`fujimoto --debug` / `--debug-redacted` writes a support log (see `debug.py` in
+Module Responsibilities, and the README's Troubleshooting section). The log's
+value depends entirely on it staying current with the code.
+
+**Instrument new features as you add them.** A feature that isn't instrumented
+is invisible in a support log, and its absence is indistinguishable from it
+working. Any new code that does one of the following needs logging in the same
+change:
+
+- runs a subprocess, or reads/writes a file outside the repo
+- discovers or resolves something (sessions, paths, branches, config) — log
+  the *outcome* and, when there is a fallback chain, **which strategy
+  succeeded**
+- silently drops or skips an item (a malformed record, an unparseable log, a
+  pruned entry) — a silent skip is exactly what a bug report looks like
+- fails in a way the user sees as "nothing happened"
+
+How to write it:
+
+```python
+from fujimoto import debug
+
+debug.log("session_state.mark_closed", session=debug.rv(name), removed=removed)
+debug.log_once(f"claude-dirs-{path}", "claude.session_dirs", via="cwd-index")
+```
+
+- Every helper is a no-op when debug mode is off, so call it unconditionally.
+  Guard with `debug.is_enabled()` only when *building* the fields is expensive.
+- Name events `<module>.<event>` and pass data as keyword fields, never as a
+  pre-formatted sentence — the log is grepped and diffed.
+- **Redaction is the caller's job.** Wrap user-identifying values (project,
+  branch, session and tmux names, search queries, arbitrary user text) in
+  `debug.rv()` and every path in `debug.rp()`. A raw f-string interpolation
+  bypasses redaction and leaks into `--debug-redacted` logs.
+- Never log a credential. `log_environment` replaces values whose env var name
+  matches `debug.is_secret_name()` with `[SECRET-<len>]` in **both** modes; if
+  you add a new source of secrets, extend that predicate.
+- Use `debug.log_once(key, ...)` for anything on a polling path — the home
+  screen re-reads Claude logs every 3 seconds. Pick a `key` that identifies the
+  *subject* (a path, a session id), so a change in state still logs.
+- The event name is positional-only, so `name=` is safe as a field.
+- `debug.py` must not import other fujimoto modules at module scope (they
+  import it) — the `fujimoto.version` import inside `log_environment` is lazy
+  for that reason.
+
+Tests must call `debug.disable()` in teardown (the logger is process-wide and
+would otherwise leak between tests) and point `FUJIMOTO_LOG_DIR` or
+`enable(log_dir=...)` at `tmp_path` — never write to the real
+`~/.fujimoto/logs`. See the autouse fixtures in `tests/test_debug.py`.
+
+Before shipping a change that touches redaction, re-run the leak check:
+
+```sh
+FUJIMOTO_LOG_DIR=/tmp/fjlog fujimoto --debug-redacted
+grep -c "$(whoami)" /tmp/fjlog/*.log   # expect 0
+```
+
 ## Documentation
 
 **Keep documentation in sync with code changes.** When making changes to the codebase:
@@ -586,6 +714,11 @@ TUI tests follow this pattern:
 - **CONTRIBUTING.md**: Update developer guidance (project layout, manual testing steps, view patterns) when internal structure changes.
 
 When you discover something new about the codebase, tooling, or patterns during a session — incorporate it into the appropriate documentation file rather than leaving it as tribal knowledge.
+
+**Instrumentation counts as part of a feature, not a follow-up.** When adding a
+feature, add its `debug` logging in the same change (see Diagnostic Logging
+above) — the debug log is a support tool, and it silently rots when new code
+paths land uninstrumented.
 
 ## Gotchas and Learnings
 
@@ -599,6 +732,53 @@ Things discovered during development that are easy to forget:
 - **Claude log entry types evolve** — real logs contain `last-prompt`, `queue-operation`, `progress` and other types beyond `assistant`/`user`/`system`/`file-history-snapshot`. The parser skips unrecognized types gracefully. `last-prompt` signals session end → `IDLE` state. `stop_reason=None` on assistant entries means interrupted/canceled (Esc) → `WAITING_FOR_USER`. Always smoke-test against real `~/.claude/projects/` data after changes.
 - **Shift+Enter in tmux requires `extended-keys always` globally** — tmux strips modifier info by default, making Shift+Enter identical to Enter. The fix requires two server/global-level settings: `set-option -g extended-keys always` and `set-option -s -a terminal-features xterm*:extkeys`. Per-session (`-t`) doesn't work. `extended-keys on` (vs `always`) doesn't work because Claude Code doesn't send the kitty keyboard protocol activation sequence. Requires tmux 3.2+. See `_ensure_extended_keys()` in `tmux.py`.
 - **fujimoto never creates `.venv` — `uv` does.** `create_worktree` only runs `git worktree add`; there is no venv/copy logic in the worktree lifecycle. A `.venv` appears in a worktree only because `uv sync`/`uv run` was run there (each worktree is its own project root with its own `pyproject.toml`, and uv materializes a per-project environment by default unless `UV_PROJECT_ENVIRONMENT` is set — which only `noxfile.py` does). The intended way to seed an environment in a fresh worktree is an `init: [uv sync]` entry in `.fujimoto.yaml`.
+- **Never fingerprint a constant — it becomes a crib inside the same log.**
+  Salting stops a fingerprint being matched *across* logs, but not within one.
+  `~/.cache/<X>` is always `fujimoto`, so hashing that component published the
+  digest of a known word, and the same digest appeared wherever the *project*
+  name was redacted — re-leaking it for any repo called fujimoto. Constants that
+  fujimoto or Claude Code choose themselves (`_OWNED_NAMES`, matched only under
+  `_OWNED_PARENTS`) are therefore preserved verbatim rather than hashed. When
+  adding redaction, ask both "could this be the user's name?" and "is this value
+  fixed enough to be guessed?" — a yes to the second means preserve, not hash.
+- **Over-redaction makes a log useless, which is its own kind of bug.** The
+  first cut redacted TUI widget ids (`id=[REDACTED-…-44]` hid *which row the
+  user picked*), `project_config` action verbs (hiding that it copied `.env` and
+  ran `uv sync`) and the `main` branch name. Those are fujimoto's and git's own
+  vocabulary, not user data. `rid`, `rref` and splitting a `<verb> <target>`
+  action into `kind=` plus a redacted `detail=` exist for exactly this.
+- **Anything called per home render needs `log_once` or `log_capped`.**
+  `config.read_meta` runs once per worktree per render, which on a machine with
+  ~50 worktrees wrote 142 lines of a 485-line log. Keyed dedupe cut that to one
+  line per worktree, and `log_capped` cut it again to ten plus a count. Note the
+  two must compose: capping raw *calls* reported `total=141` and hid 37 distinct
+  worktrees behind a number that conflated re-renders, which is why
+  `event_capped` takes a `dedupe_key`.
+- **An unsalted redaction fingerprint is known-plaintext.** A log always
+  contains fixed strings (fujimoto's own `~/.cache/fujimoto`, for one), so an
+  unsalted digest hands the reader the fingerprint of a known word — and from
+  there any guessable project name can be confirmed by hashing it. `_fingerprint`
+  is salted with `secrets.token_bytes(16)` per `enable()`, the salt is never
+  written to the log, and `disable()` clears it so `redact_text` is deterministic
+  (and the doctests meaningful) when no run is active. Correlation *within* a log
+  is the only property needed, and it survives.
+- **A redaction allowlist must only contain names a user cannot have chosen.**
+  `_SAFE_PATH_COMPONENTS` originally included `fujimoto`, `git`, `logs`, `src`,
+  `main` and `master` — which leaked the project name of every repo living in
+  `~/git/<project>`, and of fujimoto's own checkout, straight into
+  `--debug-redacted` logs that are meant to be shareable. Dotted config dirs
+  (`.claude`, `.fujimoto`) and OS dirs are safe because nobody names a repo
+  `.cache`; ordinary words are not. Git ref words live in a separate
+  `_SAFE_REF_COMPONENTS` used only for *command arguments*, since `origin/main`
+  is git's vocabulary but a *directory* called `origin` is the user's. When
+  adding to either list, ask "could this be the name of someone's project?"
+- **Never unpack a `**fields` dict into `log_capped`.** Its `limit` and
+  `dedupe_key` are typed keywords, so `**fields` (a `dict[str, object]`) could
+  supply either — `ty` rejects it, and at runtime a field named `limit` would
+  silently become the cap. Spell the fields out at each call site, even when
+  that means repeating them across two branches.
+- **`DebugLogger.event()` takes its event name positional-only** (`def event(self, event_name, /, **fields)`). Without the `/`, logging a field literally called `name=` (env vars, tool names) raises `TypeError: got multiple values for argument 'name'`. Same for `event_once`, `debug.log` and `debug.log_once`.
+- **`debug.py` must not import from other fujimoto modules at module scope** (other than a lazy `fujimoto.version` import inside `log_environment`) — `git`, `tmux`, `config`, `settings`, `project_config`, `terminal`, `vscode` and `claude.log_parser` all import it, so a top-level back-import would be circular.
 - **Bundled package data must be importable as a subpackage.** `templates/` has an `__init__.py` so `importlib.resources.files("fujimoto.templates")` resolves and hatchling ships the `.template` file in the wheel. Verify with `uv build --wheel && unzip -l dist/*.whl | grep templates` after touching packaged resources.
 - **Inside an `if-shell` argument a bare `;` separates tmux commands; at `bind-key` top level it must be `\;`.** The `x` binding's true branch is the single string `set-option @fujimoto_pending_action close ; detach-client`, which works because tmux re-parses that string; the `f` and `s` bindings pass `"\\;"` as its own argv element because the outer `bind-key` invocation would otherwise consume a bare `;` itself and run `detach-client` at bind time. Both forms are exercised in `tests/test_tmux.py`, and both were verified against a real tmux via a pty before being wired up.
 - **Claude encodes a project path by replacing `/` *and* `.` with `-`.** `/repo/.fujimoto/worktrees/x` is stored as `-repo--fujimoto-worktrees-x` — the double hyphen is the `/` plus the `.`. Encoding only the slashes made `get_sessions_for_path` miss every transcript for a worktree under the default `<repo>/.fujimoto/worktrees/` root (used whenever `FUJIMOTO_WORKTREE_ROOT` is unset), which showed up as "Resume previous session" being absent from every inactive worktree — and, from the same lookup, no Claude state icons, no fork, no session log and no search hits. Verify the rule against real data rather than assuming: read the `cwd` out of a transcript and compare it to the directory name holding it. Claude also honours `CLAUDE_CONFIG_DIR`, which moves `projects/` wholesale.

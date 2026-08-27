@@ -6,6 +6,8 @@ import re
 from datetime import date
 from pathlib import Path
 
+from fujimoto import debug
+
 
 class ConfigError(Exception):
     pass
@@ -27,11 +29,25 @@ def list_projects() -> list[Path]:
     """
     root = get_git_projects_root()
     if root is None or not root.is_dir():
+        debug.log_once(
+            "config-projects",
+            "config.list_projects",
+            git_root=debug.rp(root) if root else "[unset]",
+            usable=False,
+        )
         return []
-    return sorted(
+    projects = sorted(
         [d for d in root.iterdir() if d.is_dir() and (d / ".git").exists()],
         key=lambda p: p.name,
     )
+    debug.log_once(
+        "config-projects",
+        "config.list_projects",
+        git_root=debug.rp(root),
+        usable=True,
+        count=len(projects),
+    )
+    return projects
 
 
 def get_worktree_root(project_root: Path | None = None) -> Path:
@@ -45,6 +61,12 @@ def get_worktree_root(project_root: Path | None = None) -> Path:
     if raw:
         root = Path(raw).expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)
+        debug.log_once(
+            "config-worktree-root",
+            "config.worktree_root",
+            source="env",
+            root=debug.rp(root),
+        )
         return root
     if project_root is None:
         raise ConfigError(
@@ -53,6 +75,12 @@ def get_worktree_root(project_root: Path | None = None) -> Path:
     _ensure_meta_dir(project_root)
     root = project_root / META_DIR / "worktrees"
     root.mkdir(parents=True, exist_ok=True)
+    debug.log_once(
+        "config-worktree-root",
+        "config.worktree_root",
+        source="in-project",
+        root=debug.rp(root),
+    )
     return root
 
 
@@ -145,17 +173,47 @@ def store_session_meta(
     meta_dir = _ensure_meta_dir(worktree_path)
     meta_path = meta_dir / META_FILENAME
     meta_path.write_text(json.dumps(meta))
+    debug.log(
+        "config.store_meta",
+        worktree=debug.rp(worktree_path),
+        base_branch=debug.rref(base_branch),
+        source_root=debug.rp(source_root) if source_root else "none",
+    )
 
 
 def read_session_meta(worktree_path: Path) -> dict[str, str]:
     """Read session metadata from the worktree directory."""
     meta_path = _get_meta_dir(worktree_path) / META_FILENAME
     if not meta_path.exists():
+        debug.log_capped(
+            "config.read_meta",
+            "config.read_meta",
+            dedupe_key=f"meta-{worktree_path}",
+            worktree=debug.rp(worktree_path),
+            found=False,
+        )
         return {}
     try:
-        return json.loads(meta_path.read_text())
-    except (json.JSONDecodeError, OSError):
+        meta = json.loads(meta_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        debug.log(
+            "config.read_meta",
+            worktree=debug.rp(worktree_path),
+            found=True,
+            error=type(exc).__name__,
+        )
         return {}
+    debug.log_capped(
+        "config.read_meta",
+        "config.read_meta",
+        dedupe_key=f"meta-{worktree_path}",
+        worktree=debug.rp(worktree_path),
+        found=True,
+        keys=",".join(sorted(meta)),
+        base_branch=debug.rref(meta.get("base_branch")),
+        source_root=debug.rp(meta.get("source_root", "none")),
+    )
+    return meta
 
 
 CONFIG_ONCE_MARKER = "config_once_applied"

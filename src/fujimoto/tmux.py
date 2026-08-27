@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from fujimoto import debug
+
 META_KEY_ENV = "FUJIMOTO_META_KEY"
 DEFAULT_META_KEY = "C-a"
 PREFIX_KEY_ENV = "FUJIMOTO_TMUX_PREFIX"
@@ -66,7 +68,9 @@ def set_terminal_title(title: str) -> None:
 
 
 def is_tmux_installed() -> bool:
-    return shutil.which("tmux") is not None
+    found = shutil.which("tmux")
+    debug.log_once("tmux-installed", "tmux.installed", path=debug.rp(found))
+    return found is not None
 
 
 _LINUX_TMUX_HINTS: list[tuple[str, str]] = [
@@ -113,8 +117,21 @@ def list_all_sessions() -> list[str]:
         text=True,
     )
     if result.returncode != 0:
+        debug.log_once(
+            "tmux-list",
+            "tmux.list_sessions",
+            rc=result.returncode,
+            stderr=(result.stderr or "").strip(),
+        )
         return []
-    return result.stdout.strip().splitlines()
+    names = result.stdout.strip().splitlines()
+    debug.log_once(
+        "tmux-list",
+        "tmux.list_sessions",
+        count=len(names),
+        names=",".join(debug.rv(n) for n in names),
+    )
+    return names
 
 
 def list_project_sessions(project_name: str) -> list[str]:
@@ -147,8 +164,10 @@ def get_session_path(name: str) -> Path | None:
         text=True,
     )
     if result.returncode != 0:
+        debug.log("tmux.session_path", session=debug.rv(name), rc=result.returncode)
         return None
     out = result.stdout.strip()
+    debug.log("tmux.session_path", session=debug.rv(name), path=debug.rp(out))
     return Path(out) if out else None
 
 
@@ -165,6 +184,11 @@ def session_exists(name: str) -> bool:
         ["tmux", "has-session", "-t", name],
         capture_output=True,
     )
+    debug.log(
+        "tmux.session_exists",
+        session=debug.rv(name),
+        exists=result.returncode == 0,
+    )
     return result.returncode == 0
 
 
@@ -173,6 +197,12 @@ def rename_session(old_name: str, new_name: str) -> None:
     result = subprocess.run(
         ["tmux", "rename-session", "-t", old_name, new_name],
         capture_output=True,
+    )
+    debug.log(
+        "tmux.rename",
+        old=debug.rv(old_name),
+        new=debug.rv(new_name),
+        rc=result.returncode,
     )
     if result.returncode != 0:
         raise TmuxError(f"Failed to rename session: {old_name}")
@@ -184,6 +214,7 @@ def kill_session(name: str) -> None:
         ["tmux", "kill-session", "-t", name],
         capture_output=True,
     )
+    debug.log("tmux.kill", session=debug.rv(name), rc=result.returncode)
     if result.returncode != 0:
         raise TmuxError(f"Failed to kill session: {name}")
 
@@ -251,6 +282,7 @@ def enable_quick_terminal_binding() -> None:
         ],
         capture_output=True,
     )
+    debug.log("tmux.quick_terminal", action="enable", key=key)
 
 
 def disable_quick_terminal_binding() -> None:
@@ -262,6 +294,7 @@ def disable_quick_terminal_binding() -> None:
         ["tmux", "unbind-key", "-n", key],
         capture_output=True,
     )
+    debug.log("tmux.quick_terminal", action="disable", key=key)
 
 
 PENDING_ACTION_OPTION = "@fujimoto_pending_action"
@@ -280,6 +313,12 @@ def _configure_session(name: str) -> None:
             "they must differ."
         )
 
+    debug.log(
+        "tmux.configure_session",
+        session=debug.rv(name),
+        meta_key=meta_key or "[disabled]",
+        prefix_key=prefix_key,
+    )
     prefix_label = _meta_key_label(prefix_key)
     if meta_key:
         meta_label = _meta_key_label(meta_key)
@@ -451,6 +490,14 @@ def create_session(
         resume_session_id=resume_session_id,
         fork_session=fork_session,
     )
+    debug.log(
+        "tmux.create_session",
+        session=debug.rv(name),
+        cwd=debug.rp(working_dir),
+        resume=resume_session_id or "none",
+        system_prompt_chars=len(system_prompt or ""),
+        command=debug.rv(claude_cmd),
+    )
     subprocess.run(
         [
             "tmux",
@@ -471,6 +518,12 @@ def create_session(
 
 def create_session_with_command(name: str, working_dir: Path, command: str) -> None:
     """Create a tmux session and run an arbitrary command instead of claude."""
+    debug.log(
+        "tmux.create_session_with_command",
+        session=debug.rv(name),
+        cwd=debug.rp(working_dir),
+        command=debug.rv(command),
+    )
     subprocess.run(
         [
             "tmux",
@@ -490,7 +543,14 @@ def create_session_with_command(name: str, working_dir: Path, command: str) -> N
 
 
 def attach_session(name: str) -> None:
-    subprocess.run(["tmux", "attach-session", "-t", name])
+    debug.log("tmux.attach", session=debug.rv(name), phase="start")
+    result = subprocess.run(["tmux", "attach-session", "-t", name])
+    debug.log(
+        "tmux.attach",
+        session=debug.rv(name),
+        phase="returned",
+        rc=result.returncode,
+    )
 
 
 def take_pending_action(name: str) -> str | None:
@@ -527,6 +587,13 @@ def launch_claude_in_tmux(
     fork_session: bool = False,
 ) -> None:
     name = tmux_name or session_name(project_name, working_dir.name)
+    debug.log(
+        "tmux.launch",
+        project=debug.rv(project_name),
+        session=debug.rv(name),
+        cwd=debug.rp(working_dir),
+        resume=resume_session_id or "none",
+    )
     if session_exists(name):
         attach_session(name)
     else:
