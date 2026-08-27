@@ -417,6 +417,15 @@ responsible for running it off the event loop.
   sections. A non-empty query hides the action/settings/switch-project rows and
   any section with no matches; an empty result set renders a disabled "no
   matching sessions" row.
+- Home screen refresh (`r`): `action_refresh` re-runs `_init_git_info()` (tmux
+  sessions, the `session_state` store, worktrees, projects — and it clears
+  `_claude_cache`/`_fork_marker_cache`) then `_refresh_home_list()`, so a
+  worktree or tmux session created outside fujimoto appears without leaving the
+  screen. The 3s poller deliberately doesn't do this: it only updates Claude
+  state on rows that already exist. The highlighted row's id is captured before
+  the rebuild (appending rows moves the highlight) and re-applied after; the
+  `/` filter is preserved because `_refresh_home_list` re-applies
+  `_search_query`. Guarded on `_on_home`, so `r` is inert in other views.
 - Home screen sections: actions ("Restore N stopped sessions" when any exist, "New worktree session", "New session in X", "Ad hoc session"), sessions — running 🟢 *and* stopped 🟠 together, since the circle colour carries the distinction (with Claude state indicators on the running ones), inactive worktrees, previous Claude sessions (resumable, capped at 5), switch project
 - Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
 - Session actions submenu (in order): for active sessions, Connect → Fork session → Resume previous session; for inactive worktrees, Resume previous session → Fork session → Launch (resume is the more common action when picking an idle worktree). Then: View session log (whenever the path has a previous Claude session), Open terminal, Open in VS Code, Rename, Stop session (active only), Terminate session (active or stopped), Finish (worktree only), Cancel. Stop and Terminate are two menu items rather than one item plus a prompt — a menu is already a choice — but both route into the single `_end_session(session, terminate=...)` handler, which is also what the `Ctrl-A x` prompt calls. Claude-session items show just "Resume" + View session log + Open terminal/VS Code + Cancel. "Fork session" is always inserted at index 1 (`items.insert(1, ...)`) so its position holds across both layouts.

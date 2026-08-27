@@ -319,6 +319,14 @@ sessions** lists at once. While a filter is active the action rows
 | `↑` / `↓` | Move the highlight without leaving the filter box |
 | `Escape` | Clear the filter and return to the full list |
 
+#### Refreshing the list — `r`
+
+The home screen polls Claude state every few seconds, but only for sessions it
+already knows about. Press `r` to re-read everything: running tmux sessions,
+worktrees on disk, the stopped-session store and every transcript. Use it after
+creating a worktree or starting a session from another window. The current
+filter and the highlighted row are kept.
+
 #### Searching inside conversations — `s`
 
 `/` matches session *names*. Press `s` to search what was actually *said and
@@ -475,6 +483,7 @@ These options are set per-session and don't affect your global tmux config.
 | `Enter` | Select |
 | `/` | Filter sessions by name (home screen) |
 | `s` | Search inside session transcripts (home screen) |
+| `r` | Refresh the session list (home screen) |
 | `Escape` | Back (or quit from home; clears an active filter first) |
 | `q` | Quit |
 | Arrow keys | Navigate |

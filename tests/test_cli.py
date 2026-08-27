@@ -1467,6 +1467,83 @@ class TestSessionAppHome:
                 assert session.is_active
 
 
+class TestHomeRefresh:
+    """`r` re-runs discovery and rebuilds the home rows in place."""
+
+    @pytest.mark.asyncio
+    async def test_refresh_picks_up_a_new_session(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                assert "ds-test-proj--direct-1" not in app._session_map
+                with patch(
+                    "fujimoto.cli.list_project_sessions",
+                    return_value=["test-proj/direct-1"],
+                ):
+                    await pilot.press("r")
+                    await pilot.pause()
+                assert "ds-test-proj--direct-1" in app._session_map
+
+    @pytest.mark.asyncio
+    async def test_refresh_drops_a_gone_session(self) -> None:
+        with _patch_git_info(sessions=["test-proj/direct-1"]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                assert "ds-test-proj--direct-1" in app._session_map
+                with patch("fujimoto.cli.list_project_sessions", return_value=[]):
+                    await pilot.press("r")
+                    await pilot.pause()
+                assert "ds-test-proj--direct-1" not in app._session_map
+
+    @pytest.mark.asyncio
+    async def test_refresh_keeps_the_highlighted_row(self, tmp_path: Path) -> None:
+        wt1 = tmp_path / "20260309-fix-tests"
+        wt2 = tmp_path / "20260308-add-logging"
+        with _patch_git_info(worktrees=[wt1, wt2]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                target = "wt-20260308-add-logging"
+                for index, item in enumerate(home_list.children):
+                    if item.id == target:
+                        home_list.index = index
+                await pilot.pause()
+                await pilot.press("r")
+                await pilot.pause()
+                highlighted = app.query_one("#home-list", ListView).highlighted_child
+                assert highlighted is not None
+                assert highlighted.id == target
+
+    @pytest.mark.asyncio
+    async def test_refresh_keeps_the_filter(self, tmp_path: Path) -> None:
+        wt1 = tmp_path / "20260309-fix-tests"
+        wt2 = tmp_path / "20260308-add-logging"
+        with _patch_git_info(worktrees=[wt1, wt2]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                await pilot.pause()
+                app.query_one("#home-search", Input).value = "logging"
+                await pilot.pause()
+                assert app._search_query == "logging"
+                await app.action_refresh()
+                await pilot.pause()
+                assert app._search_query == "logging"
+                assert "wt-20260308-add-logging" in app._session_map
+                assert "wt-20260309-fix-tests" not in app._session_map
+
+    @pytest.mark.asyncio
+    async def test_refresh_is_a_noop_off_the_home_screen(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._show_session_search()
+                await pilot.pause()
+                with patch("fujimoto.cli.get_project_name") as get_name:
+                    await app.action_refresh()
+                    assert not get_name.called
+
+
 class TestSessionAppDirectSession:
     @pytest.mark.asyncio
     async def test_launch_direct_session(self) -> None:
