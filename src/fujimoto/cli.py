@@ -7,7 +7,7 @@ import sys
 import tempfile
 import textwrap
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
@@ -41,10 +41,17 @@ from fujimoto.claude import (
     SessionState,
     TranscriptMessage,
     get_sessions_for_path,
+    read_raw_transcript,
     read_transcript,
 )
 from fujimoto.claude import search as claude_search
-from fujimoto.claude.search import ContentMode, SearchError, SearchHit, Snippet
+from fujimoto.claude.search import (
+    ContentMode,
+    Matcher,
+    SearchError,
+    SearchHit,
+    Snippet,
+)
 from fujimoto.config import (
     ConfigError,
     build_worktree_path,
@@ -262,6 +269,73 @@ def _render_snippet(snippet: Snippet, max_width: int) -> Content:
     return Content.assemble(*parts)
 
 
+# Style applied to a matched substring inside the session log viewer. Same
+# `$warning` accent as a search snippet, so a match reads the same in both.
+LOG_MATCH_STYLE = "b $warning"
+
+# Half-open `(start, end)` offsets of the matches inside one transcript body.
+Spans = tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class LogBody:
+    """One highlightable body in the log viewer, and what hides it.
+
+    Searching updates these in place rather than rebuilding the transcript:
+    on a real log a full rebuild costs about half a second, which is a visible
+    stall between keystrokes. `folds` is the chain of `Collapsible`s a body sits
+    inside (a call, and the run that call belongs to), so a match can open its
+    way out of both.
+    """
+
+    widget: Static
+    text: str
+    folds: tuple[Collapsible, ...] = ()
+
+
+def _match_spans(text: str, matcher: Matcher | None) -> Spans:
+    """Where `matcher` hits inside `text`.
+
+    Zero-width matches (`x*` against a run with no `x`) are dropped: they
+    highlight nothing and there is nothing to scroll to, so counting them would
+    only inflate the tally.
+    """
+    if matcher is None:
+        return ()
+    return tuple(
+        (m.start(), m.end())
+        for m in matcher.pattern.finditer(text)
+        if m.end() > m.start()
+    )
+
+
+def _highlight(text: str, spans: Spans) -> Content:
+    """Transcript text as `Content`, with `spans` picked out.
+
+    Assembled from `(text, style)` pairs rather than markup for the reason
+    snippets are: transcript text is arbitrary bytes and a stray `[` would be
+    parsed as a tag.
+    """
+    if not spans:
+        return Content(text)
+
+    parts: list[str | tuple[str, str]] = []
+    cursor = 0
+    for start, end in spans:
+        if start > cursor:
+            parts.append(text[cursor:start])
+        parts.append((text[start:end], LOG_MATCH_STYLE))
+        cursor = end
+    if cursor < len(text):
+        parts.append(text[cursor:])
+    return Content.assemble(*parts)
+
+
+def _log_body(text: str, folds: tuple[Collapsible, ...] = ()) -> LogBody:
+    """An unhighlighted transcript body, ready for a query to be applied."""
+    return LogBody(Static(Content(text), classes="log-body"), text, folds)
+
+
 # How each transcript role is labelled and styled in the log viewer.
 _TRANSCRIPT_ROLES: dict[str, tuple[str, str]] = {
     "user": ("You", "log-user"),
@@ -329,35 +403,56 @@ def _result_heading(result: TranscriptMessage) -> str:
     return f"↳ {count} {'line' if count == 1 else 'lines'}"
 
 
+def _tool_collapsible(
+    title: str, *contents: Widget, collapsed: bool, classes: str
+) -> Collapsible:
+    """A `Collapsible` whose title is never parsed as console markup.
+
+    Textual annotates `title` as `str` but hands it to
+    `Content.from_text(markup=True)`, so a title cut from transcript bytes
+    (`⚒ Bash  command: until [ "$(gh run list …`) opens a tag it cannot close
+    and raises `MarkupError`, taking the whole viewer down. `Content` is what
+    the widget actually wants — the annotation is just narrower than the
+    runtime contract.
+    """
+    return Collapsible(
+        *contents,
+        title=Content(title),  # ty: ignore[invalid-argument-type]
+        collapsed=collapsed,
+        classes=classes,
+    )
+
+
 def _tool_widget(
     msg: TranscriptMessage, result: TranscriptMessage | None = None
-) -> Collapsible:
+) -> tuple[Collapsible, list[LogBody]]:
     """One folded tool call, with its result inside if it has one.
 
     The result belongs to the call, so it is shown as part of that expansion
     rather than as a row of its own — one thing to open, not two.
+
+    Returns the widget and its bodies, each carrying the fold it sits inside so
+    a later search can open its way out to a match.
     """
     if msg.role == "tool_result":
-        return Collapsible(
-            Static(Content(msg.text), classes="log-body"),
-            title=_tool_summary(msg),
-            collapsed=True,
-            classes="log-tool",
+        body = _log_body(msg.text)
+        fold = _tool_collapsible(
+            _tool_summary(msg), body.widget, collapsed=True, classes="log-tool"
         )
+        return fold, [replace(body, folds=(fold,))]
 
     # The title already names the tool, so the body drops that first line and
     # keeps the arguments, which the title only shows clipped.
-    body = msg.text.partition("\n")[2] or msg.text
-    contents: list[Widget] = [Static(Content(body), classes="log-body")]
+    bodies = [_log_body(msg.text.partition("\n")[2] or msg.text)]
+    contents: list[Widget] = [bodies[0].widget]
     if result is not None:
         contents.append(Static(_result_heading(result), classes="log-result-heading"))
-        contents.append(Static(Content(result.text), classes="log-body"))
-    return Collapsible(
-        *contents,
-        title=_tool_summary(msg),
-        collapsed=True,
-        classes="log-tool",
+        bodies.append(_log_body(result.text))
+        contents.append(bodies[-1].widget)
+    fold = _tool_collapsible(
+        _tool_summary(msg), *contents, collapsed=True, classes="log-tool"
     )
+    return fold, [replace(body, folds=(fold,)) for body in bodies]
 
 
 def _pair_results(
@@ -401,7 +496,9 @@ def _pair_results(
     return pairs
 
 
-def _render_transcript(messages: list[TranscriptMessage]) -> list[Widget]:
+def _render_transcript(
+    messages: list[TranscriptMessage],
+) -> tuple[list[Widget], list[LogBody]]:
     """Build the widgets for a transcript, styled by role.
 
     Prose (you, Claude, thinking) is rendered as a role header plus a body.
@@ -419,16 +516,22 @@ def _render_transcript(messages: list[TranscriptMessage]) -> list[Widget]:
     Bodies are `Content` rather than markup for the same reason snippets are:
     transcript text is arbitrary bytes, and a stray `[` or trailing backslash
     would otherwise be parsed as (or corrupt) a console markup tag.
+
+    The second return value is every body in document order, which is what the
+    `/` search updates in place — it never rebuilds this.
     """
     widgets: list[Widget] = []
+    bodies: list[LogBody] = []
     index = 0
     while index < len(messages):
         msg = messages[index]
 
         if msg.role not in _TOOL_ROLES:
             label, css = _TRANSCRIPT_ROLES.get(msg.role, (msg.role, "log-assistant"))
+            body = _log_body(msg.text)
             widgets.append(Static(label, classes=f"log-role {css}"))
-            widgets.append(Static(Content(msg.text), classes="log-body"))
+            widgets.append(body.widget)
+            bodies.append(body)
             index += 1
             continue
 
@@ -438,19 +541,25 @@ def _render_transcript(messages: list[TranscriptMessage]) -> list[Widget]:
         run = messages[index:end]
         index = end
 
-        pairs = _pair_results(run)
+        calls = [_tool_widget(call, result) for call, result in _pair_results(run)]
         if sum(1 for m in run if m.role == "tool_use") > 1:
-            widgets.append(
-                Collapsible(
-                    *[_tool_widget(call, result) for call, result in pairs],
-                    title=_tool_run_title(run),
-                    collapsed=True,
-                    classes="log-tool log-tool-run",
-                )
+            outer = _tool_collapsible(
+                _tool_run_title(run),
+                *[widget for widget, _ in calls],
+                collapsed=True,
+                classes="log-tool log-tool-run",
+            )
+            widgets.append(outer)
+            # A body inside a run is hidden twice over, so it records both folds.
+            bodies.extend(
+                replace(body, folds=body.folds + (outer,))
+                for _, call_bodies in calls
+                for body in call_bodies
             )
         else:
-            widgets.extend(_tool_widget(call, result) for call, result in pairs)
-    return widgets
+            widgets.extend(widget for widget, _ in calls)
+            bodies.extend(body for _, call_bodies in calls for body in call_bodies)
+    return widgets, bodies
 
 
 def _is_fork_worktree(worktree: Path) -> bool:
@@ -624,9 +733,35 @@ Screen {
 }
 
 #log-panel {
-    height: auto;
+    height: 1fr;
     padding: 1 2;
     border: round $primary;
+}
+
+/* The messages scroll; the header, search box and hint stay put. */
+#log-messages {
+    height: 1fr;
+}
+
+#log-search {
+    margin-bottom: 1;
+}
+
+#log-raw-warning {
+    color: $warning;
+    height: auto;
+    margin-bottom: 1;
+}
+
+#log-search-status {
+    color: $text-muted;
+    height: auto;
+    margin-bottom: 1;
+}
+
+/* The match `n`/`N` last landed on, so it is findable in a dense body. */
+.log-match-current {
+    background: $accent 30%;
 }
 
 #log-panel .form-label {
@@ -1010,17 +1145,30 @@ class SessionApp(App):
         Binding("ctrl+c", "quit", "Quit", show=False),
         Binding("escape", "go_back", "Back", show=True),
         Binding("d", "dismiss_update", "Dismiss update", show=False),
+        # `/` means two different things, so it is two bindings on one key —
+        # `check_action` disables whichever doesn't apply, and Textual falls
+        # through to the next binding for the key. One action with a switch
+        # inside it could not give the footer a per-view label.
         Binding("slash", "search", "Filter", show=True),
+        Binding("slash", "log_search", "Search", show=True),
         Binding("s", "session_search", "Search transcripts", show=True),
         Binding("r", "refresh", "Refresh", show=True),
-        # Mode toggles for the transcript search. They have to fire while the
-        # query Input holds focus, so they are Ctrl chords (which Input leaves
-        # alone) rather than plain letters.
-        Binding("ctrl+r", "toggle_search_regex", "Regex", show=False),
-        Binding("ctrl+t", "toggle_search_mode", "Raw/text", show=False),
+        # Mode toggles for the transcript search and the log viewer's own. They
+        # have to fire while the query Input holds focus, so they are Ctrl
+        # chords (which Input leaves alone) rather than plain letters — and
+        # unlike a plain letter, Textual still shows a chord in the footer with
+        # the box focused, which is exactly when you want to see them.
+        # `check_action` confines them to the views they act on.
+        Binding("ctrl+r", "toggle_search_regex", "Regex", show=True),
+        Binding("ctrl+t", "toggle_search_mode", "Raw/text", show=True),
         # Ctrl+I is the same byte as Tab in a legacy terminal; it only arrives
         # distinctly under the kitty keyboard protocol, which Textual requests.
-        Binding("ctrl+i", "toggle_search_case", "Match case", show=False),
+        Binding("ctrl+i", "toggle_search_case", "Match case", show=True),
+        # Session-log viewer only: step through the `/` matches. Plain letters
+        # are safe here because the query Input swallows them while it has
+        # focus, and `check_action` hides both outside the viewer.
+        Binding("n", "log_next_match", "Next match", show=True),
+        Binding("N", "log_prev_match", "Previous match", show=True),
     ]
 
     def __init__(
@@ -1108,6 +1256,42 @@ class SessionApp(App):
         # Set when the session-actions menu was opened from a search result, so
         # Cancel/Escape returns to the results instead of the home screen.
         self._actions_from_search: bool = False
+        # Which result row the actions menu was opened from, so backing out
+        # lands the highlight there instead of at the top of the list.
+        self._search_selected_index: int | None = None
+
+        # -- Session log viewer, and its own `/` search --
+        self._on_log: bool = False
+        self._log_session: ClaudeSession | None = None
+        self._log_messages: list[TranscriptMessage] = []
+        # Set together when `read_transcript` fails on a shape it doesn't know:
+        # the log's lines as written, and what went wrong. `_log_parse_error`
+        # being non-None is what puts the viewer in raw mode.
+        self._log_raw_lines: list[str] = []
+        self._log_parse_error: str | None = None
+        # `_log_searching` is whether the query box is armed; `_log_query` is
+        # what is highlighted. Regex/case mirror the transcript-search toggles
+        # but are tracked separately, since the two views are used differently.
+        self._log_searching: bool = False
+        self._log_query: str = ""
+        self._log_regex: bool = False
+        self._log_case_sensitive: bool = False
+        self._log_error: str | None = None
+        # Every highlightable body in the open transcript, in document order.
+        # Searching updates these in place — the viewer is never rebuilt for a
+        # query, which is what a half-second render would otherwise cost.
+        self._log_bodies: list[LogBody] = []
+        # The spans last applied to each body, so a rescan only repaints what
+        # actually changed rather than every body in the transcript.
+        self._log_spans: list[Spans] = []
+        # The subset currently matching, plus which one `n`/`N` is sitting on.
+        self._log_matches: list[Static] = []
+        self._log_match_index: int = -1
+        self._log_debounce: Timer | None = None
+        # Same role as `_search_token`: a scan's result can land after the query
+        # has moved on, so the handler checks generation rather than trusting
+        # worker cancellation.
+        self._log_search_token: int = 0
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1200,12 +1384,60 @@ class SessionApp(App):
         except ConfigError:
             pass
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide bindings that don't apply to the view on screen.
+
+        The footer is the only place most of these keys are advertised, so a
+        binding that silently does nothing here (`s` in the log viewer, `n`
+        anywhere else) is worse than absent. Note the polarity: Textual treats
+        `False` as "hide entirely" and `None` as "show, greyed out" — hiding is
+        what we want, so this returns `False`, never `None`.
+        """
+        if action == "search":
+            return self._on_home
+        if action == "log_search":
+            return self._on_log
+        if action == "session_search":
+            return self._on_home
+        if action == "refresh":
+            # `action_refresh` already no-ops off the home screen; this is so
+            # the footer stops offering it there.
+            return self._on_home
+        if action in ("log_next_match", "log_prev_match"):
+            return self._on_log and bool(self._log_matches)
+        if action in ("toggle_search_regex", "toggle_search_case"):
+            return self._on_search or self._on_log
+        if action == "toggle_search_mode":
+            return self._on_search
+        return True
+
     async def _clear_main(self) -> None:
         self._stop_polling()
         self._stop_transcript_search()
+        self._stop_log_search()
         self._on_home = False
         main = self.query_one("#main")
         await main.remove_children()
+        self.refresh_bindings()
+
+    def _stop_log_search(self) -> None:
+        """Leave the log viewer: drop the body list and cancel any pending scan.
+
+        The bodies are live widgets, so holding them past a teardown would pin a
+        removed subtree and let `n` scroll to something no longer mounted. The
+        token is bumped before the cancel, so a scan already handed back to the
+        event loop is stale from the moment the decision is made.
+        """
+        self._on_log = False
+        self._log_bodies = []
+        self._log_spans = []
+        self._log_matches = []
+        self._log_match_index = -1
+        if self._log_debounce is not None:
+            self._log_debounce.stop()
+            self._log_debounce = None
+        self._log_search_token += 1
+        self.workers.cancel_group(self, "log-search")
 
     def _stop_transcript_search(self) -> None:
         """Leave the search view: cancel the scan and any pending debounce.
@@ -1290,6 +1522,7 @@ class SessionApp(App):
     async def _show_home(self) -> None:
         await self._clear_main()
         self._on_home = True
+        self.refresh_bindings()
         self._claude_cache = None
         main = self.query_one("#main")
 
@@ -1791,7 +2024,7 @@ class SessionApp(App):
         return items
 
     async def action_search(self) -> None:
-        """Arm the home-screen search box (bound to `/`)."""
+        """Arm the home-screen name filter (bound to `/` on the home screen)."""
         if not self._on_home or not self.query("#home-search"):
             return
         self._searching = True
@@ -1903,6 +2136,7 @@ class SessionApp(App):
         """
         await self._clear_main()
         self._on_search = True
+        self.refresh_bindings()
         if not restore:
             self._search_hits = []
         main = self.query_one("#main")
@@ -1928,11 +2162,29 @@ class SessionApp(App):
                 id="search-panel",
             )
         )
-        self.query_one("#search-input", Input).focus()
         if restore and self._search_hits:
             count = len(self._search_hits)
             plural = "s" if count != 1 else ""
             self._set_search_status(f"[dim]{count} session{plural} matched[/]")
+            # Coming back from a result's actions menu, put the highlight back
+            # on that result and focus the list — otherwise walking a set of
+            # results means being dropped at the top of it every time.
+            results = self.query_one("#search-results", ListView)
+            if (
+                self._search_selected_index is not None
+                and self._search_selected_index < len(results)
+            ):
+                results.index = self._search_selected_index
+            results.focus()
+            debug.log(
+                "search.restored",
+                hits=count,
+                index=self._search_selected_index
+                if self._search_selected_index is not None
+                else "none",
+            )
+        else:
+            self.query_one("#search-input", Input).focus()
 
     def _search_status_text(self, detail: str = "") -> str:
         """The mode line above the results, plus an optional progress detail."""
@@ -1989,7 +2241,17 @@ class SessionApp(App):
         return ListItem(*labels, id=item_id)
 
     async def action_toggle_search_regex(self) -> None:
-        """Flip literal/regex matching and rerun the scan (bound to ctrl+r)."""
+        """Flip literal/regex matching and rerun the scan (bound to ctrl+r).
+
+        Shared with the log viewer's `/` search, which keeps its own flag: the
+        two views are used differently and a choice in one shouldn't surprise
+        the other.
+        """
+        if self._on_log:
+            self._log_regex = not self._log_regex
+            self._set_log_status()
+            self._start_log_search()
+            return
         if not self._on_search:
             return
         self._transcript_regex = not self._transcript_regex
@@ -2003,7 +2265,12 @@ class SessionApp(App):
         await self._restart_transcript_search()
 
     async def action_toggle_search_case(self) -> None:
-        """Flip case sensitivity and rerun the scan (bound to ctrl+i)."""
+        """Flip case sensitivity and rerun (bound to ctrl+i, log viewer too)."""
+        if self._on_log:
+            self._log_case_sensitive = not self._log_case_sensitive
+            self._set_log_status()
+            self._start_log_search()
+            return
         if not self._on_search:
             return
         self._transcript_case_sensitive = not self._transcript_case_sensitive
@@ -2044,6 +2311,7 @@ class SessionApp(App):
 
     async def _clear_search_results(self) -> None:
         self._search_hits = []
+        self._search_selected_index = None
         if self.query("#search-results"):
             await self.query_one("#search-results", ListView).clear()
         self._search_result_map = {}
@@ -2159,6 +2427,9 @@ class SessionApp(App):
     async def on_search_result_selected(self, event: ListView.Selected) -> None:
         item_id = event.item.id
         if item_id and item_id in self._search_result_map:
+            # Row ids are `sr-{index}` into `_search_hits`, so the index alone
+            # is enough to restore the highlight when the menu is backed out of.
+            self._search_selected_index = int(item_id.split("-", 1)[1])
             await self._show_session_actions(
                 self._search_result_map[item_id], from_search=True
             )
@@ -2642,20 +2913,22 @@ class SessionApp(App):
         items: list[ListItem] = []
         for i, cs in enumerate(sessions):
             time_text = _relative_time(cs.last_activity)
+            # Assembled, not markup: a session title is model-written text and
+            # a stray `[` in it would otherwise be parsed as a console tag.
             meta = (
-                f"{cs.title}  [dim]{time_text}[/]"
+                Content.assemble(cs.title, "  ", (time_text, "dim"))
                 if cs.title
-                else f"[dim]{time_text}[/]"
+                else Content.assemble((time_text, "dim"))
             )
             if cs.first_prompt:
                 prompt_lines = _format_prompt_lines(cs.first_prompt, max_width)
                 item = ListItem(
-                    *[Label(ln) for ln in prompt_lines],
-                    Label(meta, markup=True),
+                    *[Label(Content(ln)) for ln in prompt_lines],
+                    Label(meta),
                     id=f"{prefix}-{i}",
                 )
             else:
-                item = ListItem(Label(meta, markup=True), id=f"{prefix}-{i}")
+                item = ListItem(Label(meta), id=f"{prefix}-{i}")
             items.append(item)
         items.append(
             ListItem(Label("[dim]Cancel[/]", markup=True), id=f"{prefix}-cancel")
@@ -2705,41 +2978,384 @@ class SessionApp(App):
         self.query_one("#log-picker").focus()
 
     async def _show_session_log(self, cs: ClaudeSession) -> None:
-        """Render a Claude transcript read-only, without launching Claude."""
+        """Open a Claude transcript read-only, without launching Claude.
+
+        A log the parser cannot structure falls back to its raw lines with a
+        banner saying so, rather than an error screen: Claude's entry shapes
+        evolve, and a transcript you can still read and search beats one you
+        cannot open at all. A file that cannot be *read* is a real error —
+        there is nothing to fall back to.
+        """
+        messages: list[TranscriptMessage] = []
+        raw_lines: list[str] = []
+        parse_error: str | None = None
         try:
             messages = read_transcript(cs.jsonl_path)
         except ClaudeLogError as e:
             await self._show_error(str(e))
             return
+        except Exception as e:
+            # The traceback is the report: a shape the parser doesn't know is a
+            # bug to fix, not just a view to degrade.
+            debug.log_exception("claude.transcript_unparsed", e)
+            debug.log(
+                "tui.log_raw_fallback",
+                log=debug.rp(cs.jsonl_path),
+                session=debug.rid(cs.session_id),
+                error=type(e).__name__,
+            )
+            try:
+                raw_lines = read_raw_transcript(cs.jsonl_path)
+            except ClaudeLogError as read_error:
+                await self._show_error(str(read_error))
+                return
+            parse_error = f"{type(e).__name__}: {e}"
+
+        # A fresh transcript starts unsearched; the regex/case choices persist,
+        # like the transcript-search toggles do.
+        self._log_session = cs
+        self._log_messages = messages
+        self._log_raw_lines = raw_lines
+        self._log_parse_error = parse_error
+        self._log_searching = False
+        self._log_query = ""
+        self._log_error = None
+        await self._render_log_view()
+
+    async def _render_log_view(self) -> None:
+        """Mount the log viewer for `_log_session`, unhighlighted.
+
+        This runs once per transcript. On a real log building these widgets
+        costs about half a second, which is why searching never comes back
+        here: `_apply_log_search` updates the bodies that are already mounted.
+
+        Deliberately no `.hint` row, unlike the other views: everything one
+        would say is already in the app footer, and a grey strip under a full
+        screen of transcript reads as a second footer.
+        """
+        cs = self._log_session
+        if cs is None:  # pragma: no cover - only reachable via _show_session_log
+            return
+        messages = self._log_messages
 
         await self._clear_main()
+        self._on_log = True
         main = self.query_one("#main")
 
-        header = cs.title or cs.first_prompt or cs.session_id
         # Widget, not Static: `_render_transcript` mixes in Collapsibles.
-        widgets: list[Widget] = [
-            Label(_first_line(header, 80), classes="form-label"),
-            Static(
-                f"{cs.session_id}  ·  {_relative_time(cs.last_activity)}",
-                classes="session-info",
-            ),
-        ]
-        if messages:
-            widgets.extend(_render_transcript(messages))
+        body: list[Widget]
+        if self._log_parse_error is not None:
+            # Raw fallback: one row per line, still built through `_log_body`
+            # so `/` highlighting and `n`/`N` work exactly as they do above.
+            self._log_bodies = [_log_body(line) for line in self._log_raw_lines]
+            body = [b.widget for b in self._log_bodies]
+        elif messages:
+            body, self._log_bodies = _render_transcript(messages)
         else:
-            widgets.append(Static("[dim]This log has no messages.[/]", markup=True))
-        widgets.append(
-            Static(
-                "[dim]Tab to a tool row + Enter to expand  ·  Escape to go back[/]"
-                if any(m.role in ("tool_use", "tool_result") for m in messages)
-                else "[dim]Escape to go back[/]",
-                markup=True,
-                classes="hint",
+            self._log_bodies = []
+            body = [Static("[dim]This log has no messages.[/]", markup=True)]
+
+        search = Input(
+            value=self._log_query,
+            placeholder="Search this transcript...",
+            id="log-search",
+            # Textual selects an Input's whole value on focus by default, which
+            # would eat the query the first time focus came back to the box.
+            select_on_focus=False,
+        )
+        status = Static(self._log_status_text(), id="log-search-status", markup=True)
+        # Mounted always, shown only once `/` arms them, so the header and the
+        # message pane don't shuffle when the box appears.
+        search.display = self._log_searching
+        status.display = self._log_searching
+
+        header = cs.title or cs.first_prompt or cs.session_id
+        banner: list[Widget] = []
+        if self._log_parse_error is not None:
+            banner.append(
+                Static(
+                    Content.assemble(
+                        ("⚠ Could not read this transcript's structure — ", "b"),
+                        "showing the raw log. ",
+                        (self._log_parse_error, "dim"),
+                    ),
+                    id="log-raw-warning",
+                )
+            )
+
+        await main.mount(
+            Container(
+                # Content, not markup: a title or first prompt is arbitrary
+                # transcript text and a stray `[` would be parsed as a tag.
+                Label(Content(_first_line(header, 80)), classes="form-label"),
+                Static(
+                    f"{cs.session_id}  ·  {_relative_time(cs.last_activity)}",
+                    classes="session-info",
+                ),
+                *banner,
+                search,
+                status,
+                # No hint row: the app footer already carries `/` and Escape,
+                # and a second strip of grey text under a wall of transcript
+                # reads as a second footer. Expanding a tool row is a Tab and
+                # an Enter, which the fold's own ▶ marker gives away.
+                VerticalScroll(*body, id="log-messages"),
+                id="log-panel",
             )
         )
 
-        await main.mount(Container(*widgets, id="log-panel"))
-        main.focus()
+        self._log_spans = []
+        self._log_matches = []
+        self._log_match_index = -1
+        self.refresh_bindings()
+        self.query_one("#log-messages", VerticalScroll).focus()
+        debug.log(
+            "tui.log_view",
+            session=debug.rid(cs.session_id),
+            log=debug.rp(cs.jsonl_path),
+            messages=len(messages),
+            widgets=len(body),
+            bodies=len(self._log_bodies),
+            raw="yes" if self._log_parse_error is not None else "no",
+        )
+
+    def _log_matcher(self) -> Matcher | None:
+        """Compile the viewer's query, recording a bad regex rather than raising.
+
+        `ContentMode` doesn't apply here: the transcript has already been parsed
+        into messages, so there is no raw JSON left to scan.
+        """
+        self._log_error = None
+        query = self._log_query.strip()
+        if not query:
+            return None
+        try:
+            return claude_search.compile_matcher(
+                query,
+                regex=self._log_regex,
+                mode=ContentMode.RAW,
+                case_sensitive=self._log_case_sensitive,
+            )
+        except SearchError as e:
+            self._log_error = str(e)
+            return None
+
+    def _start_log_search(self) -> None:
+        """Scan the open transcript for the current query, off the event loop.
+
+        Only the *matching* is threaded — applying the result touches mounted
+        widgets and so has to happen on the event loop. That split is what keeps
+        the search box from stuttering: nothing is unmounted, and the scan of a
+        large transcript never blocks a keystroke.
+
+        An empty or malformed query still runs a scan, with a `None` matcher: it
+        is what clears the previous query's highlights.
+        """
+        self._log_search_token += 1
+        self.workers.cancel_group(self, "log-search")
+        matcher = self._log_matcher()
+        debug.log(
+            "log_search.start",
+            query=debug.rv(self._log_query),
+            chars=len(self._log_query),
+            regex=self._log_regex,
+            case_sensitive=self._log_case_sensitive,
+            bodies=len(self._log_bodies),
+            token=self._log_search_token,
+            error=self._log_error or "none",
+        )
+        self._run_log_search(
+            [body.text for body in self._log_bodies], matcher, self._log_search_token
+        )
+
+    @work(thread=True, exclusive=True, group="log-search")
+    def _run_log_search(
+        self, texts: list[str], matcher: Matcher | None, token: int
+    ) -> None:
+        spans = [_match_spans(text, matcher) for text in texts]
+        self.call_from_thread(self._apply_log_search, token, spans)
+
+    def _apply_log_search(self, token: int, spans: list[Spans]) -> None:
+        """Repaint the bodies for a completed scan, if it is still the current one.
+
+        As with the transcript search, the token — not worker cancellation — is
+        the correctness mechanism: a result can already be queued on the event
+        loop when the query changes again.
+        """
+        if token != self._log_search_token or not self._on_log:
+            debug.log(
+                "log_search.dropped",
+                token=token,
+                current=self._log_search_token,
+                on_log=self._on_log,
+            )
+            return
+        if len(spans) != len(self._log_bodies):  # pragma: no cover - guarded by token
+            debug.log(
+                "log_search.dropped",
+                token=token,
+                reason="body-count-changed",
+                spans=len(spans),
+                bodies=len(self._log_bodies),
+            )
+            return
+
+        matches: list[Static] = []
+        # Every mounted body is *checked*, but only the ones whose matches
+        # actually moved are repainted: `Static.update` forces a layout refresh,
+        # and a transcript has hundreds of bodies that a given query never
+        # touches. Bodies start unhighlighted, so an absent previous entry is ().
+        previous = self._log_spans
+        # A fold opens if *any* body inside it matched, so the decision has to
+        # be accumulated across bodies before it is applied — a run holding one
+        # hit and nine misses would otherwise be closed again by the misses.
+        # Keyed by id() because a widget's equality is not identity.
+        folds: dict[int, tuple[Collapsible, bool]] = {}
+        for index, (body, body_spans) in enumerate(zip(self._log_bodies, spans)):
+            hit = bool(body_spans)
+            was = previous[index] if index < len(previous) else ()
+            if body_spans != was:
+                body.widget.update(_highlight(body.text, body_spans))
+                body.widget.set_class(hit, "log-match")
+            if hit:
+                matches.append(body.widget)
+            for fold in body.folds:
+                known = folds.get(id(fold))
+                folds[id(fold)] = (fold, hit or (known is not None and known[1]))
+
+        for fold, hit in folds.values():
+            # A match opens its way out; everything else folds back up, so a new
+            # query starts from the same view every time. Assigned only on a
+            # change, since each one costs a refresh.
+            if fold.collapsed is hit:
+                fold.collapsed = not hit
+
+        # Guarded: these tallies walk every body, and the whole point of the
+        # in-place update is not to do per-body work on a keystroke.
+        if debug.is_enabled():
+            debug.log(
+                "log_search.done",
+                query=debug.rv(self._log_query),
+                token=token,
+                bodies=len(self._log_bodies),
+                matching_bodies=len(matches),
+                matches=sum(len(body_spans) for body_spans in spans),
+                repainted=sum(
+                    1
+                    for index, body_spans in enumerate(spans)
+                    if body_spans != (previous[index] if index < len(previous) else ())
+                ),
+                folds_open=sum(1 for _, hit in folds.values() if hit),
+            )
+        self._log_spans = spans
+        self._log_matches = matches
+        self._log_match_index = -1
+        self.refresh_bindings()
+        if matches:
+            self._step_log_match(1)
+        else:
+            self._set_log_status()
+
+    async def action_log_search(self) -> None:
+        """Search the transcript on screen (bound to `/` in the log viewer)."""
+        if not self._on_log:
+            return
+        await self._arm_log_search()
+
+    async def _arm_log_search(self) -> None:
+        """Reveal and focus the viewer's query box."""
+        if not self.query("#log-search"):
+            return  # pragma: no cover - the box is mounted with the viewer
+        self._log_searching = True
+        search = self.query_one("#log-search", Input)
+        search.display = True
+        self.query_one("#log-search-status", Static).display = True
+        search.focus()
+
+    async def _clear_log_search(self) -> None:
+        """Drop the query, hide the box and clear the highlights."""
+        self._log_searching = False
+        self._log_query = ""
+        if self.query("#log-search"):
+            box = self.query_one("#log-search", Input)
+            box.value = ""
+            box.display = False
+            self.query_one("#log-search-status", Static).display = False
+        if self._log_debounce is not None:
+            self._log_debounce.stop()
+            self._log_debounce = None
+        self._start_log_search()
+        if self.query("#log-messages"):
+            self.query_one("#log-messages", VerticalScroll).focus()
+
+    @on(Input.Changed, "#log-search")
+    def on_log_search_changed(self, event: Input.Changed) -> None:
+        if event.value == self._log_query:
+            return
+        self._log_query = event.value
+        if self._log_debounce is not None:
+            self._log_debounce.stop()
+        self._log_debounce = self.set_timer(
+            self.SEARCH_DEBOUNCE, self._debounced_log_search
+        )
+
+    def _debounced_log_search(self) -> None:
+        self._log_debounce = None
+        self._start_log_search()
+
+    @on(Input.Submitted, "#log-search")
+    def on_log_search_submitted(self, event: Input.Submitted) -> None:
+        """Hand focus to the messages, where `n`/`N` and the arrows work."""
+        if self.query("#log-messages"):
+            self.query_one("#log-messages", VerticalScroll).focus()
+
+    def _log_status_text(self) -> str:
+        """Mode line above the transcript, plus where `n`/`N` currently sits."""
+        pattern = "regex" if self._log_regex else "literal"
+        case = "match case" if self._log_case_sensitive else "ignore case"
+        mode = f"[b]{pattern}[/] · [b]{case}[/]"
+        if self._log_error is not None:
+            return f"{mode}  [red]{escape(self._log_error)}[/]"
+        if not self._log_query.strip():
+            return mode
+        total = len(self._log_matches)
+        if not total:
+            return f"{mode}  [dim]no matches[/]"
+        position = self._log_match_index + 1 if self._log_match_index >= 0 else 1
+        plural = "s" if total != 1 else ""
+        return f"{mode}  [dim]{position} of {total} matching message{plural}[/]"
+
+    def _set_log_status(self) -> None:
+        if self.query("#log-search-status"):
+            self.query_one("#log-search-status", Static).update(self._log_status_text())
+
+    async def action_log_next_match(self) -> None:
+        """Scroll to the next `/` match in the log viewer (bound to `n`)."""
+        self._step_log_match(1)
+
+    async def action_log_prev_match(self) -> None:
+        """Scroll to the previous `/` match (bound to `N`)."""
+        self._step_log_match(-1)
+
+    def _step_log_match(self, step: int) -> None:
+        """Move the current-match marker by `step`, wrapping at either end.
+
+        Starting from -1 means the first `n` lands on the first match and the
+        first `N` on the last, which is what a fresh search wants either way.
+        """
+        if not self._on_log or not self._log_matches:
+            return
+        if not self.query("#log-messages"):
+            return  # pragma: no cover - the pane outlives the match list
+        if 0 <= self._log_match_index < len(self._log_matches):
+            self._log_matches[self._log_match_index].remove_class("log-match-current")
+        self._log_match_index = (self._log_match_index + step) % len(self._log_matches)
+        current = self._log_matches[self._log_match_index]
+        current.add_class("log-match-current")
+        self.query_one("#log-messages", VerticalScroll).scroll_to_widget(
+            current, top=True
+        )
+        self._set_log_status()
 
     @on(ListView.Selected, "#log-picker")
     async def on_log_picker_selected(self, event: ListView.Selected) -> None:
@@ -3313,6 +3929,13 @@ class SessionApp(App):
         if not self.focused:
             return
 
+        if self.focused.id == "log-search":
+            if event.key == "escape":
+                event.prevent_default()
+                event.stop()
+                await self._clear_log_search()
+            return
+
         if self.focused.id == "home-search":
             if event.key == "escape":
                 event.prevent_default()
@@ -3838,6 +4461,9 @@ class SessionApp(App):
                 await self._clear_search()
                 return
             self.exit()
+        elif self._on_log and (self._log_searching or self._log_query):
+            # In the log viewer escape drops the search before leaving the view.
+            await self._clear_log_search()
         elif self._actions_from_search and not self._on_search:
             # Back out of a result's actions menu into the results it came from.
             await self._show_session_search(restore=True)

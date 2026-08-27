@@ -17,6 +17,7 @@ from fujimoto.claude.log_parser import (
     get_claude_projects_dir,
     get_sessions_for_path,
     parse_session,
+    read_raw_transcript,
     read_transcript,
     session_dirs_for_path,
 )
@@ -900,3 +901,34 @@ class TestSessionDirsForPath:
                 ]
         finally:
             blocked.chmod(0o644)
+
+
+class TestReadRawTranscript:
+    """The viewer's fallback when an entry shape defeats `read_transcript`."""
+
+    def test_missing_file_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ClaudeLogError):
+            read_raw_transcript(tmp_path / "missing.jsonl")
+
+    def test_lines_come_back_as_written_minus_the_blanks(self, tmp_path: Path) -> None:
+        log = tmp_path / "s.jsonl"
+        log.write_text('{"a": 1}\n\n  {"b": 2}  \n')
+        assert read_raw_transcript(log) == ['{"a": 1}', '{"b": 2}']
+
+    def test_unparseable_lines_survive(self, tmp_path: Path) -> None:
+        """Structure is exactly what this view isn't trying to impose."""
+        log = tmp_path / "s.jsonl"
+        log.write_text("not json at all\n[1, 2, 3]\n")
+        assert read_raw_transcript(log) == ["not json at all", "[1, 2, 3]"]
+
+    def test_a_huge_line_is_clipped(self, tmp_path: Path) -> None:
+        log = tmp_path / "s.jsonl"
+        log.write_text('{"out": "' + "x" * 5000 + '"}')
+        line = read_raw_transcript(log)[0]
+        assert len(line) < 2100
+        assert line.endswith("…")
+
+    def test_undecodable_bytes_do_not_raise(self, tmp_path: Path) -> None:
+        log = tmp_path / "s.jsonl"
+        log.write_bytes(b'{"a": "\xff\xfe"}\n')
+        assert len(read_raw_transcript(log)) == 1

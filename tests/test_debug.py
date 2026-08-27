@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -1182,3 +1183,56 @@ class TestSessionDirLookupInstrumentation:
         text = self._log_text(log_dir)
         assert "via=none dirs=0" in text
         assert "encoded=-tmp-nope" in text
+
+
+class TestLogViewerInstrumentation:
+    """The log viewer's `/` search and its raw fallback, under --debug."""
+
+    def _log_text(self, log_dir: Path) -> str:
+        return next(log_dir.glob("*.log")).read_text()
+
+    def test_scan_failure_names_the_log_it_dropped(self, tmp_path: Path) -> None:
+        """A transcript missing from a result set is invisible without this."""
+        from fujimoto.claude import search
+
+        bad = tmp_path / "projects" / "-tmp-proj" / "bad.jsonl"
+        bad.parent.mkdir(parents=True)
+        bad.write_text("{}\n")
+        log_dir = tmp_path / "logs"
+        debug.enable(redact=False, log_dir=log_dir)
+        with patch.object(
+            search, "search_log", side_effect=AttributeError("no attribute 'get'")
+        ):
+            batches = list(search.iter_hits([bad], search.compile_matcher("x")))
+        debug.disable()
+        assert sum(len(b) for _, b in batches) == 0
+        text = self._log_text(log_dir)
+        assert "search.scan_failed" in text
+        assert "error=AttributeError" in text
+        assert "failed=1" in text
+
+    def test_raw_read_reports_what_it_kept(self, tmp_path: Path) -> None:
+        from fujimoto.claude.log_parser import read_raw_transcript
+
+        log = tmp_path / "s.jsonl"
+        log.write_text('{"a": 1}\n\n{"b": "' + "x" * 5000 + '"}\n')
+        log_dir = tmp_path / "logs"
+        debug.enable(redact=False, log_dir=log_dir)
+        read_raw_transcript(log)
+        debug.disable()
+        text = self._log_text(log_dir)
+        assert "claude.read_raw" in text
+        assert "lines=2 clipped=1" in text
+
+    def test_raw_read_redacts_the_path(self, tmp_path: Path) -> None:
+        from fujimoto.claude.log_parser import read_raw_transcript
+
+        log = tmp_path / "my-private-project.jsonl"
+        log.write_text('{"a": 1}\n')
+        log_dir = tmp_path / "logs"
+        debug.enable(redact=True, log_dir=log_dir)
+        read_raw_transcript(log)
+        debug.disable()
+        text = self._log_text(log_dir)
+        assert "claude.read_raw" in text
+        assert "my-private-project" not in text

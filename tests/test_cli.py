@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -34,9 +35,12 @@ from fujimoto.cli import (
     _claude_state_label,
     _format_prompt_lines,
     _friendly_key_label,
+    LOG_MATCH_STYLE,
     SNIPPET_MATCH_STYLE,
     _fit_snippet,
     _get_claude_sessions,
+    _highlight,
+    _match_spans,
     _relative_time,
     _render_snippet,
     _pair_results,
@@ -6155,6 +6159,45 @@ class TestTranscriptSearchSelection:
                 assert len(app.query_one("#search-results", ListView)) == 1
 
     @pytest.mark.asyncio
+    async def test_returning_lands_on_the_result_that_was_opened(self) -> None:
+        """Walking a list of results shouldn't restart at the top each time."""
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._apply_search_batch(
+                    app._search_token,
+                    3,
+                    3,
+                    (_make_hit("aaa"), _make_hit("bbb"), _make_hit("ccc")),
+                )
+                results = app.query_one("#search-results", ListView)
+                results.focus()
+                results.index = 1
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._search_selected_index == 1
+
+                await app.action_go_back()
+                await pilot.pause()
+                results = app.query_one("#search-results", ListView)
+                assert results.index == 1
+                assert app.focused is results
+
+    @pytest.mark.asyncio
+    async def test_a_fresh_scan_forgets_the_remembered_row(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                app._search_selected_index = 2
+                await app._clear_search_results()
+                await pilot.pause()
+                assert app._search_selected_index is None
+
+    @pytest.mark.asyncio
     async def test_actions_opened_from_home_still_return_home(self) -> None:
         app = SessionApp()
         session = SessionInfo(
@@ -6705,7 +6748,7 @@ class TestSessionLogViewer:
     @staticmethod
     def _body_texts(app: SessionApp) -> list[str]:
         """Prose bodies only — a collapsible's body is nested, not a child."""
-        return [str(w.visual) for w in app.query("#log-panel > .log-body")]
+        return [str(w.visual) for w in app.query("#log-messages > .log-body")]
 
     @staticmethod
     def _tool_body_texts(app: SessionApp) -> list[str]:
@@ -6765,6 +6808,46 @@ class TestSessionLogViewer:
                 assert self._body_texts(app) == ["Do the thing [brackets]", "On it."]
                 # Nothing was launched — this is a read-only view.
                 assert app._launch_target is None
+
+    @pytest.mark.asyncio
+    async def test_no_hint_row_under_the_transcript(self, tmp_path: Path) -> None:
+        """A grey strip under a screenful of transcript reads as a footer.
+
+        Everything it used to say — `/`, Escape — is in the app footer, and the
+        fold markers give away that a tool row opens.
+        """
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "t1",
+                                "name": "Bash",
+                                "input": {"command": "ls"},
+                            }
+                        ]
+                    },
+                },
+            ],
+        )
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"],
+            worktrees=[wt],
+            claude_sessions_fn=lambda _p: [_log_session(log, wt)],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                await self._select(app, pilot, "#session-actions", "sa-viewlog")
+                assert len(app.query("#log-panel .hint")) == 0
+                # The messages pane is the last thing in the panel, so it gets
+                # the rest of the height instead of leaving a row for the hint.
+                assert app.query_one("#log-panel").children[-1].id == "log-messages"
 
     @pytest.mark.asyncio
     async def test_escape_returns_home(self, tmp_path: Path) -> None:
@@ -7236,7 +7319,7 @@ class TestSessionLogViewer:
                 await self._open_log(app, pilot)
                 rows = list(app.query(".log-tool"))
                 assert len(rows) == 1
-                assert rows[0].title.startswith("↳ Result (1 line)")
+                assert str(rows[0].title).startswith("↳ Result (1 line)")
                 assert self._tool_body_texts(app) == ["orphaned output"]
 
     def test_results_pair_positionally_when_a_log_has_no_ids(self) -> None:
@@ -7257,3 +7340,1053 @@ class TestSessionLogViewer:
         ts = datetime(2026, 3, 9, tzinfo=timezone.utc)
         run = [TranscriptMessage("tool_use", "Bash\ncommand: hung", ts, "t1")]
         assert _pair_results(run) == [(run[0], None)]
+
+
+class TestSessionLogSearch:
+    """`/` inside the session log viewer: highlight, count, n/N navigation."""
+
+    async def _open_log(self, pilot, app: SessionApp, log: Path, wt: Path) -> None:
+        await app._show_session_log(_log_session(log, wt))
+        await pilot.pause()
+
+    @staticmethod
+    def _status(app: SessionApp) -> str:
+        return str(app.query_one("#log-search-status", Static).render())
+
+    @staticmethod
+    def _match_texts(app: SessionApp) -> list[str]:
+        return [str(w.visual) for w in app._log_matches]
+
+    @pytest.mark.asyncio
+    async def test_slash_arms_the_box_and_matches_are_tagged(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [
+                {"type": "user", "message": {"content": "find the needle"}},
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "no hay here"}]},
+                },
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "needle again"}]},
+                },
+            ],
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(pilot, app, log, wt)
+                assert app.query_one("#log-search", Input).display is False
+
+                await pilot.press("slash")
+                await pilot.pause()
+                assert app._log_searching is True
+                assert app.query_one("#log-search", Input).display is True
+                assert app.focused is app.query_one("#log-search", Input)
+
+                app.query_one("#log-search", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert self._match_texts(app) == ["find the needle", "needle again"]
+                assert "1 of 2 matching messages" in self._status(app)
+
+    @pytest.mark.asyncio
+    async def test_n_and_shift_n_walk_the_matches_and_wrap(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [
+                {"type": "user", "message": {"content": "needle one"}},
+                {"type": "user", "message": {"content": "needle two"}},
+            ],
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(pilot, app, log, wt)
+                await pilot.press("slash")
+                app.query_one("#log-search", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                # A fresh search lands on the first match.
+                assert app._log_match_index == 0
+                assert app._log_matches[0].has_class("log-match-current")
+
+                # The Input holds focus, so drive the actions directly — a
+                # plain `n` would be typed into the query box.
+                await app.action_log_next_match()
+                assert app._log_match_index == 1
+                assert not app._log_matches[0].has_class("log-match-current")
+                assert "2 of 2" in self._status(app)
+
+                await app.action_log_next_match()
+                assert app._log_match_index == 0
+                await app.action_log_prev_match()
+                assert app._log_match_index == 1
+
+    @pytest.mark.asyncio
+    async def test_enter_hands_focus_to_the_messages_so_n_works(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [
+                {"type": "user", "message": {"content": "needle one"}},
+                {"type": "user", "message": {"content": "needle two"}},
+            ],
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(pilot, app, log, wt)
+                await pilot.press("slash")
+                app.query_one("#log-search", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app.focused is app.query_one("#log-messages")
+                await pilot.press("n")
+                await pilot.pause()
+                assert app._log_match_index == 1
+
+    @pytest.mark.asyncio
+    async def test_a_match_inside_a_tool_call_opens_the_fold(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "t1",
+                                "name": "Bash",
+                                "input": {"command": "grep needle ."},
+                            }
+                        ]
+                    },
+                },
+            ],
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(pilot, app, log, wt)
+                assert app.query_one(Collapsible).collapsed is True
+
+                await pilot.press("slash")
+                app.query_one("#log-search", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                # A match nothing can scroll to is worse than no match.
+                assert app.query_one(Collapsible).collapsed is False
+                assert len(app._log_matches) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_matches_says_so(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "hay"}}]
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(pilot, app, log, wt)
+                await pilot.press("slash")
+                app.query_one("#log-search", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert app._log_matches == []
+                assert "no matches" in self._status(app)
+
+    @pytest.mark.asyncio
+    async def test_ctrl_r_switches_to_regex_and_a_bad_one_is_reported(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "a1b2"}}]
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(pilot, app, log, wt)
+                await pilot.press("slash")
+                app.query_one("#log-search", Input).value = "a.b"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                # Literal by default, so the dot doesn't match "1".
+                assert app._log_matches == []
+                assert "literal" in self._status(app)
+
+                await app.action_toggle_search_regex()
+                await pilot.pause()
+                assert app._log_regex is True
+                assert "regex" in self._status(app)
+                assert len(app._log_matches) == 1
+
+                app.query_one("#log-search", Input).value = "(unclosed"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert app._log_matches == []
+                assert "regex" in self._status(app)
+                assert app._log_error is not None
+
+    @pytest.mark.asyncio
+    async def test_ctrl_i_switches_to_case_sensitive(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "Needle"}}]
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(pilot, app, log, wt)
+                await pilot.press("slash")
+                app.query_one("#log-search", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert len(app._log_matches) == 1
+
+                await app.action_toggle_search_case()
+                await pilot.pause()
+                assert app._log_case_sensitive is True
+                assert "match case" in self._status(app)
+                assert app._log_matches == []
+
+    @pytest.mark.asyncio
+    async def test_escape_drops_the_search_before_leaving_the_view(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "needle"}}]
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(pilot, app, log, wt)
+                await pilot.press("slash")
+                app.query_one("#log-search", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert len(app._log_matches) == 1
+
+                # First escape (from the query box) only clears the search.
+                app.query_one("#log-search", Input).focus()
+                await pilot.pause()
+                await pilot.press("escape")
+                await pilot.pause()
+                assert app._on_log is True
+                assert app._log_query == ""
+                assert app._log_matches == []
+                assert app.query_one("#log-search", Input).display is False
+
+                # The next one leaves the viewer.
+                await pilot.press("escape")
+                await pilot.pause()
+                assert len(app.query("#home-list")) == 1
+
+    @pytest.mark.asyncio
+    async def test_escape_from_the_messages_pane_also_drops_the_search_first(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "needle"}}]
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(pilot, app, log, wt)
+                await pilot.press("slash")
+                app.query_one("#log-search", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                app.query_one("#log-messages").focus()
+                await pilot.press("escape")
+                await pilot.pause()
+                assert app._on_log is True
+                assert app._log_query == ""
+
+    @pytest.mark.asyncio
+    async def test_typing_restarts_the_debounce_rather_than_stacking_renders(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "needle"}}]
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(pilot, app, log, wt)
+                await pilot.press("slash")
+                box = app.query_one("#log-search", Input)
+                box.value = "nee"
+                await pilot.pause()
+                first = app._log_debounce
+                assert first is not None
+                box.value = "needle"
+                await pilot.pause()
+                assert app._log_debounce is not first
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert app._log_debounce is None
+                assert len(app._log_matches) == 1
+
+    @pytest.mark.asyncio
+    async def test_typing_past_a_re_render_appends_rather_than_replacing(
+        self, tmp_path: Path
+    ) -> None:
+        """A re-render refocuses the box; focus must not select what's in it.
+
+        Textual selects an Input's whole value on focus by default, so without
+        `select_on_focus=False` the first keystroke after a debounced re-render
+        wiped everything typed before it.
+        """
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "needle"}}]
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(pilot, app, log, wt)
+                await pilot.press("slash")
+                await pilot.pause()
+                await pilot.press("n", "e", "e")
+                # Let the debounce fire, which remounts and refocuses the box.
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                box = app.query_one("#log-search", Input)
+                assert box.selection.is_empty
+                assert app.focused is box
+
+                await pilot.press("d", "l", "e")
+                assert box.value == "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert len(app._log_matches) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_query_updates_bodies_in_place_without_remounting(
+        self, tmp_path: Path
+    ) -> None:
+        """The panel must survive a query change — rebuilding it is the bug.
+
+        A full rebuild costs about half a second on a real transcript and takes
+        the query box down with it, so the box loses focus mid-keystroke.
+        """
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [
+                {"type": "user", "message": {"content": "needle one"}},
+                {"type": "user", "message": {"content": "only hay"}},
+            ],
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(pilot, app, log, wt)
+                await pilot.press("slash")
+                await pilot.pause()
+                panel = app.query_one("#log-panel")
+                box = app.query_one("#log-search", Input)
+                bodies = list(app._log_bodies)
+
+                box.value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                # Same widgets throughout — only their content changed.
+                assert app.query_one("#log-panel") is panel
+                assert app.query_one("#log-search", Input) is box
+                assert app._log_bodies == bodies
+                assert app.focused is box
+                assert app._log_matches == [bodies[0].widget]
+
+                # And a narrowed query re-highlights the same widgets again.
+                box.value = "hay"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert app.query_one("#log-panel") is panel
+                assert app._log_matches == [bodies[1].widget]
+                assert not bodies[0].widget.has_class("log-match")
+
+    @pytest.mark.asyncio
+    async def test_a_stale_scan_is_dropped(self, tmp_path: Path) -> None:
+        """A scan can land after the query moved on; the token is what catches it."""
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "needle"}}]
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(pilot, app, log, wt)
+                await pilot.press("slash")
+                app.query_one("#log-search", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert len(app._log_matches) == 1
+
+                stale = app._log_search_token - 1
+                app._apply_log_search(stale, [()] * len(app._log_bodies))
+                assert len(app._log_matches) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_run_of_tool_calls_folds_back_up_when_the_query_changes(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "t1",
+                                "name": "Bash",
+                                "input": {"command": "grep needle ."},
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "t2",
+                                "name": "Bash",
+                                "input": {"command": "ls"},
+                            },
+                        ]
+                    },
+                },
+            ],
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(pilot, app, log, wt)
+                run = app.query_one(".log-tool-run", Collapsible)
+                assert run.collapsed is True
+
+                await pilot.press("slash")
+                app.query_one("#log-search", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                # The run and the matching call both open; the other stays shut.
+                assert run.collapsed is False
+                calls = list(app.query(".log-tool-run .log-tool").results(Collapsible))
+                assert [c.collapsed for c in calls] == [False, True]
+
+                app.query_one("#log-search", Input).value = "nothing here"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert run.collapsed is True
+                assert all(c.collapsed for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_slash_off_the_viewer_is_inert(self) -> None:
+        """`check_action` hides it, but the action must still be safe to call."""
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await app.action_log_search()
+                await pilot.pause()
+                assert app._log_searching is False
+
+    @pytest.mark.asyncio
+    async def test_escape_mid_keystroke_cancels_the_pending_scan(
+        self, tmp_path: Path
+    ) -> None:
+        """Clearing before the debounce fires must not leave it armed."""
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "needle"}}]
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(pilot, app, log, wt)
+                await pilot.press("slash")
+                app.query_one("#log-search", Input).value = "need"
+                await pilot.pause()
+                assert app._log_debounce is not None
+
+                await app._clear_log_search()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert app._log_debounce is None
+                assert app._log_query == ""
+                assert app._log_matches == []
+
+    @pytest.mark.asyncio
+    async def test_a_new_transcript_starts_unsearched(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "needle"}}]
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(pilot, app, log, wt)
+                await pilot.press("slash")
+                app.query_one("#log-search", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                await app.action_toggle_search_regex()
+                await pilot.pause()
+
+                await self._open_log(pilot, app, log, wt)
+                assert app._log_query == ""
+                assert app._log_searching is False
+                # The regex/case choices persist, as they do in `s`.
+                assert app._log_regex is True
+
+    @pytest.mark.asyncio
+    async def test_leaving_the_viewer_drops_the_match_list(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "needle"}}]
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_log(pilot, app, log, wt)
+                await pilot.press("slash")
+                app.query_one("#log-search", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                await app._show_home()
+                await pilot.pause()
+                assert app._on_log is False
+                assert app._log_matches == []
+                # `n` off the viewer is inert, not a crash.
+                await app.action_log_next_match()
+
+
+class TestContextAwareBindings:
+    """The footer only advertises keys that do something in the current view."""
+
+    @staticmethod
+    def _footer_labels(app: SessionApp) -> set[str]:
+        """Descriptions of the bindings the footer is actually showing."""
+        return {
+            binding.description
+            for _, binding, _, _ in app.screen.active_bindings.values()
+            if binding.show
+        }
+
+    @pytest.mark.asyncio
+    async def test_slash_still_opens_the_right_search_in_each_view(
+        self, tmp_path: Path
+    ) -> None:
+        """Two bindings share `/`; the disabled one must fall through."""
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "hi"}}]
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                await pilot.pause()
+                assert app._searching is True
+                assert app.focused is app.query_one("#home-search", Input)
+
+                await app._show_session_log(_log_session(log, wt))
+                await pilot.pause()
+                await pilot.press("slash")
+                await pilot.pause()
+                assert app._log_searching is True
+                assert app.focused is app.query_one("#log-search", Input)
+
+    @pytest.mark.asyncio
+    async def test_home_offers_filter_and_transcript_search_but_not_n(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                assert app.check_action("search", ()) is True
+                assert app.check_action("session_search", ()) is True
+                # False, not None: Textual greys a None binding out but hides a
+                # False one, and hiding is the point.
+                assert app.check_action("log_search", ()) is False
+                assert app.check_action("log_next_match", ()) is False
+                assert app.check_action("toggle_search_regex", ()) is False
+                await pilot.pause()
+                assert self._footer_labels(app) == {
+                    "Quit",
+                    "Back",
+                    "Filter",
+                    "Search transcripts",
+                    "Refresh",
+                }
+
+    @pytest.mark.asyncio
+    async def test_log_viewer_offers_slash_and_match_keys_but_not_s(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "needle"}}]
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._show_session_log(_log_session(log, wt))
+                await pilot.pause()
+                assert app.check_action("search", ()) is False
+                assert app.check_action("log_search", ()) is True
+                assert app.check_action("session_search", ()) is False
+                assert app.check_action("toggle_search_regex", ()) is True
+                assert app.check_action("toggle_search_mode", ()) is False
+                # Nothing to step through until a query matches something.
+                assert app.check_action("log_next_match", ()) is False
+                # `/` reads as Search here, not Filter — same key, two bindings.
+                labels = self._footer_labels(app)
+                assert "Search" in labels
+                assert "Filter" not in labels
+                assert "Search transcripts" not in labels
+                # Regex and case apply here; raw-vs-text does not.
+                assert {"Regex", "Match case"} <= labels
+                assert "Raw/text" not in labels
+                # `r` only rebuilds the home list, so it has nothing to offer.
+                assert app.check_action("refresh", ()) is False
+                assert "Refresh" not in labels
+
+                await pilot.press("slash")
+                app.query_one("#log-search", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert app.check_action("log_next_match", ()) is True
+                assert app.check_action("log_prev_match", ()) is True
+                # Not in the footer while the query box holds focus: a plain
+                # letter would be typed into it, so Textual withholds it.
+                await pilot.press("enter")
+                await pilot.pause()
+                assert {"Next match", "Previous match"} <= self._footer_labels(app)
+
+    @pytest.mark.asyncio
+    async def test_transcript_search_offers_all_three_mode_toggles(self) -> None:
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                assert app.check_action("toggle_search_mode", ()) is True
+                assert app.check_action("toggle_search_case", ()) is True
+                assert app.check_action("session_search", ()) is False
+                assert app.check_action("quit", ()) is True
+                # The chords are the only way to discover these modes, and the
+                # query box has focus here — a chord still reaches the footer
+                # from there, which is why they aren't plain letters.
+                assert app.focused is app.query_one("#search-input", Input)
+                assert {"Regex", "Raw/text", "Match case"} <= self._footer_labels(app)
+
+
+class TestHighlight:
+    """Marking up transcript text for the log viewer's `/` search."""
+
+    @staticmethod
+    def _spans(text: str, query: str, **kwargs):
+        from fujimoto.claude.search import compile_matcher
+
+        return _match_spans(text, compile_matcher(query, **kwargs))
+
+    def test_no_matcher_means_no_spans_and_untouched_text(self) -> None:
+        assert _match_spans("plain [text]", None) == ()
+        assert str(_highlight("plain [text]", ())) == "plain [text]"
+
+    def test_matches_are_located_and_styled(self) -> None:
+        text = "a needle in a needle"
+        spans = self._spans(text, "needle")
+        assert spans == ((2, 8), (14, 20))
+        content = _highlight(text, spans)
+        # Spans are styled; the text itself is untouched.
+        assert str(content) == text
+        assert [span.style for span in content.spans] == [LOG_MATCH_STYLE] * 2
+
+    def test_brackets_are_not_parsed_as_markup(self) -> None:
+        text = '{"a": [needle'
+        assert str(_highlight(text, self._spans(text, "needle"))) == text
+
+    def test_zero_width_matches_are_dropped(self) -> None:
+        # `x*` matches empty at every position. There is nothing to highlight
+        # and nothing to scroll to, so counting them would only inflate the
+        # tally the status line reports.
+        assert self._spans("abc", "x*", regex=True) == ()
+
+    def test_case_insensitivity_is_the_matcher_s_business(self) -> None:
+        assert self._spans("Needle", "needle") == ((0, 6),)
+        assert self._spans("Needle", "needle", case_sensitive=True) == ()
+
+
+class TestTranscriptMarkupSafety:
+    """Transcript text is arbitrary bytes; nothing built from it may be markup.
+
+    A real `Bash` call whose command contained `[ "$(gh run list --workflow=…`
+    crashed the viewer with `MarkupError: Expected markup value` — the `[` in a
+    shell test opened a console tag Textual then failed to close.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_bracket_in_a_tool_title_does_not_crash_the_viewer(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        command = 'until [ "$(gh run list --workflow=post-deploy.yml)" ]; do :; done'
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "t1",
+                                "name": "Bash",
+                                "input": {"command": command},
+                            }
+                        ]
+                    },
+                },
+            ],
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._show_session_log(_log_session(log, wt))
+                await pilot.pause()
+                title = app.query_one(Collapsible).title
+                # The bracket survives verbatim rather than opening a tag.
+                assert 'until [ "$(gh run list' in str(title)
+
+    @pytest.mark.asyncio
+    async def test_a_bracket_in_the_header_does_not_crash_the_viewer(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "hi"}}]
+        )
+        cs = replace(_log_session(log, wt), title="fix [DA-494] uniqueness")
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._show_session_log(cs)
+                await pilot.pause()
+                header = str(app.query_one("#log-panel .form-label", Label).visual)
+                assert header == "fix [DA-494] uniqueness"
+
+    @pytest.mark.asyncio
+    async def test_a_bracket_in_a_picker_row_does_not_crash(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "hi"}}]
+        )
+        sessions = [
+            replace(
+                _log_session(log, wt, "aaa11111", minute=1),
+                title="fix [DA-494]",
+                first_prompt='run until [ "$(gh run list)" ]',
+            ),
+            _log_session(log, wt, "bbb22222", minute=0),
+        ]
+        session = SessionInfo(
+            name="20260309-test",
+            session_type="worktree",
+            project="test-proj",
+            path=wt,
+            tmux_session="test-proj/20260309-test",
+            is_active=False,
+            branch="worktree/20260309-test",
+        )
+        with _patch_git_info(worktrees=[wt], claude_sessions_fn=lambda _p: sessions):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._show_log_picker(session)
+                await pilot.pause()
+                # Children compose on mount, so the picker has to be on screen.
+                rendered = " ".join(
+                    str(label.visual) for label in app.query("#log-picker Label")
+                )
+                assert "fix [DA-494]" in rendered
+                assert 'until [ "$(gh run list)" ]' in rendered
+
+
+class TestRawTranscriptFallback:
+    """A log the parser can't structure is still readable, not an error screen."""
+
+    @staticmethod
+    def _rows(app: SessionApp) -> list[str]:
+        return [str(w.visual) for w in app.query("#log-messages .log-body")]
+
+    @pytest.mark.asyncio
+    async def test_a_parser_crash_falls_back_to_the_raw_log(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [{"type": "user", "message": {"content": "the needle"}}],
+        )
+        with (
+            _patch_git_info(worktrees=[wt]),
+            patch(
+                "fujimoto.cli.read_transcript",
+                side_effect=AttributeError("'list' object has no attribute 'get'"),
+            ),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._show_session_log(_log_session(log, wt))
+                await pilot.pause()
+                assert len(app.query("#log-panel")) == 1
+                warning = str(app.query_one("#log-raw-warning", Static).visual)
+                assert "showing the raw log" in warning
+                # The exception is named, so the shape can be chased down.
+                assert "AttributeError" in warning
+                assert '"content": "the needle"' in self._rows(app)[0]
+
+    @pytest.mark.asyncio
+    async def test_the_raw_view_is_still_searchable(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [
+                {"type": "user", "message": {"content": "the needle"}},
+                {"type": "user", "message": {"content": "only hay"}},
+            ],
+        )
+        with (
+            _patch_git_info(worktrees=[wt]),
+            patch("fujimoto.cli.read_transcript", side_effect=TypeError("boom")),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._show_session_log(_log_session(log, wt))
+                await pilot.pause()
+                await pilot.press("slash")
+                app.query_one("#log-search", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert len(app._log_matches) == 1
+                assert app._log_match_index == 0
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_file_is_still_an_error(self, tmp_path: Path) -> None:
+        """There is nothing to fall back *to* when the file can't be read."""
+        wt = tmp_path / "20260309-test"
+        with (
+            _patch_git_info(worktrees=[wt]),
+            patch("fujimoto.cli.read_transcript", side_effect=TypeError("boom")),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._show_session_log(_log_session(tmp_path / "gone.jsonl", wt))
+                await pilot.pause()
+                assert len(app.query("#log-panel")) == 0
+                assert "Error:" in " ".join(
+                    str(w.visual) for w in app.query("#main > Static")
+                )
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_log_shows_no_warning(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "hi"}}]
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._show_session_log(_log_session(log, wt))
+                await pilot.pause()
+                assert app._log_parse_error is None
+                assert len(app.query("#log-raw-warning")) == 0
+
+    @pytest.mark.asyncio
+    async def test_opening_a_good_log_next_clears_the_fallback(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "hi"}}]
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                with patch(
+                    "fujimoto.cli.read_transcript", side_effect=TypeError("boom")
+                ):
+                    await app._show_session_log(_log_session(log, wt))
+                    await pilot.pause()
+                    assert app._log_parse_error is not None
+
+                await app._show_session_log(_log_session(log, wt))
+                await pilot.pause()
+                assert app._log_parse_error is None
+                assert app._log_raw_lines == []
+                assert len(app.query("#log-raw-warning")) == 0
+
+
+class TestLogViewerDebugInventory:
+    """What --debug records about reading and searching one transcript."""
+
+    @pytest.fixture(autouse=True)
+    def _debug_on(self, tmp_path: Path) -> None:
+        from fujimoto import debug
+
+        debug.enable(redact=False, log_dir=tmp_path / "logs")
+        yield
+        debug.disable()
+
+    def _log_text(self, tmp_path: Path, subdir: str = "logs") -> str:
+        # Newest wins, for the reason `TestDebugHomeInventory` says: a test that
+        # re-enables the logger leaves the fixture's file alongside its own.
+        logs = sorted(
+            (tmp_path / subdir).glob("*.log"), key=lambda p: p.stat().st_mtime
+        )
+        return logs[-1].read_text()
+
+    @pytest.mark.asyncio
+    async def test_opening_and_searching_a_transcript_is_logged(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [
+                {"type": "user", "message": {"content": "the needle"}},
+                {"type": "user", "message": {"content": "only hay"}},
+            ],
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._show_session_log(_log_session(log, wt))
+                await pilot.pause()
+                await pilot.press("slash")
+                app.query_one("#log-search", Input).value = "needle"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+        text = self._log_text(tmp_path)
+        assert "tui.log_view" in text
+        assert "messages=2" in text
+        assert "raw=no" in text
+        assert "log_search.start query=needle chars=6" in text
+        assert "log_search.done" in text
+        # One body matched out of two, and only that one was repainted.
+        assert "matching_bodies=1" in text
+        assert "repainted=1" in text
+
+    @pytest.mark.asyncio
+    async def test_the_query_is_redacted(self, tmp_path: Path) -> None:
+        from fujimoto import debug
+
+        debug.disable()
+        # Its own directory, so the fixture's unredacted log cannot be the one
+        # this test reads back.
+        debug.enable(redact=True, log_dir=tmp_path / "redacted")
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [{"type": "user", "message": {"content": "my-secret-term"}}],
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._show_session_log(_log_session(log, wt))
+                await pilot.pause()
+                await pilot.press("slash")
+                app.query_one("#log-search", Input).value = "my-secret-term"
+                await pilot.pause(app.SEARCH_DEBOUNCE * 2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+        text = self._log_text(tmp_path, "redacted")
+        assert "log_search.start" in text
+        assert "chars=14" in text
+        assert "my-secret-term" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_stale_scan_says_why_it_was_dropped(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "hi"}}]
+        )
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._show_session_log(_log_session(log, wt))
+                await pilot.pause()
+                app._apply_log_search(app._log_search_token - 1, [()])
+        text = self._log_text(tmp_path)
+        assert "log_search.dropped" in text
+
+    @pytest.mark.asyncio
+    async def test_the_raw_fallback_reports_the_shape_that_defeated_it(
+        self, tmp_path: Path
+    ) -> None:
+        """The traceback is the report — an unknown entry shape is a bug."""
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "hi"}}]
+        )
+        with (
+            _patch_git_info(worktrees=[wt]),
+            patch(
+                "fujimoto.cli.read_transcript",
+                side_effect=AttributeError("'list' object has no attribute 'get'"),
+            ),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._show_session_log(_log_session(log, wt))
+                await pilot.pause()
+        text = self._log_text(tmp_path)
+        assert "claude.transcript_unparsed" in text
+        assert "AttributeError" in text
+        assert "Traceback" in text
+        assert "tui.log_raw_fallback" in text
+        assert "claude.read_raw" in text
+        assert "raw=yes" in text
