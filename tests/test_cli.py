@@ -436,8 +436,14 @@ class TestDebugHomeInventory:
         yield
         debug.disable()
 
-    def _log_text(self, tmp_path: Path) -> str:
-        return next((tmp_path / "logs").glob("*.log")).read_text()
+    def _log_text(self, tmp_path: Path, subdir: str = "logs") -> str:
+        # Newest wins: `debug.enable` names the file to the second, so a test
+        # that re-enables the logger leaves the fixture's file alongside its
+        # own, and `next(glob(...))` picked between them arbitrarily.
+        logs = sorted(
+            (tmp_path / subdir).glob("*.log"), key=lambda p: p.stat().st_mtime
+        )
+        return logs[-1].read_text()
 
     @pytest.mark.asyncio
     async def test_home_inventory_is_logged(self, tmp_path: Path) -> None:
@@ -461,7 +467,9 @@ class TestDebugHomeInventory:
         from fujimoto import debug
 
         debug.disable()
-        debug.enable(redact=True, log_dir=tmp_path / "logs")
+        # Its own directory, so the fixture's unredacted log cannot be the one
+        # this test reads back.
+        debug.enable(redact=True, log_dir=tmp_path / "redacted")
         app = SessionApp()
         with _patch_git_info(
             project="secretproj",
@@ -470,7 +478,7 @@ class TestDebugHomeInventory:
         ):
             async with app.run_test():
                 pass
-        text = self._log_text(tmp_path)
+        text = self._log_text(tmp_path, "redacted")
         assert "tui.item id=" in text
         assert "secretproj" not in text
         assert "20260827-thing" not in text
