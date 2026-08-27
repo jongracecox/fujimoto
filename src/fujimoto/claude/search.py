@@ -32,9 +32,8 @@ from pathlib import Path
 from fujimoto.claude.log_parser import (
     ClaudeLogError,
     ClaudeSession,
-    encode_project_path,
-    get_claude_projects_dir,
     parse_session,
+    session_dirs_for_path,
 )
 
 # How many logs are scanned before results are handed back to the caller.
@@ -173,7 +172,6 @@ def list_session_logs(
     they arrive shows the most recently touched sessions first — which is the
     order the home screen already implies.
     """
-    projects_dir = get_claude_projects_dir()
     targets: list[Path] = []
     if project_root is not None:
         targets.append(project_root)
@@ -181,16 +179,14 @@ def list_session_logs(
 
     mtimes: dict[Path, float] = {}
     for target in targets:
-        session_dir = projects_dir / encode_project_path(target)
-        if not session_dir.is_dir():
-            continue
-        for log in session_dir.glob("*.jsonl"):
-            if log in mtimes:
-                continue
-            try:
-                mtimes[log] = log.stat().st_mtime
-            except OSError:  # pragma: no cover - vanished between glob and stat
-                continue
+        for session_dir in session_dirs_for_path(target):
+            for log in session_dir.glob("*.jsonl"):
+                if log in mtimes:
+                    continue
+                try:
+                    mtimes[log] = log.stat().st_mtime
+                except OSError:  # pragma: no cover - vanished glob->stat
+                    continue
 
     return sorted(mtimes, key=lambda p: mtimes[p], reverse=True)
 
