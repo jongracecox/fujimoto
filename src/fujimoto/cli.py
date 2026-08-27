@@ -1085,6 +1085,10 @@ class SessionApp(App):
         # `.fujimoto/meta.json` is read once per worktree per app run rather
         # than once per rendered row.
         self._fork_marker_cache: dict[Path, bool] = {}
+        # Where each inferred "direct" session is really running, and on what
+        # branch. Resolving it runs subprocesses, and `_build_home_items` runs
+        # on every `/` keystroke, so it is memoized like `_claude_cache`.
+        self._direct_cwd_cache: dict[str, tuple[Path, str]] = {}
         # -- Transcript search (`s`) --
         self._on_search: bool = False
         self._transcript_query: str = ""
@@ -1167,6 +1171,7 @@ class SessionApp(App):
         # A different project means different transcripts and worktrees.
         self._claude_cache = None
         self._fork_marker_cache = {}
+        self._direct_cwd_cache = {}
         self._available_projects = list_projects()
         self.sub_title = self._project_name
         set_terminal_title(_session_manager_title(self._project_name))
@@ -1353,6 +1358,111 @@ class SessionApp(App):
             )
         return self._claude_cache
 
+    def _matching_worktree(self, path: Path) -> Path | None:
+        """The project worktree `path` refers to, if it is one.
+
+        Compared by `resolve()` because the two sides come from different
+        places: worktree paths are listed from the configured root, while a
+        path reported by tmux or recorded by Claude is the physical one.
+        """
+        try:
+            target = path.resolve()
+        except OSError:  # pragma: no cover - resolve() rarely fails
+            return None
+        for wt in self._existing_worktrees:
+            try:
+                if wt.resolve() == target:
+                    return wt
+            except OSError:  # pragma: no cover
+                continue
+        return None
+
+    def _direct_session_cwd(self, tmux_name: str) -> tuple[Path, str]:
+        """The real working directory and branch behind a `direct-N` row.
+
+        A direct row is *inferred* — any active session for the project whose
+        name matches no worktree directory — so nothing records where it runs,
+        and assuming the repo root was wrong: a resume can leave a `direct-N`
+        session sitting in a worktree, and the row then reported the wrong
+        directory, the wrong branch and the wrong Claude state. Ask tmux
+        instead, falling back to the session record (ignoring a relative `cwd`,
+        which older fujimotos wrote for exactly this reason) and only then to
+        the project root.
+        """
+        cached = self._direct_cwd_cache.get(tmux_name)
+        if cached is not None:
+            return cached
+
+        via = "tmux"
+        path = get_session_path(tmux_name)
+        if path is None:
+            record = self._open_sessions.get(tmux_name)
+            if record is not None and record.path.is_absolute():
+                path, via = record.path, "record"
+        if path is None:
+            path = self._project_root or self._project_cwd or Path(".")
+            via = "project-root"
+
+        # Prefer the worktree list's spelling of the path, so the result is
+        # comparable with the keys of `_claude_session_data`.
+        worktree = self._matching_worktree(path)
+        if worktree is not None:
+            path = worktree
+
+        branch = _session_branch(path)
+        debug.log(
+            "tui.direct_cwd",
+            session=debug.rv(tmux_name),
+            via=via,
+            path=debug.rp(path),
+            branch=debug.rref(branch),
+            worktree=worktree is not None,
+        )
+        resolved = (path, branch)
+        self._direct_cwd_cache[tmux_name] = resolved
+        return resolved
+
+    def _resume_target(
+        self, project: str, cwd: Path, session: SessionInfo | None = None
+    ) -> tuple[str, str]:
+        """The tmux name and session type for resuming a transcript in `cwd`.
+
+        The name has to follow the *directory*, not the row the resume started
+        from. A transcript reached through search carries the worktree it ran
+        in, and naming that session `direct-N` cut it loose from that worktree:
+        the home screen rendered it against the repo root, the worktree still
+        looked idle, and resuming it a second time started another claude on
+        the same transcript. So prefer the worktree's own tmux name, and fall
+        back to `direct-N` only when that name is genuinely occupied.
+
+        `session` is the row the resume was started from; a worktree row names
+        its own worktree even if the transcript recorded a directory that is no
+        longer one of the project's.
+        """
+        worktree = self._matching_worktree(cwd)
+        if worktree is None and session is not None:
+            if session.session_type == "worktree":
+                worktree = session.path
+        if worktree is not None:
+            name = session_name(project, worktree.name)
+            if name not in self._active_sessions:
+                debug.log(
+                    "tui.resume_target",
+                    via="worktree",
+                    tmux=debug.rv(name),
+                    cwd=debug.rp(cwd),
+                )
+                return name, "worktree"
+        name = get_next_direct_session_name(project, self._active_sessions)
+        debug.log(
+            "tui.resume_target",
+            via="direct",
+            tmux=debug.rv(name),
+            cwd=debug.rp(cwd),
+            in_worktree=worktree is not None,
+        )
+        return name, "direct"
+
     def _is_fork(self, worktree: Path) -> bool:
         """Memoized `_is_fork_worktree` — fork provenance never changes."""
         cached = self._fork_marker_cache.get(worktree)
@@ -1449,34 +1559,35 @@ class SessionApp(App):
         for sname in direct_sessions:
             item_id = f"ds-{sname.replace('/', '--')}"
             display_name = sname.split("/", 1)[1] if "/" in sname else sname
+            path, branch = self._direct_session_cwd(sname)
             if not self._search_matches(
-                display_name, sname, self._project_name, self._current_branch
+                display_name, sname, self._project_name, branch
             ):
                 continue
-            project_root_str = str(self._project_root) if self._project_root else ""
-            cs = path_to_latest.get(project_root_str)
+            cs = path_to_latest.get(str(path))
             cs_id = cs.session_id if cs else None
             cs_state = cs.state if cs else None
             if cs_id:
                 claimed_claude_ids.add(cs_id)
             state_suffix = _claude_state_label(cs_state) if cs_state else ""
-            self._session_map[item_id] = SessionInfo(
+            info = SessionInfo(
                 name=display_name,
                 session_type="direct",
                 project=self._project_name,
-                path=self._project_cwd or Path("."),
+                path=path,
                 tmux_session=sname,
                 is_active=True,
-                branch=self._current_branch,
+                branch=branch,
                 claude_session_id=cs_id,
                 claude_state=cs_state,
             )
-            label_text = (
-                f"{ICON_GREEN_CIRCLE} {display_name}"
-                f"  [dim]({self._project_name} {BRANCH_ICON}"
-                f" {self._current_branch})[/]{state_suffix}"
+            self._session_map[item_id] = info
+            active_items.append(
+                ListItem(
+                    Label(self._build_session_label(info, state_suffix), markup=True),
+                    id=item_id,
+                )
             )
-            active_items.append(ListItem(Label(label_text, markup=True), id=item_id))
 
         for wt in active_worktrees:
             sname = session_name(self._project_name, wt.name)
@@ -2175,11 +2286,9 @@ class SessionApp(App):
         for item_id, session in self._session_map.items():
             if session.session_type == "claude":
                 continue  # Previous sessions don't need live updates
-            if session.session_type == "direct":
-                path_key = str(self._project_root) if self._project_root else ""
-            else:
-                path_key = str(session.path)
-            new_cs = new_path_to_latest.get(path_key)
+            # The row's own path, which for a direct session is where tmux
+            # says it runs — not an assumed project root.
+            new_cs = new_path_to_latest.get(str(session.path))
             new_state = new_cs.state if new_cs else None
             if new_state == session.claude_state:
                 continue
@@ -2209,9 +2318,15 @@ class SessionApp(App):
         fork = f" {ICON_FORK}" if session.is_fork else ""
         if session.is_active:
             if session.session_type == "direct":
+                # A `direct-N` session is not always in the repo root — a
+                # resume can leave one in a worktree — so name the directory
+                # when it differs instead of implying the root.
+                location = session.project
+                if self._project_root and session.path != self._project_root:
+                    location = f"{session.project}/{session.path.name}"
                 return (
                     f"{ICON_GREEN_CIRCLE} {session.name}{fork}"
-                    f"  [dim]({session.project} {BRANCH_ICON}"
+                    f"  [dim]({location} {BRANCH_ICON}"
                     f" {session.branch})[/]{state_suffix}"
                 )
             return (
@@ -2470,21 +2585,12 @@ class SessionApp(App):
     # -- Resume session picker --
 
     def _launch_resume(self, session: SessionInfo, cs: ClaudeSession) -> None:
-        # For inactive worktrees, reuse the worktree's session name so the resumed
-        # session stays identified as a worktree item on the next TUI view (correct
-        # path and session lookup). For active worktrees the session name is in use,
-        # so a new direct-N name is needed.
-        if session.session_type == "worktree" and not session.is_active:
-            tmux_name = session.tmux_session
-        else:
-            tmux_name = get_next_direct_session_name(
-                session.project, self._active_sessions
-            )
+        tmux_name, session_type = self._resume_target(session.project, cs.cwd, session)
         self._launch_target = LaunchTarget(
             session.project,
             cs.cwd,  # authoritative original directory from the session log
             tmux_name,
-            session.session_type,
+            session_type,
             cs.session_id,
         )
         self.exit()
@@ -3375,14 +3481,14 @@ class SessionApp(App):
             )
             self.exit()
         elif action == "sa-resume":
-            tmux_name = get_next_direct_session_name(
-                session.project, self._active_sessions
+            tmux_name, session_type = self._resume_target(
+                session.project, session.path, session
             )
             self._launch_target = LaunchTarget(
                 session.project,
                 session.path,
                 tmux_name,
-                "direct",
+                session_type,
                 session.claude_session_id,
             )
             self.exit()
