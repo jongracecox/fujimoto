@@ -663,3 +663,56 @@ class TestReadTranscript:
         text = read_transcript(log)[0].text
         assert text.endswith("…")
         assert len(text) < 2100
+
+
+class TestTranscriptToolIds:
+    def test_tool_ids_are_carried_for_pairing(self, tmp_path: Path) -> None:
+        log = tmp_path / "s.jsonl"
+        log.write_text(
+            "\n".join(
+                [
+                    _line(
+                        {
+                            "type": "assistant",
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "id": "toolu_1",
+                                        "name": "Bash",
+                                        "input": {"command": "ls"},
+                                    }
+                                ]
+                            },
+                        }
+                    ),
+                    _line(
+                        {
+                            "type": "user",
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": "toolu_1",
+                                        "content": "a.txt",
+                                    }
+                                ]
+                            },
+                        }
+                    ),
+                ]
+            )
+        )
+        assert [m.tool_id for m in read_transcript(log)] == ["toolu_1", "toolu_1"]
+
+    def test_tool_id_is_none_when_a_log_omits_it(self, tmp_path: Path) -> None:
+        log = tmp_path / "s.jsonl"
+        log.write_text(
+            _line(
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "tool_use", "name": "Bash"}]},
+                }
+            )
+        )
+        assert read_transcript(log)[0].tool_id is None

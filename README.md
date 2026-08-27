@@ -396,10 +396,15 @@ All session types also offer **Open terminal**, **Open in VS Code** and
 ### View Session Log
 
 **View session log** reads a session's Claude transcript back without starting
-Claude. It renders the conversation — your prompts, Claude's replies, thinking,
-tool calls and their results — in a scrollable read-only view; long tool inputs
-and results are clipped, and sub-agent (sidechain) entries are omitted. Escape
-goes back — to the search results if you got there from a transcript search,
+Claude. It renders the conversation — your prompts, Claude's replies and its
+thinking — in a scrollable read-only view. Tool calls and their results are
+folded away so the conversation stays readable: a run of consecutive calls
+collapses to a single `⚒ 10 tool calls  Bash, Read, Edit` row, which opens into
+the individual calls, each still folded. Opening a call shows its arguments and
+the output it produced — the result belongs to the call rather than being a row
+of its own. Tab to a row and press Enter, or click it, to expand. Long tool inputs and results are clipped, and sub-agent
+(sidechain) entries are omitted. Escape goes back — to the search results if
+you got there from a transcript search,
 otherwise to the home screen. When a session has more than one transcript, a
 picker asks which to read.
 

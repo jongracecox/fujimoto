@@ -304,6 +304,11 @@ class TranscriptMessage:
     role: str
     text: str
     timestamp: datetime
+    # `id` for a tool_use, `tool_use_id` for its result. Carried so a call can
+    # be paired with its own result: parallel calls arrive as several tool_use
+    # blocks followed by several results, where position alone would mis-pair
+    # them.
+    tool_id: str | None = None
 
 
 # Tool inputs and results are frequently enormous (whole files, long diffs).
@@ -402,10 +407,16 @@ def read_transcript(jsonl_path: Path) -> list[TranscriptMessage]:
                         "\n".join(f"{k}: {v}" for k, v in params.items())
                     ).strip()
                 body = f"{name}\n{summary}" if summary else str(name)
-                messages.append(TranscriptMessage("tool_use", body, ts))
+                messages.append(
+                    TranscriptMessage("tool_use", body, ts, block.get("id"))
+                )
             elif block_type == "tool_result":
                 body = _clip(_block_text(block)).strip()
                 if body:
-                    messages.append(TranscriptMessage("tool_result", body, ts))
+                    messages.append(
+                        TranscriptMessage(
+                            "tool_result", body, ts, block.get("tool_use_id")
+                        )
+                    )
 
     return messages

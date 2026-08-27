@@ -21,8 +21,10 @@ from textual.content import Content
 from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.worker import get_current_worker
+from textual.widget import Widget
 from textual.widgets import (
     Button,
+    Collapsible,
     Footer,
     Header,
     Input,
@@ -278,18 +280,175 @@ def _first_line(text: str, max_width: int) -> str:
     return ""
 
 
-def _render_transcript(messages: list[TranscriptMessage]) -> list[Static]:
-    """Build one Static per transcript message, styled by role.
+def _tool_summary(msg: TranscriptMessage) -> str:
+    """One-line title for a collapsed tool call or result.
+
+    `tool_use` bodies are `name\nparams`, so the name becomes the title and the
+    first parameter line its detail. A result has no name, so it is summarised
+    by size instead — enough to judge whether it is worth opening.
+    """
+    lines = [ln for ln in msg.text.splitlines() if ln.strip()]
+    if msg.role == "tool_use":
+        name = lines[0] if lines else "tool"
+        detail = _first_line("\n".join(lines[1:]), 60) if len(lines) > 1 else ""
+        return f"⚒ {name}  {detail}" if detail else f"⚒ {name}"
+    count = len(lines)
+    detail = _first_line(msg.text, 60)
+    unit = "line" if count == 1 else "lines"
+    return (
+        f"↳ Result ({count} {unit})  {detail}"
+        if detail
+        else f"↳ Result ({count} {unit})"
+    )
+
+
+_TOOL_ROLES = ("tool_use", "tool_result")
+
+
+def _tool_run_title(run: list[TranscriptMessage]) -> str:
+    """Title for a folded run of tool calls: how many, and which tools."""
+    names = []
+    for msg in run:
+        if msg.role != "tool_use":
+            continue
+        name = msg.text.splitlines()[0] if msg.text else "tool"
+        if name not in names:
+            names.append(name)
+    calls = sum(1 for msg in run if msg.role == "tool_use")
+    unit = "tool call" if calls == 1 else "tool calls"
+    shown = ", ".join(names[:4])
+    if len(names) > 4:
+        shown += f", +{len(names) - 4} more"
+    return f"⚒ {calls} {unit}  {shown}" if shown else f"⚒ {calls} {unit}"
+
+
+def _result_heading(result: TranscriptMessage) -> str:
+    """Divider between a call's arguments and the output it produced."""
+    count = len([ln for ln in result.text.splitlines() if ln.strip()])
+    return f"↳ {count} {'line' if count == 1 else 'lines'}"
+
+
+def _tool_widget(
+    msg: TranscriptMessage, result: TranscriptMessage | None = None
+) -> Collapsible:
+    """One folded tool call, with its result inside if it has one.
+
+    The result belongs to the call, so it is shown as part of that expansion
+    rather than as a row of its own — one thing to open, not two.
+    """
+    if msg.role == "tool_result":
+        return Collapsible(
+            Static(Content(msg.text), classes="log-body"),
+            title=_tool_summary(msg),
+            collapsed=True,
+            classes="log-tool",
+        )
+
+    # The title already names the tool, so the body drops that first line and
+    # keeps the arguments, which the title only shows clipped.
+    body = msg.text.partition("\n")[2] or msg.text
+    contents: list[Widget] = [Static(Content(body), classes="log-body")]
+    if result is not None:
+        contents.append(Static(_result_heading(result), classes="log-result-heading"))
+        contents.append(Static(Content(result.text), classes="log-body"))
+    return Collapsible(
+        *contents,
+        title=_tool_summary(msg),
+        collapsed=True,
+        classes="log-tool",
+    )
+
+
+def _pair_results(
+    run: list[TranscriptMessage],
+) -> list[tuple[TranscriptMessage, TranscriptMessage | None]]:
+    """Pair each tool call in a run with its result.
+
+    Pairing is by `tool_id`, falling back to the next unclaimed result for logs
+    that carry no ids. A result nothing claims (its call clipped away, or a log
+    that only recorded the reply) is returned on its own.
+    """
+    by_id = {
+        m.tool_id: m for m in run if m.role == "tool_result" and m.tool_id is not None
+    }
+    claimed: set[int] = set()
+    pairs: list[tuple[TranscriptMessage, TranscriptMessage | None]] = []
+
+    for index, msg in enumerate(run):
+        if msg.role != "tool_use":
+            continue
+        result = by_id.get(msg.tool_id) if msg.tool_id is not None else None
+        if result is None:
+            result = next(
+                (
+                    later
+                    for offset, later in enumerate(run[index + 1 :], index + 1)
+                    if later.role == "tool_result"
+                    and later.tool_id is None
+                    and offset not in claimed
+                ),
+                None,
+            )
+        if result is not None:
+            claimed.add(run.index(result))
+        pairs.append((msg, result))
+
+    used = {id(result) for _, result in pairs if result is not None}
+    for msg in run:
+        if msg.role == "tool_result" and id(msg) not in used:
+            pairs.append((msg, None))
+    return pairs
+
+
+def _render_transcript(messages: list[TranscriptMessage]) -> list[Widget]:
+    """Build the widgets for a transcript, styled by role.
+
+    Prose (you, Claude, thinking) is rendered as a role header plus a body.
+    Tool calls and their results are folded away instead: they are the bulk of a
+    transcript by volume and the least of it by interest, and hiding them is what
+    keeps the conversation itself readable.
+
+    Each result is folded into its own call's expansion, so a call and its reply
+    are one row rather than two. A *run* of consecutive tool messages collapses
+    as a unit once it holds more than one call — a session that made twenty calls in a row would otherwise
+    still fill the screen with twenty one-line rows. Opening the run reveals the
+    individual calls, each still folded. A lone call is left unwrapped, since
+    wrapping two rows in a third helps nobody.
 
     Bodies are `Content` rather than markup for the same reason snippets are:
     transcript text is arbitrary bytes, and a stray `[` or trailing backslash
     would otherwise be parsed as (or corrupt) a console markup tag.
     """
-    widgets: list[Static] = []
-    for msg in messages:
-        label, css_class = _TRANSCRIPT_ROLES.get(msg.role, (msg.role, "log-assistant"))
-        widgets.append(Static(label, classes=f"log-role {css_class}"))
-        widgets.append(Static(Content(msg.text), classes="log-body"))
+    widgets: list[Widget] = []
+    index = 0
+    while index < len(messages):
+        msg = messages[index]
+
+        if msg.role not in _TOOL_ROLES:
+            label, css = _TRANSCRIPT_ROLES.get(msg.role, (msg.role, "log-assistant"))
+            widgets.append(Static(label, classes=f"log-role {css}"))
+            widgets.append(Static(Content(msg.text), classes="log-body"))
+            index += 1
+            continue
+
+        end = index
+        while end < len(messages) and messages[end].role in _TOOL_ROLES:
+            end += 1
+        run = messages[index:end]
+        index = end
+
+        pairs = _pair_results(run)
+        if sum(1 for m in run if m.role == "tool_use") > 1:
+            widgets.append(
+                Collapsible(
+                    *[_tool_widget(call, result) for call, result in pairs],
+                    title=_tool_run_title(run),
+                    collapsed=True,
+                    classes="log-tool log-tool-run",
+                )
+            )
+        else:
+            widgets.extend(_tool_widget(call, result) for call, result in pairs)
     return widgets
 
 
@@ -489,7 +648,7 @@ Screen {
 }
 
 .log-assistant {
-    color: $accent;
+    color: #a78bfa;
 }
 
 .log-thinking {
@@ -497,7 +656,36 @@ Screen {
 }
 
 .log-tool {
+    margin-top: 1;
+    /* Textual's default Collapsible reserves a bottom pad and a top rule,
+       which read as gaps between messages in a transcript. */
+    padding: 0;
+    border-top: none;
+    background: transparent;
+}
+
+.log-tool CollapsibleTitle {
     color: $warning;
+    padding: 0;
+}
+
+.log-tool Contents {
+    padding: 0;
+    margin: 0 0 0 2;
+}
+
+.log-result-heading {
+    color: $text-muted;
+    margin-top: 1;
+}
+
+.log-tool-run > CollapsibleTitle {
+    color: $accent;
+}
+
+/* Inside an opened run the calls are a list, not separate messages. */
+.log-tool-run .log-tool {
+    margin-top: 0;
 }
 
 .log-body {
@@ -2292,7 +2480,8 @@ class SessionApp(App):
         main = self.query_one("#main")
 
         header = cs.title or cs.first_prompt or cs.session_id
-        widgets: list[Static] = [
+        # Widget, not Static: `_render_transcript` mixes in Collapsibles.
+        widgets: list[Widget] = [
             Label(_first_line(header, 80), classes="form-label"),
             Static(
                 f"{cs.session_id}  ·  {_relative_time(cs.last_activity)}",
@@ -2303,7 +2492,15 @@ class SessionApp(App):
             widgets.extend(_render_transcript(messages))
         else:
             widgets.append(Static("[dim]This log has no messages.[/]", markup=True))
-        widgets.append(Static("[dim]Escape to go back[/]", markup=True, classes="hint"))
+        widgets.append(
+            Static(
+                "[dim]Tab to a tool row + Enter to expand  ·  Escape to go back[/]"
+                if any(m.role in ("tool_use", "tool_result") for m in messages)
+                else "[dim]Escape to go back[/]",
+                markup=True,
+                classes="hint",
+            )
+        )
 
         await main.mount(Container(*widgets, id="log-panel"))
         main.focus()
