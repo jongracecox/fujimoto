@@ -380,7 +380,7 @@ the mode then sticks until you change it or restart.
 
 **Worktree sessions** create an isolated git worktree with its own branch. Useful for standalone tasks that become PRs, or investigations where you want to fork off and explore.
 
-**Direct sessions** launch Claude in an existing repo directory on its current branch. Quick and lightweight — no worktree overhead.
+**Direct sessions** launch Claude in an existing repo directory on its current branch. Quick and lightweight — no worktree overhead. A direct row shows the directory it is actually running in, which is usually the repo root but need not be — resuming an old conversation can leave one in a worktree.
 
 **Ad hoc sessions** launch Claude in a temporary directory outside any git project. For quick questions, investigations, and one-off tasks that don't need a repository.
 

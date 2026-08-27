@@ -44,6 +44,7 @@ from fujimoto.cli import (
     _tool_summary,
     main,
 )
+from fujimoto import session_state
 from fujimoto.config import ConfigError
 from fujimoto.git import GitError
 from fujimoto.tmux import TmuxError
@@ -61,20 +62,25 @@ def _patch_git_info(
     projects: list[Path] | None = None,
     claude_sessions_fn: object | None = None,
     open_sessions: dict[str, object] | None = None,
+    worktree_root: Path | None = None,
+    session_paths: dict[str, Path] | None = None,
 ):
     """Return a context manager that patches git/tmux info for TUI tests."""
     import contextlib
 
     @contextlib.contextmanager
     def _ctx():
-        worktree_root = None
+        nonlocal worktree_root
         if worktrees is not None:
-            # We need the root to exist for iterdir
-            import tempfile
+            # We need the root to exist for iterdir. A caller that needs to
+            # know the paths up front (to pair them with `session_paths`)
+            # supplies the root itself.
+            if worktree_root is None:
+                import tempfile
 
-            _tmpdir = tempfile.mkdtemp()
-            worktree_root = Path(_tmpdir) / project
-            worktree_root.mkdir(parents=True)
+                _tmpdir = tempfile.mkdtemp()
+                worktree_root = Path(_tmpdir) / project
+            worktree_root.mkdir(parents=True, exist_ok=True)
             for wt in worktrees:
                 (worktree_root / wt.name).mkdir(exist_ok=True)
 
@@ -96,6 +102,12 @@ def _patch_git_info(
                 return_value=worktree_root or Path("/nonexistent"),
             ),
             patch("fujimoto.cli.session_name", side_effect=lambda p, d: f"{p}/{d}"),
+            # Never shell out to a real tmux from a test: an unpatched lookup
+            # would make every direct row fall back to the project root.
+            patch(
+                "fujimoto.cli.get_session_path",
+                side_effect=lambda name: (session_paths or {}).get(name),
+            ),
             patch(
                 "fujimoto.cli.list_projects",
                 return_value=projects or [],
@@ -1589,6 +1601,181 @@ class TestSessionAppDirectSession:
                 await pilot.pause()
                 assert app._launch_target is not None
                 assert app._launch_target[2] == "test-proj/my-task"
+
+
+class TestDirectSessionLocation:
+    """A `direct-N` row reports where tmux says it runs, not the repo root."""
+
+    @staticmethod
+    def _worktree_session(wt: Path) -> ClaudeSession:
+        return ClaudeSession(
+            jsonl_path=wt / "session.jsonl",
+            session_id="abc12345-def6-7890-abcd-ef1234567890",
+            state=SessionState.WORKING,
+            last_entry_type=EntryType.ASSISTANT,
+            stop_reason=StopReason.TOOL_USE,
+            cwd=wt,
+            git_branch="worktree/20260309-test",
+            last_activity=datetime(2026, 3, 9, 12, 0, 0, tzinfo=timezone.utc),
+            title="In a worktree",
+            first_prompt="Fix the bug",
+        )
+
+    @pytest.mark.asyncio
+    async def test_direct_row_in_worktree_uses_worktree_path_and_state(
+        self, tmp_path: Path
+    ) -> None:
+        wt_root = tmp_path / "worktrees" / "test-proj"
+        wt = wt_root / "20260309-test"
+        cs = self._worktree_session(wt)
+        with _patch_git_info(
+            sessions=["test-proj/direct-1"],
+            worktrees=[wt],
+            worktree_root=wt_root,
+            session_paths={"test-proj/direct-1": wt},
+            claude_sessions_fn=lambda path: [cs] if path == wt else [],
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                info = app._session_map["ds-test-proj--direct-1"]
+                assert info.path == wt
+                # State comes from the worktree's transcript, not the root's
+                assert info.claude_session_id == cs.session_id
+                assert info.claude_state == SessionState.WORKING
+                label = app.query_one("#ds-test-proj--direct-1").query_one(Label)
+                assert "test-proj/20260309-test" in str(label.render())
+
+    @pytest.mark.asyncio
+    async def test_direct_row_falls_back_to_session_record(
+        self, tmp_path: Path
+    ) -> None:
+        """tmux can't answer (session gone mid-render) → use the record."""
+        recorded = tmp_path / "somewhere"
+        record = session_state.SessionRecord(cwd=str(recorded))
+        with _patch_git_info(
+            sessions=["test-proj/direct-1"],
+            open_sessions={"test-proj/direct-1": record},
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                assert app._session_map["ds-test-proj--direct-1"].path == recorded
+
+    @pytest.mark.asyncio
+    async def test_direct_row_ignores_relative_record_cwd(self) -> None:
+        """A relative `cwd` is the old bug's own output — not a location."""
+        record = session_state.SessionRecord(cwd=".")
+        with _patch_git_info(
+            sessions=["test-proj/direct-1"],
+            open_sessions={"test-proj/direct-1": record},
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                info = app._session_map["ds-test-proj--direct-1"]
+                assert info.path == Path("/fake/repo")
+
+    @pytest.mark.asyncio
+    async def test_direct_session_cwd_is_memoized(self) -> None:
+        with (
+            _patch_git_info(sessions=["test-proj/direct-1"]),
+            patch("fujimoto.cli.get_session_path", return_value=None) as get_path,
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                calls = get_path.call_count
+                app._direct_session_cwd("test-proj/direct-1")
+                assert get_path.call_count == calls
+
+
+class TestResumeTarget:
+    """Resuming names the tmux session after the transcript's directory."""
+
+    @staticmethod
+    def _session(wt: Path) -> ClaudeSession:
+        return ClaudeSession(
+            jsonl_path=wt / "session.jsonl",
+            session_id="abc12345-def6-7890-abcd-ef1234567890",
+            state=SessionState.IDLE,
+            last_entry_type=EntryType.ASSISTANT,
+            stop_reason=StopReason.END_TURN,
+            cwd=wt,
+            git_branch="worktree/20260309-test",
+            last_activity=datetime(2026, 3, 9, 12, 0, 0, tzinfo=timezone.utc),
+            title="In a worktree",
+            first_prompt="Fix the bug",
+        )
+
+    @pytest.mark.asyncio
+    async def test_transcript_in_idle_worktree_reuses_worktree_name(
+        self, tmp_path: Path
+    ) -> None:
+        wt_root = tmp_path / "worktrees" / "test-proj"
+        wt = wt_root / "20260309-test"
+        with _patch_git_info(worktrees=[wt], worktree_root=wt_root):
+            app = SessionApp()
+            async with app.run_test():
+                assert app._resume_target("test-proj", wt) == (
+                    "test-proj/20260309-test",
+                    "worktree",
+                )
+
+    @pytest.mark.asyncio
+    async def test_transcript_in_busy_worktree_falls_back_to_direct(
+        self, tmp_path: Path
+    ) -> None:
+        wt_root = tmp_path / "worktrees" / "test-proj"
+        wt = wt_root / "20260309-test"
+        with (
+            _patch_git_info(
+                worktrees=[wt],
+                worktree_root=wt_root,
+                sessions=["test-proj/20260309-test"],
+            ),
+            patch(
+                "fujimoto.cli.get_next_direct_session_name",
+                return_value="test-proj/direct-1",
+            ),
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                assert app._resume_target("test-proj", wt) == (
+                    "test-proj/direct-1",
+                    "direct",
+                )
+
+    @pytest.mark.asyncio
+    async def test_resuming_a_claude_row_lands_in_its_worktree(
+        self, tmp_path: Path
+    ) -> None:
+        """The regression: a transcript row whose cwd is a worktree.
+
+        It used to launch as `direct-N`, which detached the session from the
+        worktree and let the worktree be resumed again alongside it.
+        """
+        wt_root = tmp_path / "worktrees" / "test-proj"
+        wt = wt_root / "20260309-test"
+        cs = self._session(wt)
+        with _patch_git_info(
+            worktrees=[wt],
+            worktree_root=wt_root,
+            # Reached from the project root's listing, as a search hit is
+            claude_sessions_fn=lambda path: [cs] if path == Path("/fake/repo") else [],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == f"cs-{cs.session_id}":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                # "Resume" is the first action for a claude row
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+                assert app._launch_target[2] == "test-proj/20260309-test"
+                assert app._launch_target[3] == "worktree"
+                assert app._launch_target[1] == wt
 
 
 class TestSessionAppAdhocSession:

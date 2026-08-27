@@ -404,7 +404,7 @@ responsible for running it off the event loop.
 - `LaunchTarget` — `NamedTuple` describing what `main()` should launch: `(project, working_dir, tmux_name, session_type, resume_session_id, forked_from_session_id, forked_from_worktree)`. A `NamedTuple` rather than a dataclass so existing index-based access keeps working.
 - `SessionApp` — main app class with CSS styling
 - Module-level helpers: `_claude_state_label(state)`, `_relative_time(dt)`, `_get_claude_sessions(root, worktrees)`, `_is_fork_worktree(path)`, `_build_fork_system_prompt(project, working_dir, parent_worktree, base_branch)`, `_fit_snippet(snippet, max_width)` / `_render_snippet(snippet, max_width)` (search-result snippet rendering — see the `Content.assemble` gotcha)
-- Instance helpers: `_build_session_label(session, state_suffix)` — the single source of truth for session row text (including the 🍴 fork marker), used by `_show_home`'s initial render of worktree rows and by `_poll_session_states` for in-place updates; `_build_claude_session_items(sessions, prefix)` — shared row rendering for the resume (`rp-*`), fork (`fp-*`) and log-viewer (`lp-*`) pickers
+- Instance helpers: `_build_session_label(session, state_suffix)` — the single source of truth for session row text (including the 🍴 fork marker), used by `_show_home`'s render of direct *and* worktree rows and by `_poll_session_states` for in-place updates; `_build_claude_session_items(sessions, prefix)` — shared row rendering for the resume (`rp-*`), fork (`fp-*`) and log-viewer (`lp-*`) pickers; `_matching_worktree(path)` — the project worktree a path refers to, compared by `resolve()`; `_direct_session_cwd(tmux_name)` — where a `direct-N` row really runs and on what branch (memoized in `_direct_cwd_cache`); `_resume_target(project, cwd, session=None)` — the tmux name and session type a resume should use
 - Views: home (sessions list), session actions submenu, terminate/stop prompt (`#terminate-prompt`, opened by a pending `close` from `Ctrl-A x`; Terminate / Stop / Cancel with Terminate highlighted so Enter matches the `confirm-before` it replaces, and Cancel re-attaching via `_launch_target` so it costs nothing), finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), fork title form, fork branch select, fork session picker, session log picker + read-only log viewer, conflict resolution, project switcher (with autocomplete filter), tmux install, error
 - Transcript search (`s`) — see the dedicated section below.
 - Home screen name filter: `/` arms a filter box (`#home-search`) mounted above
@@ -523,7 +523,35 @@ Three custom exception types, all caught in `main()`:
     - `tmux send-keys` **cannot** test key bindings — it injects into the pane and bypasses key-table dispatch entirely. Drive an attached client's pty instead (`pty.fork()`, then `os.write(fd, b"\x01f")`).
   - The flag is cleared on read, so a later ordinary detach of the same session can't re-trigger the fork. `main()` keys it on `tmux_name or session_name(project, working_dir.name)` — the same name `launch_claude_in_tmux` derives — so a freshly created worktree (whose `tmux_name` is `None`) is matched correctly.
   - The whole flow funnels into the shared `_finalize_create` / `_do_create_and_launch`, so forks inherit the directory-conflict handling (`_show_conflict`, `conflict-suffix`) for free. A non-`None` `_fork_source` is the only difference; `_show_create_form` clears the fork state so a cancelled fork can't leak into the next plain create.
-- **Resume previous session — tmux naming**: When resuming from an inactive worktree, the resumed session reuses the worktree's existing tmux session name (e.g., `project/20260101-feature`) instead of generating a new `direct-N` name. This keeps the session correctly identified as a worktree item on subsequent TUI views, so its path and Claude session lookup remain tied to the worktree directory. For active worktrees (original session still alive), a `direct-N` name is used because the worktree name is occupied. The working directory for resumed sessions always comes from `cs.cwd` (the directory recorded in the Claude session log) rather than `session.path`.
+- **Resume previous session — tmux naming follows the directory, not the row.**
+  `_resume_target(project, cwd, session=None)` is the single decision, used by
+  both `_launch_resume` (the worktree/resume pickers) and `sa-resume` (a
+  `claude` row from the home screen or a search hit). If `cwd` is one of the
+  project's worktrees and that worktree's tmux name is free, the session takes
+  the worktree's name and type `worktree`; otherwise it falls back to
+  `direct-N`/`direct`. A worktree row also names its own worktree when the
+  transcript's `cwd` is no longer one of the project's. The working directory
+  always comes from `cs.cwd` (the directory recorded in the Claude session log)
+  rather than `session.path`.
+  **This used to be decided from the row's `session_type`**, and `sa-resume`
+  hardcoded `direct`. Resuming a transcript found by search — whose `cwd` is
+  whatever worktree it ran in — therefore launched a `direct-N` session inside
+  that worktree. The worktree's own tmux name stayed free, so the home screen
+  still showed the worktree as idle, and resuming it again started a *second*
+  `claude --resume` on the same transcript. Two live processes, one JSONL.
+- **A `direct-N` row is inferred, so its location must be asked for, not
+  assumed.** `_build_home_items` treats every active tmux session for the
+  project whose name matches no worktree directory as a direct session; nothing
+  records where it runs. It used to fill in `path=self._project_cwd or
+  Path(".")` and `branch=self._current_branch`, which was wrong for any direct
+  session not in the repo root — wrong directory, wrong branch, and Claude
+  state read from the *root's* latest transcript. `_direct_session_cwd` now
+  resolves it from `get_session_path` (tmux), then the `session_state` record
+  (skipping a relative `cwd` — that string is the old bug's own output), then
+  the project root; the label names the directory when it differs from the
+  root. The lookup runs subprocesses, so it is memoized in `_direct_cwd_cache`
+  (cleared by `_init_git_info`) — see "Nothing in the home render path may
+  touch the disk".
 - **Home list fills the screen**: `#home-panel` and `#home-list` are both
   `height: 1fr`, so the session list expands to whatever vertical space `#main`
   leaves after the header, update banner, search box and bottom bar, and scrolls
@@ -620,8 +648,10 @@ Three custom exception types, all caught in `main()`:
   (memoized in `_claude_cache`; invalidated by `_init_git_info` on project switch
   and by `_show_home` on re-entry, and *refreshed* rather than bypassed by
   `_poll_session_states` so the next keystroke renders from freshly polled data)
-  and `_is_fork()` (memoizes `_is_fork_worktree`'s `meta.json` read in
-  `_fork_marker_cache`; fork provenance never changes).
+  `_is_fork()` (memoizes `_is_fork_worktree`'s `meta.json` read in
+  `_fork_marker_cache`; fork provenance never changes) and
+  `_direct_session_cwd()` (memoizes the tmux + git lookups behind a `direct-N`
+  row in `_direct_cwd_cache`; a tmux session's start directory never changes).
 - **Live polling**: The home screen uses `set_interval(3s)` to poll Claude JSONL logs for state changes. When a session's state changes, labels are updated in-place via `label.update()` — the screen is never cleared or rebuilt, which avoids blank-screen flicker. A snapshot dict (`path → (session_id, state)`) is compared each tick to detect changes efficiently. The timer is stopped when navigating away (`_clear_main` cancels it) and restarted by `_show_home`.
 
 ## Testing
