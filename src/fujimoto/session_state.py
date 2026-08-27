@@ -72,7 +72,7 @@ def load_state() -> dict[str, SessionRecord]:
             continue
         kwargs = {k: v for k, v in raw.items() if k in fields}
         records[name] = SessionRecord(
-            **kwargs,  # type: ignore[arg-type]
+            **kwargs,
             last_seen=raw.get("last_seen") or "",
         )
     return records
