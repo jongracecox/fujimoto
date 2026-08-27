@@ -5450,7 +5450,7 @@ class TestTranscriptSearchEndToEnd:
         with (
             _patch_git_info(),
             patch(
-                "fujimoto.claude.search.get_claude_projects_dir",
+                "fujimoto.claude.log_parser.get_claude_projects_dir",
                 return_value=projects,
             ),
         ):
@@ -5477,7 +5477,7 @@ class TestTranscriptSearchEndToEnd:
         with (
             _patch_git_info(),
             patch(
-                "fujimoto.claude.search.get_claude_projects_dir",
+                "fujimoto.claude.log_parser.get_claude_projects_dir",
                 return_value=projects,
             ),
         ):
@@ -5511,7 +5511,7 @@ class TestTranscriptSearchEndToEnd:
         with (
             _patch_git_info(worktrees=[worktree]),
             patch(
-                "fujimoto.claude.search.get_claude_projects_dir",
+                "fujimoto.claude.log_parser.get_claude_projects_dir",
                 return_value=projects,
             ),
         ):
@@ -5943,7 +5943,7 @@ class TestHighlightedResultRows:
         with (
             _patch_git_info(),
             patch(
-                "fujimoto.claude.search.get_claude_projects_dir",
+                "fujimoto.claude.log_parser.get_claude_projects_dir",
                 return_value=projects,
             ),
         ):
@@ -6066,7 +6066,7 @@ class TestTranscriptSearchCaseToggle:
         with (
             _patch_git_info(),
             patch(
-                "fujimoto.claude.search.get_claude_projects_dir",
+                "fujimoto.claude.log_parser.get_claude_projects_dir",
                 return_value=projects,
             ),
         ):

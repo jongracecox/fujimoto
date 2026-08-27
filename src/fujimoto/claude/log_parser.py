@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -93,28 +95,154 @@ class ClaudeSession:
         )
 
 
+# Claude replaces both separators *and dots* with hyphens when it encodes a
+# project path into a directory name: `/repo/.fujimoto/worktrees/x` becomes
+# `-repo--fujimoto-worktrees-x`, with a double hyphen where the `/.` was.
+# Encoding only the slashes silently missed every transcript for a worktree
+# under the default `<repo>/.fujimoto/worktrees/` root.
+_ENCODE_CHARS = re.compile(r"[/.]")
+
+
+def _normalize(path: Path | str) -> str:
+    """Path as a plain string with any trailing slash removed."""
+    return str(path).rstrip("/") or "/"
+
+
 def encode_project_path(path: Path) -> str:
     """Encode a project path for use as a Claude projects directory name.
 
-    Replaces forward slashes with hyphens, matching Claude's convention.
+    Replaces forward slashes *and dots* with hyphens, matching Claude's
+    convention.
 
     >>> encode_project_path(Path("/Users/alice/git/myproject"))
     '-Users-alice-git-myproject'
     >>> encode_project_path(Path("/Users/alice/git/worktrees/proj/20260309-fix"))
     '-Users-alice-git-worktrees-proj-20260309-fix'
+    >>> encode_project_path(Path("/repo/.fujimoto/worktrees/20260309-fix"))
+    '-repo--fujimoto-worktrees-20260309-fix'
     >>> encode_project_path(Path("/tmp/test/"))
     '-tmp-test'
     """
-    return str(path).rstrip("/").replace("/", "-")
+    return _ENCODE_CHARS.sub("-", _normalize(path))
 
 
 def get_claude_projects_dir() -> Path:
     """Return the path to Claude's projects directory.
 
+    Honours `CLAUDE_CONFIG_DIR`, which relocates Claude's whole config tree —
+    transcripts included.
+
     >>> isinstance(get_claude_projects_dir(), Path)
     True
     """
-    return Path.home() / ".claude" / "projects"
+    configured = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    base = Path(configured).expanduser() if configured else Path.home() / ".claude"
+    return base / "projects"
+
+
+# How far into a log to look for the `cwd` it was recorded against. The first
+# entry almost always carries one; the cap stops a pathological log being read
+# in full.
+_CWD_SCAN_LINES = 20
+
+# (projects dir, its mtime_ns, cwd -> session dirs). Built only when an encoded
+# lookup misses, and rebuilt when the projects directory gains or loses a child.
+_cwd_index_cache: tuple[Path, int, dict[str, list[Path]]] | None = None
+
+
+def _first_cwd(log: Path) -> str | None:
+    """The `cwd` recorded near the start of a transcript, if any."""
+    try:
+        with log.open(errors="replace") as fh:
+            for _, line in zip(range(_CWD_SCAN_LINES), fh):
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(entry, dict) and entry.get("cwd"):
+                    return _normalize(entry["cwd"])
+    except OSError:
+        return None
+    return None
+
+
+def _cwd_index() -> dict[str, list[Path]]:
+    """Map every recorded `cwd` to the session directories holding it.
+
+    The encoding above is a guess at what a *different* program does with a
+    path, so it can be wrong again (a new munged character, a symlink Claude
+    resolved and we did not). The transcripts themselves record the directory
+    they ran in, which is ground truth — so a missed lookup falls back to this
+    index rather than reporting no sessions.
+    """
+    global _cwd_index_cache
+
+    projects_dir = get_claude_projects_dir()
+    try:
+        mtime = projects_dir.stat().st_mtime_ns
+    except OSError:
+        return {}
+
+    if _cwd_index_cache is not None:
+        cached_dir, cached_mtime, cached_index = _cwd_index_cache
+        if cached_dir == projects_dir and cached_mtime == mtime:
+            return cached_index
+
+    index: dict[str, list[Path]] = {}
+    try:
+        entries = sorted(projects_dir.iterdir())
+    except OSError:  # pragma: no cover - raced with a delete
+        return {}
+    for session_dir in entries:
+        if not session_dir.is_dir():
+            continue
+        for log in sorted(session_dir.glob("*.jsonl")):
+            cwd = _first_cwd(log)
+            if cwd is None:
+                continue
+            dirs = index.setdefault(cwd, [])
+            if session_dir not in dirs:
+                dirs.append(session_dir)
+
+    _cwd_index_cache = (projects_dir, mtime, index)
+    return index
+
+
+def session_dirs_for_path(project_path: Path) -> list[Path]:
+    """Claude session directories holding transcripts for `project_path`.
+
+    Tries the encoded directory name for the path as given and as resolved
+    (Claude records the *physical* cwd, so a symlinked worktree root would
+    otherwise never match), then falls back to the recorded-cwd index.
+    """
+    projects_dir = get_claude_projects_dir()
+
+    candidates: list[Path] = []
+    for variant in _path_variants(project_path):
+        session_dir = projects_dir / encode_project_path(variant)
+        if session_dir not in candidates and session_dir.is_dir():
+            candidates.append(session_dir)
+    if candidates:
+        return candidates
+
+    index = _cwd_index()
+    for variant in _path_variants(project_path):
+        found = index.get(_normalize(variant))
+        if found:
+            return list(found)
+    return []
+
+
+def _path_variants(project_path: Path) -> list[Path]:
+    """The path as given, plus its symlink-resolved form when they differ."""
+    variants = [project_path]
+    try:
+        resolved = project_path.resolve()
+    except OSError:  # pragma: no cover - resolve rarely raises
+        return variants
+    if _normalize(resolved) != _normalize(project_path):
+        variants.append(resolved)
+    return variants
 
 
 def parse_session(jsonl_path: Path) -> ClaudeSession:
@@ -267,21 +395,20 @@ def get_sessions_for_path(project_path: Path) -> list[ClaudeSession]:
     """Get all Claude sessions for a given project path.
 
     Returns sessions sorted by last_activity descending (most recent first).
-    Returns an empty list if the encoded directory doesn't exist or has no JSONL files.
+    Returns an empty list when no session directory resolves to the path, or
+    when the ones that do hold no parseable JSONL files.
     """
-    projects_dir = get_claude_projects_dir()
-    encoded = encode_project_path(project_path)
-    session_dir = projects_dir / encoded
-
-    if not session_dir.is_dir():
-        return []
-
     sessions: list[ClaudeSession] = []
-    for jsonl_file in session_dir.glob("*.jsonl"):
-        try:
-            sessions.append(parse_session(jsonl_file))
-        except ClaudeLogError:
-            continue
+    seen: set[Path] = set()
+    for session_dir in session_dirs_for_path(project_path):
+        for jsonl_file in session_dir.glob("*.jsonl"):
+            if jsonl_file in seen:
+                continue
+            seen.add(jsonl_file)
+            try:
+                sessions.append(parse_session(jsonl_file))
+            except ClaudeLogError:
+                continue
 
     sessions.sort(key=lambda s: s.last_activity, reverse=True)
     return sessions

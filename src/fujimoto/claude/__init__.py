@@ -12,6 +12,7 @@ from fujimoto.claude.log_parser import (
     get_sessions_for_path,
     parse_session,
     read_transcript,
+    session_dirs_for_path,
 )
 from fujimoto.claude.search import (
     DEFAULT_BATCH_SIZE,
@@ -48,4 +49,5 @@ __all__ = [
     "parse_session",
     "read_transcript",
     "search_log",
+    "session_dirs_for_path",
 ]

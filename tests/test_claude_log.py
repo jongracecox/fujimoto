@@ -18,6 +18,7 @@ from fujimoto.claude.log_parser import (
     get_sessions_for_path,
     parse_session,
     read_transcript,
+    session_dirs_for_path,
 )
 
 
@@ -69,14 +70,46 @@ class TestEncodeProjectPath:
     def test_trailing_slash(self) -> None:
         assert encode_project_path(Path("/tmp/test/")) == "-tmp-test"
 
+    def test_dots_become_hyphens(self) -> None:
+        # Claude munges dots as well as slashes, so `/.` becomes `--`. This is
+        # what made every worktree under the default `<repo>/.fujimoto/
+        # worktrees/` root invisible to the transcript lookup.
+        assert (
+            encode_project_path(Path("/repo/.fujimoto/worktrees/20260309-fix"))
+            == "-repo--fujimoto-worktrees-20260309-fix"
+        )
+
+    def test_dot_inside_a_name(self) -> None:
+        assert encode_project_path(Path("/git/site.com")) == "-git-site-com"
+
 
 class TestGetClaudeProjectsDir:
-    def test_returns_expected_path(self) -> None:
+    def test_returns_expected_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
         with patch(
             "fujimoto.claude.log_parser.Path.home", return_value=Path("/mock/home")
         ):
             result = get_claude_projects_dir()
             assert result == Path("/mock/home/.claude/projects")
+
+    def test_honours_claude_config_dir(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/elsewhere/claude")
+        assert get_claude_projects_dir() == Path("/elsewhere/claude/projects")
+
+    def test_config_dir_tilde_is_expanded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "~/cc")
+        assert get_claude_projects_dir() == Path.home() / "cc" / "projects"
+
+    def test_blank_config_dir_falls_back_to_home(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "   ")
+        with patch(
+            "fujimoto.claude.log_parser.Path.home", return_value=Path("/mock/home")
+        ):
+            assert get_claude_projects_dir() == Path("/mock/home/.claude/projects")
 
 
 class TestParseSession:
@@ -716,3 +749,154 @@ class TestTranscriptToolIds:
             )
         )
         assert read_transcript(log)[0].tool_id is None
+
+
+class TestSessionDirsForPath:
+    """Resolving a working directory to Claude's transcript directories."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_index_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The recorded-cwd index is memoized per projects dir + mtime; clear it
+        # so one test's fake tree cannot answer another's lookup.
+        monkeypatch.setattr("fujimoto.claude.log_parser._cwd_index_cache", None)
+
+    def _log(self, path: Path, cwd: str = "/test") -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_make_entry(cwd=cwd, text="Done.") + "\n")
+        return path
+
+    def test_dotted_worktree_path_is_found(self, tmp_path: Path) -> None:
+        # The regression: a worktree under the default `<repo>/.fujimoto/
+        # worktrees/` root, whose Claude directory has `--fujimoto` in it.
+        projects = tmp_path / "projects"
+        wt = Path("/repo/.fujimoto/worktrees/20260309-fix")
+        self._log(
+            projects / "-repo--fujimoto-worktrees-20260309-fix" / "s1.jsonl",
+            cwd=str(wt),
+        )
+
+        with patch(
+            "fujimoto.claude.log_parser.get_claude_projects_dir",
+            return_value=projects,
+        ):
+            assert session_dirs_for_path(wt) == [
+                projects / "-repo--fujimoto-worktrees-20260309-fix"
+            ]
+            assert len(get_sessions_for_path(wt)) == 1
+
+    def test_missing_path_resolves_to_nothing(self, tmp_path: Path) -> None:
+        with patch(
+            "fujimoto.claude.log_parser.get_claude_projects_dir",
+            return_value=tmp_path / "projects",
+        ):
+            assert session_dirs_for_path(Path("/no/such/dir")) == []
+
+    def test_symlinked_path_matches_resolved_directory(self, tmp_path: Path) -> None:
+        # Claude records the physical cwd, so a worktree reached through a
+        # symlink is filed under the resolved path.
+        real = tmp_path / "real" / "wt"
+        real.mkdir(parents=True)
+        link = tmp_path / "link"
+        link.symlink_to(tmp_path / "real")
+
+        projects = tmp_path / "projects"
+        encoded = encode_project_path(real.resolve())
+        self._log(projects / encoded / "s1.jsonl", cwd=str(real))
+
+        with patch(
+            "fujimoto.claude.log_parser.get_claude_projects_dir",
+            return_value=projects,
+        ):
+            assert session_dirs_for_path(link / "wt") == [projects / encoded]
+
+    def test_falls_back_to_recorded_cwd(self, tmp_path: Path) -> None:
+        # No encoding rule would produce this directory name — only the `cwd`
+        # inside the transcript ties it to the path.
+        projects = tmp_path / "projects"
+        self._log(projects / "opaque-name" / "s1.jsonl", cwd="/some/project")
+
+        with patch(
+            "fujimoto.claude.log_parser.get_claude_projects_dir",
+            return_value=projects,
+        ):
+            assert session_dirs_for_path(Path("/some/project")) == [
+                projects / "opaque-name"
+            ]
+            sessions = get_sessions_for_path(Path("/some/project"))
+
+        assert [s.session_id for s in sessions] == ["s1"]
+
+    def test_fallback_ignores_unrelated_directories(self, tmp_path: Path) -> None:
+        projects = tmp_path / "projects"
+        self._log(projects / "opaque-name" / "s1.jsonl", cwd="/some/project")
+        (projects / "not-a-dir.jsonl").write_text("")
+
+        with patch(
+            "fujimoto.claude.log_parser.get_claude_projects_dir",
+            return_value=projects,
+        ):
+            assert session_dirs_for_path(Path("/other/project")) == []
+
+    def test_fallback_survives_a_malformed_log(self, tmp_path: Path) -> None:
+        projects = tmp_path / "projects"
+        (projects / "junk").mkdir(parents=True)
+        (projects / "junk" / "s0.jsonl").write_text("not json\n")
+        self._log(projects / "opaque-name" / "s1.jsonl", cwd="/some/project")
+
+        with patch(
+            "fujimoto.claude.log_parser.get_claude_projects_dir",
+            return_value=projects,
+        ):
+            assert session_dirs_for_path(Path("/some/project")) == [
+                projects / "opaque-name"
+            ]
+
+    def test_fallback_with_no_projects_dir(self, tmp_path: Path) -> None:
+        with patch(
+            "fujimoto.claude.log_parser.get_claude_projects_dir",
+            return_value=tmp_path / "nope",
+        ):
+            assert session_dirs_for_path(Path("/some/project")) == []
+
+    def test_index_picks_up_a_new_session_directory(self, tmp_path: Path) -> None:
+        projects = tmp_path / "projects"
+        projects.mkdir()
+
+        with patch(
+            "fujimoto.claude.log_parser.get_claude_projects_dir",
+            return_value=projects,
+        ):
+            assert session_dirs_for_path(Path("/some/project")) == []
+            self._log(projects / "opaque-name" / "s1.jsonl", cwd="/some/project")
+            assert session_dirs_for_path(Path("/some/project")) == [
+                projects / "opaque-name"
+            ]
+
+    def test_sessions_are_not_double_counted(self, tmp_path: Path) -> None:
+        # A trailing slash and a bare path encode identically; the same log
+        # must not be parsed twice.
+        projects = tmp_path / "projects"
+        self._log(projects / "-test-project" / "s1.jsonl")
+
+        with patch(
+            "fujimoto.claude.log_parser.get_claude_projects_dir",
+            return_value=projects,
+        ):
+            assert len(get_sessions_for_path(Path("/test/project/"))) == 1
+
+    def test_fallback_survives_an_unreadable_log(self, tmp_path: Path) -> None:
+        projects = tmp_path / "projects"
+        blocked = self._log(projects / "blocked" / "s0.jsonl", cwd="/some/project")
+        blocked.chmod(0o000)
+        self._log(projects / "opaque-name" / "s1.jsonl", cwd="/some/project")
+
+        try:
+            with patch(
+                "fujimoto.claude.log_parser.get_claude_projects_dir",
+                return_value=projects,
+            ):
+                assert session_dirs_for_path(Path("/some/project")) == [
+                    projects / "opaque-name"
+                ]
+        finally:
+            blocked.chmod(0o644)

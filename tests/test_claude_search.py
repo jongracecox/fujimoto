@@ -94,7 +94,7 @@ def test_matcher_carries_its_mode():
 def test_lists_logs_for_root_and_worktrees_newest_first(tmp_path, monkeypatch):
     projects = tmp_path / "projects"
     monkeypatch.setattr(
-        "fujimoto.claude.search.get_claude_projects_dir", lambda: projects
+        "fujimoto.claude.log_parser.get_claude_projects_dir", lambda: projects
     )
     root = Path("/repo")
     worktree = Path("/repo/wt")
@@ -111,7 +111,7 @@ def test_lists_logs_for_root_and_worktrees_newest_first(tmp_path, monkeypatch):
 
 def test_lists_nothing_when_no_encoded_directory(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        "fujimoto.claude.search.get_claude_projects_dir", lambda: tmp_path
+        "fujimoto.claude.log_parser.get_claude_projects_dir", lambda: tmp_path
     )
     assert list_session_logs(Path("/nope"), []) == []
 
@@ -119,7 +119,7 @@ def test_lists_nothing_when_no_encoded_directory(tmp_path, monkeypatch):
 def test_none_project_root_still_scans_worktrees(tmp_path, monkeypatch):
     projects = tmp_path / "projects"
     monkeypatch.setattr(
-        "fujimoto.claude.search.get_claude_projects_dir", lambda: projects
+        "fujimoto.claude.log_parser.get_claude_projects_dir", lambda: projects
     )
     log = _simple_log(projects / "-repo-wt" / "a.jsonl", "hi")
     assert list_session_logs(None, [Path("/repo/wt")]) == [log]
@@ -128,16 +128,31 @@ def test_none_project_root_still_scans_worktrees(tmp_path, monkeypatch):
 def test_duplicate_targets_are_listed_once(tmp_path, monkeypatch):
     projects = tmp_path / "projects"
     monkeypatch.setattr(
-        "fujimoto.claude.search.get_claude_projects_dir", lambda: projects
+        "fujimoto.claude.log_parser.get_claude_projects_dir", lambda: projects
     )
     log = _simple_log(projects / "-repo" / "a.jsonl", "hi")
     assert list_session_logs(Path("/repo"), [Path("/repo")]) == [log]
 
 
+def test_dotted_worktree_path_is_listed(tmp_path, monkeypatch):
+    # A worktree under the default `<repo>/.fujimoto/worktrees/` root: Claude
+    # encodes the dot as a hyphen, so the directory carries a double hyphen.
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(
+        "fujimoto.claude.log_parser.get_claude_projects_dir", lambda: projects
+    )
+    log = _simple_log(
+        projects / "-repo--fujimoto-worktrees-20260309-fix" / "a.jsonl", "hi"
+    )
+    assert list_session_logs(
+        None, [Path("/repo/.fujimoto/worktrees/20260309-fix")]
+    ) == [log]
+
+
 def test_non_jsonl_files_are_ignored(tmp_path, monkeypatch):
     projects = tmp_path / "projects"
     monkeypatch.setattr(
-        "fujimoto.claude.search.get_claude_projects_dir", lambda: projects
+        "fujimoto.claude.log_parser.get_claude_projects_dir", lambda: projects
     )
     (projects / "-repo").mkdir(parents=True)
     (projects / "-repo" / "notes.txt").write_text("needle")
