@@ -1012,6 +1012,7 @@ class SessionApp(App):
         Binding("d", "dismiss_update", "Dismiss update", show=False),
         Binding("slash", "search", "Filter", show=True),
         Binding("s", "session_search", "Search transcripts", show=True),
+        Binding("r", "refresh", "Refresh", show=True),
         # Mode toggles for the transcript search. They have to fire while the
         # query Input holds focus, so they are Ctrl chords (which Input leaves
         # alone) rather than plain letters.
@@ -1716,6 +1717,39 @@ class SessionApp(App):
             if not item.disabled:
                 return index
         return None
+
+    async def action_refresh(self) -> None:
+        """Re-read session state and rebuild the home list (bound to `r`).
+
+        The 3s poller only refreshes Claude state on rows that already exist,
+        so a worktree created or a tmux session started outside fujimoto never
+        appears until the home screen is re-entered. This re-runs the same
+        discovery `_init_git_info` does at startup — tmux sessions, the open
+        session store, worktrees, projects — drops the memoized transcript data
+        and rebuilds the rows in place, keeping the current filter and the
+        highlighted row.
+        """
+        if not self._on_home or not self.query("#home-list"):
+            return
+        home_list = self.query_one("#home-list", ListView)
+        # Captured before the rebuild: appending rows moves the highlight.
+        highlighted = home_list.highlighted_child
+        target = highlighted.id if highlighted is not None else None
+        self._init_git_info()
+        debug.log(
+            "tui.refresh",
+            project=debug.rv(self._project_name),
+            worktrees=len(self._existing_worktrees),
+            active=len(self._active_sessions),
+            open_records=len(self._open_sessions),
+            filtered=bool(self._search_query),
+        )
+        await self._refresh_home_list()
+        if target is not None:
+            for index, item in enumerate(home_list.children):
+                if item.id == target and not item.disabled:
+                    home_list.index = index
+                    break
 
     @on(Input.Changed, "#home-search")
     async def on_home_search_changed(self, event: Input.Changed) -> None:
