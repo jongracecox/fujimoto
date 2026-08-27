@@ -1075,6 +1075,9 @@ class SessionApp(App):
         # applied after Enter hands focus back to the list.
         self._searching: bool = False
         self._search_query: str = ""
+        # Id of the home row the highlight was last on, so returning from a
+        # submenu lands back where the user left rather than at the top.
+        self._home_selection: str | None = None
         # Parsed Claude transcript data for the home screen, memoized so a `/`
         # keystroke re-filters rows instead of re-reading every JSONL log.
         self._claude_cache: (
@@ -1164,6 +1167,8 @@ class SessionApp(App):
         # A different project means different transcripts and worktrees.
         self._claude_cache = None
         self._fork_marker_cache = {}
+        # Row ids are project-specific, so a remembered one is meaningless here.
+        self._home_selection = None
         self._available_projects = list_projects()
         self.sub_title = self._project_name
         set_terminal_title(_session_manager_title(self._project_name))
@@ -1270,6 +1275,9 @@ class SessionApp(App):
         return None
 
     async def _show_home(self) -> None:
+        # Captured before the list is rebuilt: mounting rows fires
+        # `ListView.Highlighted`, which would otherwise overwrite it.
+        target = self._home_selection
         await self._clear_main()
         self._on_home = True
         self._claude_cache = None
@@ -1303,11 +1311,26 @@ class SessionApp(App):
                 id="home-panel",
             )
         )
+        self._restore_home_selection(target)
         if self._searching:
             self.query_one("#home-search").focus()
         else:
             self.query_one("#home-list").focus()
         self._poll_timer = self.set_interval(3, self._poll_session_states)
+
+    def _restore_home_selection(self, target: str | None) -> None:
+        """Re-highlight `target` on the home list, else the first usable row.
+
+        Mounting the list highlights (and so records) its first row, which is
+        why the caller captures the id *before* rebuilding.
+        """
+        home_list = self.query_one("#home-list", ListView)
+        if target is not None:
+            for index, item in enumerate(home_list.children):
+                if item.id == target and not item.disabled:
+                    home_list.index = index
+                    return
+        home_list.index = self._first_selectable_index(home_list)
 
     def _stopped_records(self) -> dict[str, session_state.SessionRecord]:
         """Open records for this project with no live tmux session behind them.
@@ -1702,6 +1725,12 @@ class SessionApp(App):
             if not item.disabled:
                 return index
         return None
+
+    @on(ListView.Highlighted, "#home-list")
+    def on_home_highlighted(self, event: ListView.Highlighted) -> None:
+        """Remember the highlighted row so a return to home can restore it."""
+        if event.item is not None and event.item.id is not None:
+            self._home_selection = event.item.id
 
     @on(Input.Changed, "#home-search")
     async def on_home_search_changed(self, event: Input.Changed) -> None:

@@ -1268,6 +1268,41 @@ class TestSessionAppAdhocSession:
                 assert app.query_one("#action-adhoc")
 
 
+class TestHomeSelectionMemory:
+    @pytest.mark.asyncio
+    async def test_returns_to_previous_row_after_submenu(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                for i, item in enumerate(home_list.children):
+                    if item.id == "wt-20260309-test":
+                        home_list.index = i
+                        break
+                await pilot.press("enter")
+                await pilot.pause()
+                assert len(app.query("#session-actions")) > 0
+
+                await pilot.press("escape")
+                await pilot.pause()
+                home_list = app.query_one("#home-list", ListView)
+                assert home_list.index is not None
+                assert home_list.children[home_list.index].id == "wt-20260309-test"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_when_row_is_gone(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                app._home_selection = "wt-does-not-exist"
+                await app._show_home()
+                await pilot.pause()
+                home_list = app.query_one("#home-list", ListView)
+                assert home_list.index == 0
+
+
 class TestSessionAppSessionActions:
     @pytest.mark.asyncio
     async def test_shows_submenu_for_active_worktree(self, tmp_path: Path) -> None:

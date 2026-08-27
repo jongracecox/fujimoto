@@ -513,6 +513,15 @@ Three custom exception types, all caught in `main()`:
     `_show_session_search(restore=True)` — re-rendering the collected
     `_search_hits` rather than throwing a completed scan away. Opening the menu
     from the home screen clears the flag, so that path still returns home.
+- **The home highlight survives a round trip through a submenu**:
+  `@on(ListView.Highlighted, "#home-list")` records the highlighted row's id in
+  `_home_selection`; `_show_home` captures that id *before* rebuilding (mounting
+  rows fires `Highlighted` for the first one, which would clobber it) and
+  `_restore_home_selection` re-highlights the matching row afterwards, falling
+  back to `_first_selectable_index` when the row is gone — a terminated session,
+  a deleted worktree. `_init_git_info` clears it, since row ids are
+  project-scoped. Filtering with `/` still resets to the first match:
+  `_refresh_home_list` is unchanged.
 - **Home name filter rebuilds rows, not the screen**: `_show_home` mounts the panel;
   all row construction (and the population of `_session_map` /
   `_claude_state_snapshot`) lives in `_build_home_items()`, which applies the
