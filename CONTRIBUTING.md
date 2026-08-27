@@ -36,6 +36,7 @@ src/fujimoto/
 ├── config.py     # Env var loading, path construction, session metadata
 ├── git.py        # Git subprocess wrappers
 ├── tmux.py       # tmux session management
+├── debug.py      # --debug / --debug-redacted diagnostic logging + redaction
 ├── project_config.py  # Optional per-project .fujimoto.yaml (copy/link/init)
 ├── templates/    # Packaged scaffolds (fujimoto.yaml.template)
 └── claude/
@@ -194,6 +195,43 @@ a `_build_*_items()` helper at all. The shape:
 - Both should raise their respective error types (`GitError`, `TmuxError`)
 - Import and use them in `cli.py`
 
+### Diagnostic Logging (`debug.py`)
+
+`fujimoto --debug` (or `--debug-redacted`) writes a support log to
+`~/.fujimoto/logs/` — see the Troubleshooting section of the README for what it
+captures and how redaction reads.
+
+**New features must be instrumented in the same change** — CLAUDE.md's
+Diagnostic Logging section is the normative list of what needs logging and how
+redaction works. In short, when adding code that touches the environment, a
+subprocess, discovery logic, or that can silently skip an item, instrument it:
+
+```python
+from fujimoto import debug
+
+debug.log("tmux.kill", session=debug.rv(name), rc=result.returncode)
+debug.log_once(f"claude-dir-{encoded}", "claude.discovery", logs=len(logs))
+```
+
+Rules of thumb:
+
+- Every helper is a no-op when debug mode is off — call it unconditionally.
+  Guard with `debug.is_enabled()` only when *building* the fields is expensive.
+- Wrap user-identifying values in `debug.rv()` and paths in `debug.rp()` so
+  `--debug-redacted` can hide them. Never log a credential; `log_environment`
+  redacts anything matching `debug.is_secret_name()` in both modes.
+- Use `debug.log_once(key, ...)` for anything on a polling path — the home
+  screen re-reads Claude logs every 3 seconds.
+- The event name is positional-only, so `name=` is safe as a field.
+- `debug.py` must not import other fujimoto modules at module scope (they
+  import it) — the `fujimoto.version` import inside `log_environment` is lazy
+  for that reason.
+- Tests must call `debug.disable()` in teardown (see the autouse fixtures in
+  `tests/test_debug.py` and `TestDebugFlags` in `tests/test_cli.py`) — the
+  logger is process-wide and would otherwise leak into other tests. Point
+  `FUJIMOTO_LOG_DIR` (or `enable(log_dir=...)`) at `tmp_path`; never write to
+  the real `~/.fujimoto/logs`.
+
 ### Claude Log Integration
 
 The `claude/` subpackage parses Claude Code's JSONL session logs (`~/.claude/projects/`). Not yet wired into the TUI — currently a standalone module with its own test suite.
@@ -304,3 +342,12 @@ https://docs.pypi.org/trusted-publishers/
    - Create a worktree with a name that already exists
 10. With `FUJIMOTO_WORKTREE_ROOT` unset: confirm worktrees land in
    `<repo>/.fujimoto/worktrees/` and the directory is gitignored
+9. Run `fujimoto --debug`, create and attach a session, detach, quit — then
+   read the log in `~/.fujimoto/logs/` and confirm it covers the whole flow.
+   Repeat with `--debug-redacted` and confirm your username, project name and
+   branch name appear nowhere in the file:
+
+   ```sh
+   FUJIMOTO_LOG_DIR=/tmp/fjlog fujimoto --debug-redacted
+   grep -c "$(whoami)" /tmp/fjlog/*.log   # expect 0
+   ```

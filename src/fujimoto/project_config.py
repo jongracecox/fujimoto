@@ -20,6 +20,8 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from fujimoto import debug
+
 from .config import ConfigError
 
 CONFIG_FILENAME = ".fujimoto.yaml"
@@ -134,6 +136,7 @@ def load_project_config(project_root: Path) -> ProjectConfig:
     """
     path = project_root / CONFIG_FILENAME
     if not path.exists():
+        debug.log("project_config.load", path=debug.rp(path), found=False)
         return ProjectConfig()
     try:
         raw = yaml.safe_load(path.read_text())
@@ -142,9 +145,27 @@ def load_project_config(project_root: Path) -> ProjectConfig:
     if raw is None:
         return ProjectConfig()
     try:
-        return ProjectConfig.model_validate(raw)
+        config = ProjectConfig.model_validate(raw)
     except ValidationError as exc:
+        debug.log(
+            "project_config.load",
+            path=debug.rp(path),
+            found=True,
+            valid=False,
+            error=type(exc).__name__,
+        )
         raise ConfigError(f"Invalid {CONFIG_FILENAME}:\n{exc}") from exc
+    debug.log(
+        "project_config.load",
+        path=debug.rp(path),
+        found=True,
+        valid=True,
+        copy=len(config.copy_entries),
+        link=len(config.link_entries),
+        init=len(config.init_commands),
+        on_error=config.on_error,
+    )
+    return config
 
 
 def _substitute(text: str, mapping: dict[str, str]) -> str:
@@ -192,6 +213,13 @@ def apply_project_config(
     skipped). Never raises for individual action failures.
     """
     result = ApplyResult()
+    debug.log(
+        "project_config.apply",
+        phase="start",
+        trigger=trigger,
+        source_root=debug.rp(source_root),
+        worktree=debug.rp(worktree_root),
+    )
 
     for entry in config.copy_entries:
         if not entry.when.runs_on(trigger):
@@ -263,6 +291,25 @@ def apply_project_config(
                 result.init_error = message
                 break
 
+    debug.log(
+        "project_config.apply",
+        phase="done",
+        trigger=trigger,
+        actions=len(result.actions),
+        warnings=len(result.warnings),
+        init_error=debug.rv(result.init_error) if result.init_error else "none",
+    )
+    for action in result.actions:
+        # "copied .env" / "ran: uv sync" — the verb is ours, the target is not.
+        verb, _, target = action.partition(" ")
+        debug.log(
+            "project_config.action",
+            kind=verb.rstrip(":"),
+            detail=debug.rv(target),
+        )
+    for warning in result.warnings:
+        kind, _, detail = warning.partition(": ")
+        debug.log("project_config.warning", kind=kind, detail=debug.rv(detail))
     return result
 
 

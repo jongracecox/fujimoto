@@ -6,6 +6,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from fujimoto import debug
+
 
 def _has_vscode() -> bool:
     """Check if the ``code`` CLI is available on PATH."""
@@ -17,6 +19,7 @@ def open_vscode(directory: Path) -> None:
 
     Raises ``OSError`` if the ``code`` CLI is not found.
     """
+    debug.log("vscode.open", directory=debug.rp(directory), available=_has_vscode())
     if not _has_vscode():
         msg = (
             "'code' CLI not found on PATH. On macOS, install it from VS Code: "

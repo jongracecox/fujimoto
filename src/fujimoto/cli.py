@@ -34,6 +34,7 @@ from textual.widgets import (
     Static,
 )
 
+from fujimoto import debug
 from fujimoto.claude import (
     ClaudeLogError,
     ClaudeSession,
@@ -1075,9 +1076,6 @@ class SessionApp(App):
         # applied after Enter hands focus back to the list.
         self._searching: bool = False
         self._search_query: str = ""
-        # Id of the home row the highlight was last on, so returning from a
-        # submenu lands back where the user left rather than at the top.
-        self._home_selection: str | None = None
         # Parsed Claude transcript data for the home screen, memoized so a `/`
         # keystroke re-filters rows instead of re-reading every JSONL log.
         self._claude_cache: (
@@ -1131,6 +1129,7 @@ class SessionApp(App):
             if load_settings().quick_terminal_enabled is None and quick_terminal_key():
                 self._prompt_quick_terminal()
         except (ConfigError, GitError) as e:
+            debug.log_exception("tui.mount_failed", e)
             await self._show_error(str(e))
 
     def _start_update_check(self) -> None:
@@ -1167,11 +1166,19 @@ class SessionApp(App):
         # A different project means different transcripts and worktrees.
         self._claude_cache = None
         self._fork_marker_cache = {}
-        # Row ids are project-specific, so a remembered one is meaningless here.
-        self._home_selection = None
         self._available_projects = list_projects()
         self.sub_title = self._project_name
         set_terminal_title(_session_manager_title(self._project_name))
+        debug.log(
+            "tui.git_info",
+            cwd=debug.rp(cwd) if cwd else "none",
+            project=debug.rv(self._project_name),
+            root=debug.rp(self._project_root),
+            current_branch=debug.rref(self._current_branch),
+            default_branch=debug.rref(self._default_branch),
+            active_sessions=len(self._active_sessions),
+            projects=len(self._available_projects),
+        )
 
         self._existing_worktrees = []
         try:
@@ -1275,9 +1282,6 @@ class SessionApp(App):
         return None
 
     async def _show_home(self) -> None:
-        # Captured before the list is rebuilt: mounting rows fires
-        # `ListView.Highlighted`, which would otherwise overwrite it.
-        target = self._home_selection
         await self._clear_main()
         self._on_home = True
         self._claude_cache = None
@@ -1311,26 +1315,11 @@ class SessionApp(App):
                 id="home-panel",
             )
         )
-        self._restore_home_selection(target)
         if self._searching:
             self.query_one("#home-search").focus()
         else:
             self.query_one("#home-list").focus()
         self._poll_timer = self.set_interval(3, self._poll_session_states)
-
-    def _restore_home_selection(self, target: str | None) -> None:
-        """Re-highlight `target` on the home list, else the first usable row.
-
-        Mounting the list highlights (and so records) its first row, which is
-        why the caller captures the id *before* rebuilding.
-        """
-        home_list = self.query_one("#home-list", ListView)
-        if target is not None:
-            for index, item in enumerate(home_list.children):
-                if item.id == target and not item.disabled:
-                    home_list.index = index
-                    return
-        home_list.index = self._first_selectable_index(home_list)
 
     def _stopped_records(self) -> dict[str, session_state.SessionRecord]:
         """Open records for this project with no live tmux session behind them.
@@ -1652,6 +1641,8 @@ class SessionApp(App):
             )
             items.extend(previous_items)
 
+        self._log_home_inventory(path_to_latest, root_claude_sessions)
+
         if searching:
             if not items:
                 items.append(
@@ -1725,12 +1716,6 @@ class SessionApp(App):
             if not item.disabled:
                 return index
         return None
-
-    @on(ListView.Highlighted, "#home-list")
-    def on_home_highlighted(self, event: ListView.Highlighted) -> None:
-        """Remember the highlighted row so a return to home can restore it."""
-        if event.item is not None and event.item.id is not None:
-            self._home_selection = event.item.id
 
     @on(Input.Changed, "#home-search")
     async def on_home_search_changed(self, event: Input.Changed) -> None:
@@ -2031,6 +2016,88 @@ class SessionApp(App):
         if item_id and item_id in self._search_result_map:
             await self._show_session_actions(
                 self._search_result_map[item_id], from_search=True
+            )
+
+    def _log_home_inventory(
+        self,
+        path_to_latest: dict[str, ClaudeSession],
+        root_claude_sessions: list[ClaudeSession],
+    ) -> None:
+        """Record what the home screen resolved, for --debug diagnosis."""
+        if not debug.is_enabled():
+            return
+        debug.log_once(
+            "tui-home",
+            "tui.home",
+            items=len(self._session_map),
+            worktrees=len(self._existing_worktrees),
+            active_sessions=len(self._active_sessions),
+            claude_paths=len(path_to_latest),
+            root_claude_sessions=len(root_claude_sessions),
+            resume_offered=len(self._resume_sessions),
+        )
+        # `_existing_worktrees` is newest-first, so a cap keeps the worktrees
+        # someone is plausibly working in and counts the long tail.
+        skipped_worktrees = 0
+        skipped_with_session = 0
+        for path in self._existing_worktrees:
+            has_session = str(path) in path_to_latest
+            logged = debug.log_capped(
+                "tui.worktree",
+                "tui.worktree",
+                dedupe_key=f"tui-worktree-{path}",
+                path=debug.rp(path),
+                has_claude_session=has_session,
+            )
+            if not logged:
+                skipped_worktrees += 1
+                skipped_with_session += has_session
+        if skipped_worktrees:
+            debug.log_once(
+                "tui-worktree-summary",
+                "tui.worktree_summary",
+                not_logged=skipped_worktrees,
+                with_claude_session=skipped_with_session,
+                without=skipped_worktrees - skipped_with_session,
+            )
+
+        # Running sessions first: they are what a report is usually about.
+        items = sorted(
+            self._session_map.items(),
+            key=lambda kv: (not kv[1].is_active, kv[0]),
+        )
+        skipped_types: dict[str, int] = {}
+        skipped_states: dict[str, int] = {}
+        for item_id, info in items:
+            logged = debug.log_capped(
+                "tui.item",
+                "tui.item",
+                dedupe_key=f"tui-item-{item_id}",
+                id=debug.rid(item_id),
+                type=info.session_type,
+                name=debug.rv(info.name),
+                path=debug.rp(info.path),
+                tmux=debug.rv(info.tmux_session),
+                active=info.is_active,
+                branch=debug.rref(info.branch),
+                claude_session=info.claude_session_id or "none",
+                claude_state=info.claude_state,
+            )
+            if not logged:
+                skipped_types[info.session_type] = (
+                    skipped_types.get(info.session_type, 0) + 1
+                )
+                state = str(info.claude_state or "unknown")
+                skipped_states[state] = skipped_states.get(state, 0) + 1
+        if skipped_types:
+            debug.log_once(
+                "tui-item-summary",
+                "tui.item_summary",
+                not_logged=sum(skipped_types.values()),
+                types=",".join(f"{k}={v}" for k, v in sorted(skipped_types.items())),
+                claude_states=",".join(
+                    f"{k}={v}" for k, v in sorted(skipped_states.items())
+                ),
             )
 
     def _build_settings_items(self) -> list[ListItem]:
@@ -3181,6 +3248,7 @@ class SessionApp(App):
     @on(ListView.Selected, "#home-list")
     async def on_home_selected(self, event: ListView.Selected) -> None:
         item_id = event.item.id
+        debug.log("tui.selected", list="home", id=debug.rid(item_id))
         if item_id == "action-restore":
             await self._restore_stopped_sessions()
         elif item_id == "action-create":
@@ -3841,6 +3909,11 @@ def _apply_worktree_config(working_dir: Path) -> bool:
     reopens the TUI). Non-worktree sessions always proceed.
     """
     source_root = _resolve_worktree_source(working_dir)
+    debug.log(
+        "launch.worktree_config",
+        working_dir=debug.rp(working_dir),
+        source_root=debug.rp(source_root) if source_root else "none",
+    )
     if source_root is None:
         return True
 
@@ -3893,6 +3966,7 @@ def _create_config() -> None:
 
 def _run_pane_command(action: str, session: str) -> None:
     """Dispatch in-session pane actions invoked via tmux key bindings."""
+    debug.log("pane.command", action=action, session=debug.rv(session))
     path = get_session_path(session)
     if path is None:
         display_message(session, f"fujimoto: could not resolve session '{session}'")
@@ -3903,8 +3977,35 @@ def _run_pane_command(action: str, session: str) -> None:
         elif action == "terminal":
             open_terminal(path)
     except OSError as exc:
+        debug.log_exception("pane.failed", exc)
+        _finish_debug_log()
         display_message(session, f"fujimoto: {exc}")
         sys.exit(1)
+    _finish_debug_log()
+
+
+def _start_debug_log(*, redact: bool) -> None:
+    """Open the diagnostic log and record the environment snapshot."""
+    try:
+        logger = debug.enable(redact=redact)
+    except OSError as exc:
+        print(f"fujimoto: could not open debug log: {exc}", file=sys.stderr)
+        return
+    print(f"fujimoto: debug log → {logger.path}")
+    if redact:
+        print("fujimoto: sensitive values are redacted in this log")
+    debug.log_environment()
+    debug.log_section("run")
+
+
+def _finish_debug_log() -> None:
+    """Close the diagnostic log and remind the user where it is."""
+    path = debug.log_path()
+    if path is None:
+        return
+    debug.log("shutdown")
+    debug.disable()
+    print(f"fujimoto: debug log written to {path}")
 
 
 def main() -> None:
@@ -3920,12 +4021,30 @@ def main() -> None:
         action="store_true",
         help="Write a commented .fujimoto.yaml template to the repo root and exit",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Write a detailed diagnostic log to ~/.fujimoto/logs "
+            "(override the directory with $FUJIMOTO_LOG_DIR)"
+        ),
+    )
+    parser.add_argument(
+        "--debug-redacted",
+        action="store_true",
+        help=(
+            "Like --debug, but replace usernames, project/session/branch names "
+            "and path components with shape-preserving redaction tokens"
+        ),
+    )
     sub = parser.add_subparsers(dest="command")
     pane = sub.add_parser("pane", help="Per-session pane actions")
     pane.add_argument("action", choices=["vscode", "terminal"])
     pane.add_argument("--session", required=True)
 
     args = parser.parse_args()
+    if args.debug or args.debug_redacted:
+        _start_debug_log(redact=args.debug_redacted)
     if args.command == "pane":
         _run_pane_command(args.action, args.session)
         return
@@ -3935,7 +4054,11 @@ def main() -> None:
 
     try:
         issues = _check_prerequisites()
+        debug.log("prerequisites", issues=len(issues))
         if issues:
+            for issue in issues:
+                debug.log("prerequisite_issue", detail=debug.rv(issue))
+            _finish_debug_log()
             print("fujimoto: configuration error\n", file=sys.stderr)
             for issue in issues:
                 print(f"  {issue}\n", file=sys.stderr)
@@ -3958,6 +4081,14 @@ def main() -> None:
                 session_type = target.session_type
                 fork_id = target.forked_from_session_id
                 resume_id = fork_id or target.resume_session_id
+                debug.log(
+                    "launch.target",
+                    project=debug.rv(project_name),
+                    working_dir=debug.rp(working_dir),
+                    tmux=debug.rv(tmux_name),
+                    session_type=session_type,
+                    resume=resume_id or "none",
+                )
                 if fork_id:
                     # A fork resumes the parent's conversation but in a new
                     # worktree, so it needs the prompt explaining the move.
@@ -3980,6 +4111,7 @@ def main() -> None:
                     )
                 )
                 if not _apply_worktree_config(working_dir):
+                    debug.log("launch.aborted", reason="project-config")
                     continue  # setup failed and on_error=abort -> reopen the TUI
                 resolved_name = tmux_name or session_name(
                     project_name, working_dir.name
@@ -4021,17 +4153,25 @@ def main() -> None:
                         project_name, working_dir, resolved_name, session_type
                     )
             else:
+                debug.log("tui.exit", reason="quit")
                 break
         set_terminal_title("")
+        _finish_debug_log()
     except (ConfigError, GitError) as e:
         set_terminal_title("")
+        debug.log_exception("fatal", e)
+        _finish_debug_log()
         print(f"\nfujimoto: {e}", file=sys.stderr)
         sys.exit(1)
     except TmuxError as e:
         set_terminal_title("")
+        debug.log_exception("fatal", e)
+        _finish_debug_log()
         print(f"\nfujimoto: {e}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
         set_terminal_title("")
+        debug.log("interrupted")
+        _finish_debug_log()
         print("\nAborted.")
         sys.exit(130)

@@ -73,6 +73,7 @@ export FUJIMOTO_WINDOW_TITLE="{git_project} - {worktree_name}"   # Terminal wind
 export FUJIMOTO_META_KEY="C-a"                                   # In-session fujimoto chord (blank to disable)
 export FUJIMOTO_TMUX_PREFIX="C-b"                                # tmux prefix key (default: C-b)
 export FUJIMOTO_QUICK_TERMINAL_KEY="C-\`"                        # Global quick-terminal toggle key (blank to disable)
+export FUJIMOTO_LOG_DIR=~/.fujimoto/logs                         # Where --debug logs are written
 ```
 
 > **Note:** As of this release, the **defaults are swapped** from earlier
@@ -477,6 +478,82 @@ These options are set per-session and don't affect your global tmux config.
 | `Escape` | Back (or quit from home; clears an active filter first) |
 | `q` | Quit |
 | Arrow keys | Navigate |
+
+## Troubleshooting (`--debug`)
+
+If fujimoto misbehaves — a session doesn't appear, a Claude state indicator
+looks wrong, a worktree launch fails — run it with `--debug` and share the log:
+
+```sh
+fujimoto --debug            # full detail
+fujimoto --debug-redacted   # same, with identifying values redacted
+```
+
+A timestamped log is written to `~/.fujimoto/logs/fujimoto-<date>-<time>-<pid>.log`
+(override the directory with `FUJIMOTO_LOG_DIR`) and the path is printed on
+start and on exit. The log records:
+
+- fujimoto / Python / platform versions, and the versions of `tmux`, `git`,
+  `claude`, `gh`, `code`, `uv` and `brew` found on `PATH`
+- every `FUJIMOTO_*`, `CLAUDE_*` and `ANTHROPIC_*` environment variable, plus
+  the usual terminal/shell ones (credential-looking values are always replaced
+  with `[SECRET-<length>]`, in both modes)
+- every `git` command run, with exit code and output
+- tmux session discovery, session creation (including the exact `claude`
+  command line), attach and detach
+- Claude session discovery: the encoded `~/.claude/projects` directory, how
+  many JSONL logs were found, parsed or failed, and for each session its id,
+  derived state, `cwd`, branch and last activity
+- what the home screen resolved: worktrees, active sessions, every list item
+- `.fujimoto.yaml` loading plus every copy/link/init action and warning
+- launch targets, aborted launches, and any fatal error with its traceback
+
+Polled state (Claude session discovery runs every 3 seconds) is only re-logged
+when it actually changes, so a long-running session stays readable. Long
+inventories are capped: the first ten worktrees and sessions are logged in full
+(running sessions and newest worktrees first), then a summary counts the rest —
+so on a machine with fifty worktrees the log still opens with what you did
+rather than a wall of state:
+
+```
+series.summarised series=config.read_meta logged=10 not_logged=37 total=47
+tui.item_summary  not_logged=15 types=worktree=15 claude_states=idle=15
+```
+
+### Redaction
+
+`--debug-redacted` is for sharing a log without exposing project, branch or
+directory names. Values are replaced with a token that preserves their
+*shape* — which is often what matters, e.g. when a project name contains
+characters that break a path:
+
+```
+[REDACTED-3f9a-12-CONTAINS.-]
+ |         |    |  |
+ |         |    |  `-- the non-alphanumeric characters the value contained
+ |         |    `----- character length
+ |         `---------- stable fingerprint (the same value always redacts to it)
+ `-------------------- marker
+```
+
+Paths keep their separators and depth, and your home directory collapses to
+`~`, so a log still shows the *shape* of where you are:
+
+```
+~/[REDACTED-9a88-3]/[REDACTED-f8ee-8]                 # ~/git/myproject
+~/.fujimoto/worktrees/[REDACTED-850a-14-CONTAINS-]    # a fujimoto worktree
+```
+
+A component survives only if it cannot be a name you chose — operating-system
+directories (`Users`, `usr`, `bin`, `opt`, …) and dotted config directories
+(`.claude`, `.fujimoto`, `.cache`) do; ordinary words like `git`, `src` or
+`logs` do not, because those are perfectly good project names. Names fujimoto
+and Claude Code pick themselves stay readable when they appear where they
+belong, so `~/.cache/fujimoto/sessions.json` is legible while a *repo* called
+`fujimoto` is still hidden. Command lines
+keep flags, subcommands and git's own ref vocabulary
+(`git symbolic-ref refs/remotes/origin/HEAD` stays readable), while branch and
+session names are redacted.
 
 ## Development
 

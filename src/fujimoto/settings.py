@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from fujimoto import debug
+
 
 def _settings_path() -> Path:
     return Path.home() / ".cache" / "fujimoto" / "settings.json"
@@ -24,6 +26,12 @@ def load_settings() -> Settings:
         return Settings()
     raw = data.get("quick_terminal_enabled")
     enabled: bool | None = raw if isinstance(raw, bool) else None
+    debug.log_once(
+        "settings",
+        "settings.loaded",
+        path=debug.rp(path),
+        quick_terminal_enabled=enabled,
+    )
     return Settings(quick_terminal_enabled=enabled)
 
 
@@ -33,6 +41,11 @@ def save_settings(settings: Settings) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             json.dumps({"quick_terminal_enabled": settings.quick_terminal_enabled})
+        )
+        debug.log(
+            "settings.saved",
+            path=debug.rp(path),
+            quick_terminal_enabled=settings.quick_terminal_enabled,
         )
     except OSError:
         pass
