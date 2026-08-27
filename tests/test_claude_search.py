@@ -509,3 +509,28 @@ def test_case_sensitive_snippet_spans_cover_the_match(tmp_path):
     snippet = _snippet("say Needle and needle", 4, 10, matcher)
     # Only the correctly-cased occurrence is reported.
     assert [snippet.text[a:b] for a, b in snippet.spans] == ["Needle"]
+
+
+class TestIterHitsResilience:
+    def test_one_unparseable_log_does_not_end_the_scan(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A scan over hundreds of logs must survive one bad apple."""
+        from fujimoto.claude import search as search_module
+
+        first = _simple_log(tmp_path / "a.jsonl", "the needle")
+        second = _simple_log(tmp_path / "b.jsonl", "the needle again")
+
+        real = search_module.search_log
+
+        def exploding(path: Path, matcher):
+            if path == first:
+                raise AttributeError("'list' object has no attribute 'get'")
+            return real(path, matcher)
+
+        monkeypatch.setattr(search_module, "search_log", exploding)
+        matcher = compile_matcher("needle", mode=ContentMode.RAW)
+        batches = list(search_module.iter_hits([first, second], matcher))
+        scanned, hits = batches[-1]
+        assert scanned == 2
+        assert [h.session.jsonl_path for h in hits] == [second]

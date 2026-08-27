@@ -11,7 +11,7 @@ uv run pytest                                  # Run tests with coverage
 uv run nox                                     # Run tests across all supported Python versions
 uv run nox -s tests-3.14                       # Run tests against a single Python version
 uv run nox -s tests_textual                    # Run dependency-pin matrix (textual)
-uv tool install --force --reinstall .          # Install globally (re-run after code changes)
+uv tool install --force --reinstall --no-cache .  # Install globally (re-run after code changes)
 ```
 
 ## Environment Variables (all optional)
@@ -384,6 +384,7 @@ pydantic):
 - `parse_session(jsonl_path)` — reads JSONL, tracks last meaningful (non-sidechain) entry, derives state. Skips lines that parse to a non-dict (a bare list or string is valid JSON but has no entry type), which previously raised `AttributeError` out of `get_sessions_for_path` and into the home screen.
 - `get_sessions_for_path(project_path)` — encodes path, globs `*.jsonl`, returns sorted sessions
 - `TranscriptMessage` — frozen dataclass: `role`, `text`, `timestamp`, `tool_id`. `role` is one of `user`, `assistant`, `thinking`, `tool_use`, `tool_result` — the last three come from *content blocks*, not entry types. `tool_id` carries a `tool_use`'s `id` and a `tool_result`'s `tool_use_id`, so the viewer can pair a call with its own reply
+- `read_raw_transcript(jsonl_path)` — the log's lines as written (blank lines dropped, each clipped to `_MAX_RAW_LINE_CHARS`), for the viewer's fallback when `read_transcript` meets an entry shape it doesn't know. Raises `ClaudeLogError` only when the file itself cannot be read
 - `read_transcript(jsonl_path)` — reads a log into an ordered `list[TranscriptMessage]` for the read-only viewer. Skips sidechain (sub-agent), meta and unrecognized entries; clips tool inputs/results to 20 lines / 2000 chars (`_clip`) since whole-file payloads are unreadable in a TUI
 
 **`claude/search.py`** — Full-text search over transcript *contents* (as opposed
@@ -400,10 +401,11 @@ responsible for running it off the event loop.
 - `_collect(source, matcher, count, snippets)` counts every match but skips snippetting one that falls inside a window already emitted — so `MAX_SNIPPETS` buys three *different* places rather than three near-identical views of one dense paragraph. Counts are unaffected.
 
 **`cli.py`** — Textual TUI with async view management:
+- `LogBody` — frozen dataclass `(widget, text, folds)`: one highlightable body in the log viewer, its source text, and the `Collapsible`s that hide it. `Spans` is the alias for its `(start, end)` match offsets
 - `SessionInfo` — dataclass for session state (type, project, path, tmux name, active status, claude_session_id, claude_state, is_fork)
 - `LaunchTarget` — `NamedTuple` describing what `main()` should launch: `(project, working_dir, tmux_name, session_type, resume_session_id, forked_from_session_id, forked_from_worktree)`. A `NamedTuple` rather than a dataclass so existing index-based access keeps working.
 - `SessionApp` — main app class with CSS styling
-- Module-level helpers: `_claude_state_label(state)`, `_relative_time(dt)`, `_get_claude_sessions(root, worktrees)`, `_is_fork_worktree(path)`, `_build_fork_system_prompt(project, working_dir, parent_worktree, base_branch)`, `_fit_snippet(snippet, max_width)` / `_render_snippet(snippet, max_width)` (search-result snippet rendering — see the `Content.assemble` gotcha)
+- Module-level helpers: `_claude_state_label(state)`, `_relative_time(dt)`, `_get_claude_sessions(root, worktrees)`, `_is_fork_worktree(path)`, `_build_fork_system_prompt(project, working_dir, parent_worktree, base_branch)`, `_fit_snippet(snippet, max_width)` / `_render_snippet(snippet, max_width)` (search-result snippet rendering — see the `Content.assemble` gotcha), `_match_spans(text, matcher)` / `_highlight(text, spans)` / `_log_body(text, folds)` (log-viewer match highlighting, split so the regex half can run in a worker thread and only the `Content` half touches widgets), `_tool_collapsible(title, …)` (a `Collapsible` whose title is `Content`, never markup)
 - Instance helpers: `_build_session_label(session, state_suffix)` — the single source of truth for session row text (including the 🍴 fork marker), used by `_show_home`'s render of direct *and* worktree rows and by `_poll_session_states` for in-place updates; `_build_claude_session_items(sessions, prefix)` — shared row rendering for the resume (`rp-*`), fork (`fp-*`) and log-viewer (`lp-*`) pickers; `_matching_worktree(path)` — the project worktree a path refers to, compared by `resolve()`; `_direct_session_cwd(tmux_name)` — where a `direct-N` row really runs and on what branch (memoized in `_direct_cwd_cache`); `_resume_target(project, cwd, session=None)` — the tmux name and session type a resume should use
 - Views: home (sessions list), session actions submenu, terminate/stop prompt (`#terminate-prompt`, opened by a pending `close` from `Ctrl-A x`; Terminate / Stop / Cancel with Terminate highlighted so Enter matches the `confirm-before` it replaces, and Cancel re-attaching via `_launch_target` so it costs nothing), finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), fork title form, fork branch select, fork session picker, session log picker + read-only log viewer, conflict resolution, project switcher (with autocomplete filter), tmux install, error
 - Transcript search (`s`) — see the dedicated section below.
@@ -458,11 +460,99 @@ responsible for running it off the event loop.
   Collapsible `padding-bottom` and `border-top`, which otherwise read as gaps
   between messages, and `.log-tool-run .log-tool` drops the top margin again
   inside an opened run, where the calls are a list rather than separate
-  messages. `#main` is already a `VerticalScroll`, so focusing it gives
+  messages. The messages live in their own `VerticalScroll` (`#log-messages`)
+  inside `#log-panel` rather than directly in `#main`, so the header, the `/`
+  box and the hint stay put while the transcript scrolls; focusing it gives
   arrow/page/end scrolling for free, and Escape falls through to `action_go_back`,
   which returns to the search results when the menu came from a search and to the
   home screen otherwise. Nothing is launched — this path never sets
   `_launch_target`.
+- **Log viewer search (`/`)** — the same three-axis matcher as `s`, applied to
+  the one transcript on screen. `_show_session_log` reads and parses the log
+  once; `_render_log_view` mounts the panel once. **Searching never comes back
+  through either.** Mechanics worth knowing:
+  - **Nothing is remounted for a query.** `_render_transcript(messages)` returns
+    `(widgets, bodies)` where a `LogBody` is `(widget, text, folds)` — the
+    `Static` for one body, its source text, and the `Collapsible`s that hide it.
+    A query then only calls `Static.update()` on the bodies whose spans changed.
+    Measured on a real 838-message log: a full rebuild is ~540 ms (visible as
+    the query box vanishing mid-keystroke), while a rescan is ~1.7 ms of
+    matching plus ~6 ms of `Content` building.
+  - **Matching runs in a thread, applying runs on the event loop.**
+    `_start_log_search` bumps `_log_search_token`, cancels the `log-search`
+    group and hands `[body.text …]` plus the matcher to `_run_log_search`
+    (`@work(thread=True, exclusive=True)`), which returns `list[Spans]` — pure
+    data, no widgets — via `call_from_thread(self._apply_log_search, …)`. As
+    with the transcript search, **the token is the correctness mechanism**, not
+    worker cancellation: a scan can already be queued when the query changes.
+  - **`_match_spans` and `_highlight` are separate for exactly that reason** —
+    the first is regex work that can happen anywhere, the second builds
+    `Content` and must not. Zero-width matches are dropped, since there is
+    nothing to highlight or scroll to.
+  - **`_apply_log_search` accumulates fold state before applying it.** A fold
+    opens if *any* body inside it matched, so a run holding one hit and nine
+    misses would be re-closed by the misses if each body decided alone. Folds
+    are keyed by `id()` (widget equality is not identity) and assigned only on
+    a change, since each assignment costs a refresh. Everything with no match
+    folds back up, so each query starts from the same view.
+  - **`_log_matches` is the list of matching body `Static`s** (document order,
+    since `_log_bodies` is). `_step_log_match(±1)` wraps, swaps the
+    `.log-match-current` class and calls `scroll_to_widget`; starting from `-1`
+    is what makes the first `n` land on the first match and the first `N` on
+    the last. `_stop_log_search` (from `_clear_main`) drops the lists and bumps
+    the token — the entries are live widgets from a removed subtree.
+  - **`n`/`N` are plain letters, unlike the `s` view's Ctrl chords**, because
+    the `Input` swallows them while it holds focus — which is also why
+    `Input.Submitted` moves focus to `#log-messages`, and why Textual withholds
+    them from the footer while the box is focused. `ContentMode` is not offered:
+    the transcript is already parsed, so there is no raw JSON to scan.
+  - **The viewer mounts no `.hint` row**, unlike every other view. `/` and
+    Escape are already in the footer, and a second strip of grey text below a
+    screenful of transcript reads as a second footer rather than as help.
+  - **The query box is built with `select_on_focus=False`.** Textual selects an
+    `Input`'s whole value on focus by default, which ate the query whenever
+    focus came back to the box.
+  - Escape is layered: `_on_key` clears the search when the box has focus, and
+    `action_go_back` clears it before leaving the view when it does not.
+  - **Instrumented as `log_search.start` / `.done` / `.dropped`** (plus
+    `tui.log_view` when the viewer opens). `.done` reports `repainted`, which is
+    the number that says whether the in-place update is doing its job — a value
+    close to `bodies` means the skip-unchanged check has stopped working. Its
+    fields walk every body, so the whole call sits behind `debug.is_enabled()`.
+- **Raw fallback for a transcript the parser can't structure.** Claude's entry
+  shapes evolve, so `_show_session_log` treats an unexpected exception out of
+  `read_transcript` as "show it anyway": `read_raw_transcript` returns the log's
+  lines as written (blank lines dropped, each clipped to
+  `_MAX_RAW_LINE_CHARS`), `_log_parse_error` records `Type: message`, and
+  `_render_log_view` puts a `#log-raw-warning` banner above one `_log_body` per
+  line — so `/`, highlighting and `n`/`N` all work unchanged. A `ClaudeLogError`
+  is still a real error screen: there is nothing to fall back *to* when the file
+  cannot be read. `search.iter_hits` swallows the same class of failure per log,
+  so one bad transcript cannot end a scan over hundreds.
+  Both swallowing paths are the ones `--debug` most needs to see, since neither
+  is visible in the UI: the viewer logs `claude.transcript_unparsed` **with the
+  traceback** plus `tui.log_raw_fallback`, and `iter_hits` logs
+  `search.scan_failed` per log and a `failed=` count on `search.scan phase=done`.
+  An unknown entry shape is a parser bug to fix, not just a view to degrade.
+- **`check_action` makes the footer context-aware.** `s` and `r` show only on
+  the home screen, the mode toggles only where they toggle something, and `n`/`N`
+  only when a log search has matches to step through. Two details:
+  - **Return `False`, never `None`.** Textual's polarity is the opposite of what
+    it reads like: `False` drops a binding from the footer entirely, `None`
+    shows it greyed out.
+  - **`/` is two bindings on one key** — `search` ("Filter") and `log_search`
+    ("Search") — because a binding's description is static, and one action with
+    a switch inside it would label the log viewer's search "Filter". Textual's
+    `_check_bindings` walks every binding for a key and falls through the ones
+    whose `check_action` is false, so exactly one fires.
+  - **The mode toggles are `show=True`.** They were hidden from the footer back
+    when they would have appeared on every screen; `check_action` now confines
+    them to the two views they act on, and a Ctrl chord — unlike `n`/`N` —
+    still reaches the footer while the query `Input` holds focus, which is
+    exactly when someone needs to discover them.
+  - It is only consulted when something calls `refresh_bindings()`, which
+    `_clear_main`, `_show_home`, `_show_session_search`, `_render_log_view` and
+    `_apply_log_search` all do.
 - Finish flow: Push & Create PR (background Claude), Cherry-pick to base, Discard & Delete
 - Open terminal flow: sub-menu with "This window" (default; uses Textual's `App.suspend()` to pause the TUI, then runs `subprocess.run([$SHELL], cwd=session.path)` as a child process — when the user types `exit`, the TUI resumes on the session actions menu) and "New window" (spawns a new iTerm/Terminal/Linux emulator window via `open_terminal()`)
 - All view transitions are `async` — `await _clear_main()` then `await mount()`
@@ -493,7 +583,15 @@ Three custom exception types, all caught in `main()`:
 
 - **TUI loop with tmux detach**: The TUI runs in a `while True` loop. After tmux detach (subprocess.run returns), the loop restarts and the TUI reappears. The loop breaks when the user quits without selecting a session.
 - **Per-session tmux config**: Prefix defaults to `Ctrl-B` (tmux's standard default; configurable via `FUJIMOTO_TMUX_PREFIX`), status bar with shortcut hints — all set via `tmux set-option -t` so the user's global config is untouched. The attach flow is silent (no pre-attach banner) to reduce noise when launching sessions repeatedly.
-- **Global install via `uv tool`**: Requires `--force --reinstall` to rebuild the wheel from source. Plain `--force` reuses cached builds.
+- **Global install via `uv tool` needs `--no-cache`**: `--force` alone reuses a
+  cached build, and so, in practice, does `--force --reinstall` — uv's build
+  cache is keyed on the derived version, and `hatch-vcs` gives every commit in
+  a run of untagged work the same `X.Y.Z.dev0` string. The install then reports
+  success while leaving the previous wheel in place, which looks exactly like a
+  feature that doesn't work. Always
+  `uv tool install --force --reinstall --no-cache .`, and verify with
+  `fujimoto --version` (the `.devN` suffix moves) or by grepping the installed
+  `site-packages/fujimoto/cli.py` for something the change added.
 - **Remembering sessions across a restart**: `session_state.py` records every session as open at launch — in `main()`, **before** `launch_claude_in_tmux` blocks on the attach, so a host that dies mid-session still has a record to restore from. `_init_git_info` loads the pruned state into `_open_sessions`; `_stopped_records()` derives the open-but-not-running set for the current project; `_build_home_items` renders those in the *sessions* section as 🟠 and excludes them from *inactive worktrees*. A **Restore N stopped sessions** row relaunches them all via `create_session` (detached, resuming each path's latest transcript, attaching to none) — deliberately without `_apply_worktree_config`, which would run N `init` blocks up front; config still runs when the user actually attaches. `_end_session(session, terminate=...)` is the single handler behind both menu items and both outcomes of the `Ctrl-A x` prompt; it tolerates a `kill_session` failure only when `session_exists` confirms the session is already gone (otherwise marking a live session closed would hide it). `_do_delete_worktree` and `on_rename_submitted` keep the store honest via `mark_closed` / `rename`.
 - **Session metadata**: `.fujimoto/meta.json` stored in worktree directory records the base branch for cherry-pick targeting, the `source_root` (main repo) for project-config source resolution, and — for forks — `forked_from_session_id` plus `forked_from_worktree`. The `.fujimoto/` directory contains a `.gitignore` with `*` so its contents are automatically ignored by git.
 - **Project config (`.fujimoto.yaml`)**: An optional, committed per-project file (`project_config.py`) declaring files to copy/link into a worktree and init commands to run. Applied centrally in `main()`'s launch loop (parent process, **before** `tmux attach`) by `_apply_worktree_config(working_dir)`, for **every** worktree connection mode (new, reconnect-to-live, relaunch/resume) — so copy/link/init run on each connect, not just creation. `_do_create_and_launch` no longer applies config; it only creates the worktree and stores meta. Key mechanics:
@@ -628,6 +726,13 @@ Three custom exception types, all caught in `main()`:
     `_show_session_search(restore=True)` — re-rendering the collected
     `_search_hits` rather than throwing a completed scan away. Opening the menu
     from the home screen clears the flag, so that path still returns home.
+  - **A restore focuses the results list, not the query box, and puts the
+    highlight back on the row that was opened** (`_search_selected_index`,
+    recovered from the `sr-{index}` row id and cleared by `_clear_search_results`
+    when a fresh scan starts). Focusing the input on the way back meant every
+    Escape dropped the user at the top of the list, which makes walking a set of
+    results one at a time impossible. A restore with no hits still focuses the
+    input, since there is nothing to highlight.
 - **Home name filter rebuilds rows, not the screen**: `_show_home` mounts the panel;
   all row construction (and the population of `_session_map` /
   `_claude_state_snapshot`) lives in `_build_home_items()`, which applies the
@@ -823,6 +928,7 @@ Things discovered during development that are easy to forget:
 - **Claude encodes a project path by replacing `/` *and* `.` with `-`.** `/repo/.fujimoto/worktrees/x` is stored as `-repo--fujimoto-worktrees-x` — the double hyphen is the `/` plus the `.`. Encoding only the slashes made `get_sessions_for_path` miss every transcript for a worktree under the default `<repo>/.fujimoto/worktrees/` root (used whenever `FUJIMOTO_WORKTREE_ROOT` is unset), which showed up as "Resume previous session" being absent from every inactive worktree — and, from the same lookup, no Claude state icons, no fork, no session log and no search hits. Verify the rule against real data rather than assuming: read the `cwd` out of a transcript and compare it to the directory name holding it. Claude also honours `CLAUDE_CONFIG_DIR`, which moves `projects/` wholesale.
 - **`kill_session` raises when the session is already gone**, so any code path that ends a session has to decide what that means. `_end_session` re-raises only if `session_exists` still reports the session — a session that died between being listed and being acted on is already in the state the kill was aiming for, while a kill that genuinely failed must not silently mark a live session closed.
 - **Never splice arbitrary text into a console-markup string — assemble a `Content` instead.** Search snippets are raw transcript bytes cut at arbitrary offsets, and both of these silently corrupt the row: a fragment ending in `[` swallows the tag that follows it (`[dim]{"a": [[/]` renders the literal text `{"a": [[/]`), and a fragment ending in `\` escapes it (`[dim]path\[/]` renders `path[/]`). `rich.markup.escape` does **not** save you — it only escapes a `[` that still looks like a tag *in the fragment it is given*, so `escape('{"a": [')` returns the string unchanged. `Content.assemble(("text", "style"), ...)` never parses the text at all, resolves `$theme-variables` in the style, and — unlike a nested `[b]` inside `[dim]` — does not inherit the surrounding `dim` into the highlight. See `_render_snippet`.
+- **Anything built from transcript text must be `Content`, including a `Collapsible` title.** The `Content.assemble` rule below is usually stated about *bodies*, but a widget's title argument is parsed as markup too: `Collapsible(title=...)` hands the string to `Content.from_text(markup=True)`, so a `⚒ Bash  command: until [ "$(gh run list …` title raised `MarkupError: Expected markup value` and took the whole viewer down. The same applies to the viewer's header (a session title or first prompt) and the Claude-session picker rows (`_build_claude_session_items`), which mix a model-written title with a `[dim]` timestamp — that one is `Content.assemble`, since it is styled as well as arbitrary. Rule of thumb: if a string came out of a transcript, it reaches a widget as `Content` or not at all.
 - **`Static`/`Label` text in tests is read with `str(widget.render())`, not `.renderable`** — Textual 8 dropped the attribute. `render()` returns the *resolved* content, so console markup (`[dim]`, `[b]`) is gone from the string; assert on the plain text. And a `ListItem`'s own children are composed when the item mounts, so `item.query(Label)` needs an `await pilot.pause()` after a non-awaited `ListView.append`.
 - **A worker's `is_cancelled` is not a synchronisation primitive.** Cancelling a Textual worker (or letting `exclusive=True` supersede it) does not unwind work already queued on the event loop via `call_from_thread`. Anything a worker hands back must carry a generation token the handler checks — see `_search_token`. Bump the token *before* cancelling, so a batch in flight is stale from the moment the decision is made.
 - **OSC escape writes during a Textual run must go to `sys.__stdout__`, not `sys.stdout`.** Textual replaces `sys.stdout` with an internal capture while the app runs, so an OSC sequence (e.g. the `set_terminal_title` iTerm2/window-title escape) written to `sys.stdout` from inside a running app — such as `_init_git_info` updating the title on project switch — never reaches the terminal. `sys.__stdout__` stays connected to the real tty, so writing there works both before and during `app.run()`. This is why the session-manager title set at `main()` (pre-run) worked but the in-app update initially did not.

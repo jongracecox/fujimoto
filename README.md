@@ -56,10 +56,12 @@ uv tool install git+https://github.com/jongracecox/fujimoto.git
 Or install from a local clone:
 
 ```sh
-uv tool install --force --reinstall /path/to/this/repo
+uv tool install --force --reinstall --no-cache /path/to/this/repo
 ```
 
-Re-run with `--force --reinstall` after local code changes to pick up updates.
+Re-run with `--force --reinstall --no-cache` after local code changes to pick
+up updates. Without `--no-cache`, uv can reuse the previous build and report
+success while installing nothing new.
 
 ## Configuration
 
@@ -375,6 +377,10 @@ the mode then sticks until you change it or restart.
 | `Ctrl+R` / `Ctrl+T` / `Ctrl+I` | Toggle regex / message-text-vs-raw / match-case |
 | `Escape` | Back to the home screen (the query is kept for next time) |
 
+Backing out of a result's actions puts the highlight back on the result you
+opened, so working down a list of results doesn't drop you at the top of it
+every time.
+
 
 ### Three Session Types
 
@@ -412,10 +418,43 @@ collapses to a single `⚒ 10 tool calls  Bash, Read, Edit` row, which opens int
 the individual calls, each still folded. Opening a call shows its arguments and
 the output it produced — the result belongs to the call rather than being a row
 of its own. Tab to a row and press Enter, or click it, to expand. Long tool inputs and results are clipped, and sub-agent
-(sidechain) entries are omitted. Escape goes back — to the search results if
+(sidechain) entries are omitted. The viewer carries no hint line of its own —
+the footer already names the keys — so the transcript gets the full height.
+Escape goes back — to the search results if
 you got there from a transcript search,
 otherwise to the home screen. When a session has more than one transcript, a
 picker asks which to read.
+
+If a transcript turns out to hold an entry shape fujimoto doesn't recognise, the
+viewer says so and shows the raw log instead of refusing to open it. The raw
+view searches exactly like the normal one.
+
+#### Searching within the transcript — `/`
+
+Press `/` inside the viewer to search the conversation you are reading. Every
+match is highlighted in place, `n` steps to the next one and `N` to the
+previous, wrapping at either end; the status line above the transcript tracks
+where you are (`3 of 11 matching messages`). A match buried in a folded tool
+call opens that fold, so nothing is highlighted where you can't reach it.
+
+`Ctrl+R` and `Ctrl+I` toggle regex and case exactly as they do in the transcript
+search, and the current settings are shown alongside the match count. (`Ctrl+T`
+has no meaning here — the transcript has already been parsed into messages, so
+there is no raw JSON left to scan.) `Enter` hands focus to the transcript, where
+`n`/`N` and the arrow keys work; the first `Escape` clears the search, and the
+next one leaves the viewer.
+
+Searching runs in the background and only repaints the lines whose matches
+changed, so the transcript never rebuilds under you and the query box keeps
+focus while you type.
+
+| Key | While reading a session log |
+|-----|-----------------------------|
+| `/` | Search this transcript |
+| `n` / `N` | Next / previous match |
+| `Ctrl+R` / `Ctrl+I` | Toggle regex / match-case |
+| `Enter` (in the box) | Move focus to the transcript |
+| `Escape` | Clear the search, then leave the viewer |
 
 ### Fork Session
 
@@ -484,9 +523,16 @@ These options are set per-session and don't affect your global tmux config.
 | `/` | Filter sessions by name (home screen) |
 | `s` | Search inside session transcripts (home screen) |
 | `r` | Refresh the session list (home screen) |
+| `n` / `N` | Next / previous match (session log viewer) |
 | `Escape` | Back (or quit from home; clears an active filter first) |
 | `q` | Quit |
 | Arrow keys | Navigate |
+
+The footer only lists the keys that do something in the view you are in — `s`
+and `r` disappear once you leave the home screen, the `Ctrl+R`/`Ctrl+T`/`Ctrl+I` mode
+toggles appear only while you are searching, `n`/`N` only when a log search has
+matches to step through, and `/` is labelled *Filter* on the home screen but
+*Search* while you are reading a session log.
 
 ## Troubleshooting (`--debug`)
 

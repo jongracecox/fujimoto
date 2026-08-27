@@ -288,11 +288,26 @@ def iter_hits(
 
     batch: list[SearchHit] = []
     hits = 0
+    failed = 0
     scanned = 0
     for log in logs:
         if is_cancelled is not None and is_cancelled():
             return
-        hit = search_log(log, matcher)
+        try:
+            hit = search_log(log, matcher)
+        except Exception as exc:
+            # Entry shapes evolve, so one log the parser chokes on must not end
+            # a scan over hundreds of them. Dropping it is the honest outcome:
+            # the alternative is no results at all — but a transcript silently
+            # missing from a result set is exactly what a debug log is for.
+            debug.log(
+                "search.scan_failed",
+                log=debug.rp(log),
+                error=type(exc).__name__,
+                detail=debug.rv(str(exc)),
+            )
+            failed += 1
+            hit = None
         scanned += 1
         if hit is not None:
             batch.append(hit)
@@ -309,6 +324,7 @@ def iter_hits(
         logs=len(logs),
         scanned=scanned,
         hits=hits,
+        failed=failed,
         mode=matcher.mode,
     )
 

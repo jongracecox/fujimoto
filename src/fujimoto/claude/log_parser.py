@@ -588,6 +588,46 @@ def _block_text(block: dict) -> str:
     return ""
 
 
+# How much of a raw JSONL line the fallback view keeps. A single entry can be
+# a megabyte of tool output; the fallback exists to be read, not to be complete.
+_MAX_RAW_LINE_CHARS = 2000
+
+
+def read_raw_transcript(jsonl_path: Path) -> list[str]:
+    """The log's lines as written, for when structuring them fails.
+
+    Claude's entry shapes evolve, so a log the parser chokes on is a question
+    of when rather than if. Falling back to the bytes keeps such a transcript
+    readable (and searchable) instead of turning it into an error screen.
+    Raises ClaudeLogError if the file cannot be read at all — there is nothing
+    to fall back *to* in that case. Blank lines are dropped and very long ones
+    clipped; see `TestReadRawTranscript` for the details.
+    """
+    try:
+        text = jsonl_path.read_text(errors="replace")
+    except OSError as e:
+        raise ClaudeLogError(f"Cannot read {jsonl_path}: {e}")
+
+    lines: list[str] = []
+    clipped = 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if len(line) > _MAX_RAW_LINE_CHARS:
+            line = line[:_MAX_RAW_LINE_CHARS].rstrip() + " …"
+            clipped += 1
+        lines.append(line)
+    debug.log(
+        "claude.read_raw",
+        log=debug.rp(jsonl_path),
+        lines=len(lines),
+        clipped=clipped,
+        bytes=len(text),
+    )
+    return lines
+
+
 def read_transcript(jsonl_path: Path) -> list[TranscriptMessage]:
     """Read a Claude session log into an ordered list of messages.
 

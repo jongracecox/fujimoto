@@ -23,7 +23,7 @@ uv run fujimoto
 After making changes, reinstall to test the global `fujimoto` command:
 
 ```sh
-uv tool install --force --reinstall .
+uv tool install --force --reinstall --no-cache .
 ```
 
 Both `--force` and `--reinstall` are required — `--force` alone reuses cached wheel builds and won't pick up code changes.

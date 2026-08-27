@@ -11,6 +11,7 @@ from fujimoto.claude.log_parser import (
     get_claude_projects_dir,
     get_sessions_for_path,
     parse_session,
+    read_raw_transcript,
     read_transcript,
     session_dirs_for_path,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "iter_hits",
     "list_session_logs",
     "parse_session",
+    "read_raw_transcript",
     "read_transcript",
     "search_log",
     "session_dirs_for_path",
