@@ -2310,6 +2310,17 @@ class SessionApp(App):
             self.query_one("#search-results").focus()
 
     async def _clear_search_results(self) -> None:
+        """Drop the collected hits and empty the results list.
+
+        The token is bumped (and the scan cancelled) *before* awaiting the
+        clear, not after: `ListView.clear()` yields to the event loop, and a
+        batch the outgoing scan had already handed over with
+        `call_from_thread` is applied during that await if its token still
+        looks current — appending `sr-0` to the list the fresh scan is about
+        to append its own `sr-0` to, which Textual rejects as a duplicate id.
+        """
+        self._search_token += 1
+        self.workers.cancel_group(self, "transcript-search")
         self._search_hits = []
         self._search_selected_index = None
         if self.query("#search-results"):
@@ -2402,8 +2413,24 @@ class SessionApp(App):
         max_width = max(20, self.size.width - 12)
         for hit in hits:
             index = len(self._search_hits)
+            try:
+                results.append(self._build_search_result_item(index, hit, max_width))
+            except Exception as e:
+                # Whatever is wrong with one row — arbitrary transcript bytes
+                # reaching a widget, or an id Textual won't take — costs that
+                # result, not the whole session. `_search_hits` is appended to
+                # only after the row is mounted, so the ids stay in step with
+                # it and a later restore still resolves.
+                self._search_result_map.pop(f"sr-{index}", None)
+                debug.log_exception("tui.search_row_failed", e)
+                debug.log(
+                    "tui.search_row_dropped",
+                    index=index,
+                    session=debug.rid(hit.session.session_id),
+                    error=type(e).__name__,
+                )
+                continue
             self._search_hits.append(hit)
-            results.append(self._build_search_result_item(index, hit, max_width))
         if results.index is None and len(results) > 0:
             results.index = 0
 
@@ -3020,7 +3047,27 @@ class SessionApp(App):
         self._log_searching = False
         self._log_query = ""
         self._log_error = None
-        await self._render_log_view()
+        try:
+            await self._render_log_view()
+        except Exception as e:
+            # Rendering is the other half of the same risk: a transcript can
+            # parse cleanly and still carry text that a widget refuses (a
+            # `Collapsible` title is parsed as markup, for one). The raw view
+            # builds nothing but `Static`s, so it is the floor to fall to.
+            debug.log_exception("tui.log_render_failed", e)
+            if parse_error is not None:
+                # Already the raw view — there is no simpler thing to draw.
+                await self._show_error(f"Could not display this log: {e}")
+                return
+            try:
+                raw_lines = read_raw_transcript(cs.jsonl_path)
+            except ClaudeLogError as read_error:
+                await self._show_error(str(read_error))
+                return
+            self._log_messages = []
+            self._log_raw_lines = raw_lines
+            self._log_parse_error = f"{type(e).__name__}: {e}"
+            await self._render_log_view()
 
     async def _render_log_view(self) -> None:
         """Mount the log viewer for `_log_session`, unhighlighted.
