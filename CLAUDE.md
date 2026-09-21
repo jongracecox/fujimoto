@@ -151,12 +151,21 @@ conflate them:
 | intent | tmux | icon | home-screen section |
 |---|---|---|---|
 | open | running | 🟢 | sessions |
+| open, parked | stopped | 🅿️ | sessions |
 | open | stopped | 🟠 | sessions |
 | closed / no record | stopped | ⚫ | inactive worktrees |
 
+Within the *sessions* section rows are ordered running, parked, then stopped.
+
 **Stop** ends the claude process and keeps the record open (the transcript is
 untouched, so the conversation resumes; an in-flight task is interrupted).
-**Terminate** ends it and deletes the record. Anything that kills a session
+**Park** is the same operation with `SessionRecord.parked` set: a *flavour* of
+stopped, not a third intent, so everything keyed off `is_stopped` (resume,
+terminate, the sessions section) keeps working. It differs only in the icon and
+in being skipped by **Restore N stopped sessions** — a session put down on
+purpose should not come back with the ones a crash took away. `mark_open`
+writes a fresh record, so launching or resuming un-parks; that is the only exit
+short of terminating. **Terminate** ends it and deletes the record. Anything that kills a session
 *outside* fujimoto — host restart, `tmux kill-session`, a closed window, `exit`
 in the pane — leaves the record alone, so it comes back as stopped. That is the
 whole restart-recovery mechanism: no boot-time detection, no heuristics.
@@ -236,14 +245,17 @@ as JSON in `~/.cache/fujimoto/sessions.json` (same graceful-degradation pattern
 as `settings.py`: missing file, unreadable cache or corrupt JSON yield an empty
 state, never an error):
 - `SessionRecord` dataclass: `cwd`, `project`, `session_type`, `branch`,
-  `claude_session_id`, `last_seen`. Only `cwd` is required — every other field
-  defaults, so a record written by a different fujimoto version still loads.
+  `claude_session_id`, `parked`, `last_seen`. Only `cwd` is required — every
+  other field defaults, so a record written by a different fujimoto version
+  still loads (`parked` is coerced with `bool()` on load for exactly that
+  reason).
 - Keyed by **tmux session name**, so worktree, direct and ad hoc sessions are
   covered uniformly and a record outlives its worktree directory.
 - `load_state()` / `save_state()`, `mark_open(...)` (every launch and
   reconnect; a reconnect passing no id keeps the id recorded at first launch),
-  `mark_closed(name)`, `touch(name, claude_session_id=None)`,
-  `rename(old, new)`, `prune()`.
+  `mark_closed(name)`, `touch(name, claude_session_id=None, *, parked=None)`
+  (`parked` is tri-state: `None` leaves the flag alone, so a plain stop of a
+  parked session doesn't silently un-park it), `rename(old, new)`, `prune()`.
 - **A record's presence means "open"; its absence means "closed"** — which is
   also what a session fujimoto has never launched looks like. `mark_closed`
   therefore just deletes the record, and there is no reconciliation pass and
@@ -407,7 +419,7 @@ responsible for running it off the event loop.
 - `SessionApp` — main app class with CSS styling
 - Module-level helpers: `_claude_state_label(state)`, `_relative_time(dt)`, `_get_claude_sessions(root, worktrees)`, `_is_fork_worktree(path)`, `_build_fork_system_prompt(project, working_dir, parent_worktree, base_branch)`, `_fit_snippet(snippet, max_width)` / `_render_snippet(snippet, max_width)` (search-result snippet rendering — see the `Content.assemble` gotcha), `_match_spans(text, matcher)` / `_highlight(text, spans)` / `_log_body(text, folds)` (log-viewer match highlighting, split so the regex half can run in a worker thread and only the `Content` half touches widgets), `_tool_collapsible(title, …)` (a `Collapsible` whose title is `Content`, never markup)
 - Instance helpers: `_build_session_label(session, state_suffix)` — the single source of truth for session row text (including the 🍴 fork marker), used by `_show_home`'s render of direct *and* worktree rows and by `_poll_session_states` for in-place updates; `_build_claude_session_items(sessions, prefix)` — shared row rendering for the resume (`rp-*`), fork (`fp-*`) and log-viewer (`lp-*`) pickers; `_matching_worktree(path)` — the project worktree a path refers to, compared by `resolve()`; `_direct_session_cwd(tmux_name)` — where a `direct-N` row really runs and on what branch (memoized in `_direct_cwd_cache`); `_resume_target(project, cwd, session=None)` — the tmux name and session type a resume should use
-- Views: home (sessions list), session actions submenu, terminate/stop prompt (`#terminate-prompt`, opened by a pending `close` from `Ctrl-A x`; Terminate / Stop / Cancel with Terminate highlighted so Enter matches the `confirm-before` it replaces, and Cancel re-attaching via `_launch_target` so it costs nothing), finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), fork title form, fork branch select, fork session picker, session log picker + read-only log viewer, conflict resolution, project switcher (with autocomplete filter), tmux install, error
+- Views: home (sessions list), session actions submenu, terminate/park/stop prompt (`#terminate-prompt`, opened by a pending `close` from `Ctrl-A x`; Terminate / Park / Stop / Cancel with Terminate highlighted so Enter matches the `confirm-before` it replaces, and Cancel re-attaching via `_launch_target` so it costs nothing), finish flow, confirm dialog, create form, branch select (3 options), branch picker (filterable list), fork title form, fork branch select, fork session picker, session log picker + read-only log viewer, conflict resolution, project switcher (with autocomplete filter), tmux install, error
 - Transcript search (`s`) — see the dedicated section below.
 - Home screen name filter: `/` arms a filter box (`#home-search`) mounted above
   `#home-list`. `action_search` reveals + focuses it; `Input.Changed` re-renders
@@ -430,7 +442,7 @@ responsible for running it off the event loop.
   `_search_query`. Guarded on `_on_home`, so `r` is inert in other views.
 - Home screen sections: actions ("Restore N stopped sessions" when any exist, "New worktree session", "New session in X", "Ad hoc session"), sessions — running 🟢 *and* stopped 🟠 together, since the circle colour carries the distinction (with Claude state indicators on the running ones), inactive worktrees, previous Claude sessions (resumable, capped at 5), switch project
 - Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
-- Session actions submenu (in order): for active sessions, Connect → Fork session → Resume previous session; for inactive worktrees, Resume previous session → Fork session → Launch (resume is the more common action when picking an idle worktree). Then: View session log (whenever the path has a previous Claude session), Open terminal, Open in VS Code, Rename, Stop session (active only), Terminate session (active or stopped), Finish (worktree only), Cancel. Stop and Terminate are two menu items rather than one item plus a prompt — a menu is already a choice — but both route into the single `_end_session(session, terminate=...)` handler, which is also what the `Ctrl-A x` prompt calls. Claude-session items show just "Resume" + View session log + Open terminal/VS Code + Cancel. "Fork session" is always inserted at index 1 (`items.insert(1, ...)`) so its position holds across both layouts.
+- Session actions submenu (in order): for active sessions, Connect → Fork session → Resume previous session; for inactive worktrees, Resume previous session → Fork session → Launch (resume is the more common action when picking an idle worktree). Then: View session log (whenever the path has a previous Claude session), Open terminal, Open in VS Code, Rename, Park session and Stop session (active only), Terminate session (active or stopped), Finish (worktree only), Cancel. Stop and Terminate are two menu items rather than one item plus a prompt — a menu is already a choice — but both route into the single `_end_session(session, terminate=...)` handler, which is also what the `Ctrl-A x` prompt calls. Claude-session items show just "Resume" + View session log + Open terminal/VS Code + Cancel. "Fork session" is always inserted at index 1 (`items.insert(1, ...)`) so its position holds across both layouts.
 - "Resume previous session" auto-launches the sole candidate when only one previous Claude session exists for the path, skipping the picker. Two or more sessions still show the picker.
 - Fork flow: `sa-fork` → `#fork-title-input` → `#fork-branch-list` (parent branch (default) / parent's base / another branch → the shared `_show_branch_picker`) → conversation picker `#fork-picker` (`fp-{i}`, only when >1 candidate) → the shared `_finalize_create` / `_do_create_and_launch`. Offered for worktree *and* direct sessions that have at least one previous Claude session.
 - Session log viewer: `sa-viewlog` → `_show_log_picker` → `_show_session_log`. The
@@ -607,7 +619,7 @@ Three custom exception types, all caught in `main()`:
   `uv tool install --force --reinstall --no-cache .`, and verify with
   `fujimoto --version` (the `.devN` suffix moves) or by grepping the installed
   `site-packages/fujimoto/cli.py` for something the change added.
-- **Remembering sessions across a restart**: `session_state.py` records every session as open at launch — in `main()`, **before** `launch_claude_in_tmux` blocks on the attach, so a host that dies mid-session still has a record to restore from. `_init_git_info` loads the pruned state into `_open_sessions`; `_stopped_records()` derives the open-but-not-running set for the current project; `_build_home_items` renders those in the *sessions* section as 🟠 and excludes them from *inactive worktrees*. A **Restore N stopped sessions** row relaunches them all via `create_session` (detached, resuming each path's latest transcript, attaching to none) — deliberately without `_apply_worktree_config`, which would run N `init` blocks up front; config still runs when the user actually attaches. `_end_session(session, terminate=...)` is the single handler behind both menu items and both outcomes of the `Ctrl-A x` prompt; it tolerates a `kill_session` failure only when `session_exists` confirms the session is already gone (otherwise marking a live session closed would hide it). `_do_delete_worktree` and `on_rename_submitted` keep the store honest via `mark_closed` / `rename`.
+- **Remembering sessions across a restart**: `session_state.py` records every session as open at launch — in `main()`, **before** `launch_claude_in_tmux` blocks on the attach, so a host that dies mid-session still has a record to restore from. `_init_git_info` loads the pruned state into `_open_sessions`; `_stopped_records()` derives the open-but-not-running set for the current project; `_build_home_items` renders those in the *sessions* section as 🟠 (🅿️ when `parked`, sorted after the running rows and before the stopped ones) and excludes them from *inactive worktrees*. A **Restore N stopped sessions** row relaunches the unparked ones via `create_session` (detached, resuming each path's latest transcript, attaching to none) — deliberately without `_apply_worktree_config`, which would run N `init` blocks up front; config still runs when the user actually attaches. `_end_session(session, terminate=..., park=...)` is the single handler behind every menu item and every outcome of the `Ctrl-A x` prompt; it tolerates a `kill_session` failure only when `session_exists` confirms the session is already gone (otherwise marking a live session closed would hide it). `_do_delete_worktree` and `on_rename_submitted` keep the store honest via `mark_closed` / `rename`.
 - **Session metadata**: `.fujimoto/meta.json` stored in worktree directory records the base branch for cherry-pick targeting, the `source_root` (main repo) for project-config source resolution, and — for forks — `forked_from_session_id` plus `forked_from_worktree`. The `.fujimoto/` directory contains a `.gitignore` with `*` so its contents are automatically ignored by git.
 - **Project config (`.fujimoto.yaml`)**: An optional, committed per-project file (`project_config.py`) declaring files to copy/link into a worktree and init commands to run. Applied centrally in `main()`'s launch loop (parent process, **before** `tmux attach`) by `_apply_worktree_config(working_dir)`, for **every** worktree connection mode (new, reconnect-to-live, relaunch/resume) — so copy/link/init run on each connect, not just creation. `_do_create_and_launch` no longer applies config; it only creates the worktree and stores meta. Key mechanics:
   - **Config is read from the source root (main clone), not the worktree.** `.fujimoto.yaml` is a local, uncommitted file in the main clone, so it isn't present in a worktree checkout — `_apply_worktree_config` calls `load_project_config(source_root)`. (`--create-config` writes it to the main clone's root.)

@@ -195,7 +195,7 @@ via `FUJIMOTO_META_KEY`) to enter a one-shot "fujimoto mode", then:
 | `f` | Fork this session — detaches back to the fujimoto TUI and opens the **Fork session** flow for this worktree, so you get the usual name prompt, base-branch menu and conversation picker. |
 | `s` | Stop this session — closes claude but keeps the session in your list as 🟠, ready to resume. No prompt. |
 | `d` | Detach the tmux session (returns you to the fujimoto TUI). |
-| `x` | End this session. With a split open it kills just that pane (with confirmation), as before. With claude alone in the window it detaches to the fujimoto TUI and asks whether to **terminate** (default) or merely **stop** it. |
+| `x` | End this session. With a split open it kills just that pane (with confirmation), as before. With claude alone in the window it detaches to the fujimoto TUI and asks whether to **terminate** (default), **park** 🅿️ or merely **stop** 🟠 it. |
 | `[` | Enter copy mode (scrollback / selection). |
 | `?` | Flash the binding cheatsheet in the status bar. |
 
@@ -269,6 +269,7 @@ fujimoto
 ───── sessions ─────
 🟢 20260309-cleanup-ui          (worktree)
 🟢 direct-1                     (direct @ main)
+🅿️ 20260305-spike-caching       (worktree)
 🟠 20260307-parser-rewrite      (worktree)
 🟠 direct-2                     (direct @ main)
 ───── inactive worktrees ─────
@@ -289,6 +290,7 @@ what you had open instead:
 | | Meaning |
 |---|---|
 | 🟢 | Running right now. |
+| 🅿️ | **Parked** — stopped on purpose and set aside. Resume it whenever you like; **Restore** leaves it where it is. |
 | 🟠 | **Stopped** — not running, but you never told fujimoto you were done with it. Resume it and carry on. |
 | ⚫ | An inactive worktree: terminated through fujimoto, or never launched from it. |
 
@@ -298,20 +300,28 @@ host restart, `tmux kill-session` from another terminal, closing the window,
 `exit` in the pane — leaves it stopped and resumable. There is no guessing
 about why a session went away.
 
+Sessions are listed running first, then parked, then stopped, so the ones
+still in flight stay at the top.
+
 **Restore** appears at the top of the home screen whenever something is
 stopped. It relaunches every stopped session in the project at once, each
 resuming its most recent conversation, and attaches to none of them — pick the
-one you want to sit in from the list.
+one you want to sit in from the list. Parked sessions are skipped: you put them
+down deliberately, unlike the ones a restart took away.
 
 **Stop** ends the claude process but keeps the session history: the transcript
 is untouched and the conversation resumes where it left off. Any task claude
 was part-way through is interrupted, so stop at a natural break.
 
+**Park** does exactly what Stop does, but flags the session so it shows as 🅿️
+and sits out the bulk restore — for work you are consciously shelving rather
+than pausing. Launching or resuming a parked session un-parks it.
+
 #### Filtering sessions by name — `/`
 
 Press `/` on the home screen to open a filter box, then type. Matching is live
 and case-insensitive, against session names and branch names, and covers the
-**sessions** (running and stopped), **inactive worktrees** and **previous claude
+**sessions** (running, parked and stopped), **inactive worktrees** and **previous claude
 sessions** lists at once. While a filter is active the action rows
 (`+ New …`, settings, switch project) are hidden so only matches remain.
 
@@ -396,14 +406,14 @@ Select any session to see contextual options:
 
 | Session State | Options |
 |--------------|---------|
-| Active worktree | Connect, Fork session, Resume previous session, View session log, Stop, Terminate, Finish |
+| Active worktree | Connect, Fork session, Resume previous session, View session log, Park, Stop, Terminate, Finish |
 | Stopped worktree | Resume previous session, Fork session, View session log, Launch, Terminate, Finish |
 | Inactive worktree | Resume previous session, Fork session, View session log, Launch, Finish |
-| Active direct | Connect, Fork session, Resume previous session, View session log, Stop, Terminate |
+| Active direct | Connect, Fork session, Resume previous session, View session log, Park, Stop, Terminate |
 
-**Stop** keeps the session in your list as 🟠; **Terminate** marks it done and
-drops it to ⚫. Both close claude — the difference is only whether fujimoto
-offers it back to you.
+**Stop** keeps the session in your list as 🟠 and **Park** keeps it as 🅿️;
+**Terminate** marks it done and drops it to ⚫. All three close claude — the
+difference is only whether fujimoto offers it back to you, and how eagerly.
 
 All session types also offer **Open terminal**, **Open in VS Code** and
 **Rename**.

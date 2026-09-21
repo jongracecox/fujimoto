@@ -6,6 +6,11 @@ any other way — an out-of-band ``tmux kill-session``, a closed terminal window
 an ``exit`` in the pane, a tmux crash, a host restart — keeps its record and is
 shown as *stopped*, ready to resume.
 
+*Parking* is a user-chosen flavour of stopped: the record stays open exactly as
+a stop leaves it, but it is flagged so the home screen draws it blue and the
+bulk restore leaves it alone — a session set aside on purpose should not come
+back with the ones a crash took away.
+
 That single rule is the whole design: there is no boot-time detection and no
 reconciliation pass. A record's presence means "open"; its absence means
 "closed", which is also what a session fujimoto has never launched looks like.
@@ -44,6 +49,10 @@ class SessionRecord:
     session_type: str = ""
     branch: str = ""
     claude_session_id: str | None = None
+    # Parked is a *flavour* of stopped, not a third intent: the record is open
+    # either way, and the flag only changes which icon the home screen draws
+    # and whether "Restore stopped sessions" sweeps it up.
+    parked: bool = False
     last_seen: str = ""
 
     @property
@@ -87,7 +96,14 @@ def load_state() -> dict[str, SessionRecord]:
 
     records: dict[str, SessionRecord] = {}
     skipped = 0
-    fields = {"cwd", "project", "session_type", "branch", "claude_session_id"}
+    fields = {
+        "cwd",
+        "project",
+        "session_type",
+        "branch",
+        "claude_session_id",
+        "parked",
+    }
     for name, raw in data.items():
         if not isinstance(raw, dict) or not isinstance(raw.get("cwd"), str):
             # A malformed record is silently dropped, which otherwise looks
@@ -96,6 +112,9 @@ def load_state() -> dict[str, SessionRecord]:
             debug.log("session_state.skipped", session=debug.rv(name))
             continue
         kwargs = {k: v for k, v in raw.items() if k in fields}
+        # A record written by a fujimoto that predates parking has no flag, and
+        # a hand-edited one may have the wrong type; either way it is not parked.
+        kwargs["parked"] = bool(kwargs.get("parked"))
         records[name] = SessionRecord(
             **kwargs,
             last_seen=raw.get("last_seen") or "",
@@ -135,7 +154,11 @@ def mark_open(
     branch: str = "",
     claude_session_id: str | None = None,
 ) -> None:
-    """Record that a session is open. Called on every launch and reconnect."""
+    """Record that a session is open. Called on every launch and reconnect.
+
+    Launching clears the parked flag: a session you are sitting in is not
+    parked, whatever it was before.
+    """
     state = load_state()
     existing = state.get(tmux_name)
     # A reconnect knows nothing new about the conversation, so don't let it
@@ -172,8 +195,17 @@ def mark_closed(tmux_name: str) -> None:
         save_state(state)
 
 
-def touch(tmux_name: str, claude_session_id: str | None = None) -> None:
-    """Refresh a record without changing its intent (used when stopping)."""
+def touch(
+    tmux_name: str,
+    claude_session_id: str | None = None,
+    *,
+    parked: bool | None = None,
+) -> None:
+    """Refresh a record without changing its intent (used when stopping).
+
+    `parked` is tri-state: `None` leaves the flag alone, so an ordinary stop of
+    an already-parked session does not quietly un-park it.
+    """
     state = load_state()
     record = state.get(tmux_name)
     if record is None:
@@ -184,10 +216,13 @@ def touch(tmux_name: str, claude_session_id: str | None = None) -> None:
         session=debug.rv(tmux_name),
         found=True,
         claude_session=claude_session_id or "unchanged",
+        parked="unchanged" if parked is None else parked,
     )
     record.last_seen = _now()
     if claude_session_id is not None:
         record.claude_session_id = claude_session_id
+    if parked is not None:
+        record.parked = parked
     save_state(state)
 
 
