@@ -129,6 +129,7 @@ ICON_GEAR = "\u2699"
 ICON_ZZZ = "\U0001f4a4"
 ICON_GREEN_CIRCLE = "\U0001f7e2"
 ICON_ORANGE_CIRCLE = "\U0001f7e0"
+ICON_PARKED = "\U0001f17f\ufe0f"
 ICON_BLACK_CIRCLE = "\u26ab"
 ICON_HLINE = "\u2500"
 ICON_WIZARD = "\U0001f9d9\U0001f3fd\u200d\u2642\ufe0f"
@@ -1112,6 +1113,9 @@ class SessionInfo:
     # Not running, but the user never terminated it through fujimoto — so it
     # is still theirs to come back to. Renders orange, resumes by default.
     is_stopped: bool = field(default=False)
+    # Stopped on purpose and set aside. Renders blue and is skipped by the bulk
+    # restore; in every other respect it behaves exactly like a stopped session.
+    is_parked: bool = field(default=False)
     claude_session_id: str | None = field(default=None)
     claude_state: SessionState | None = field(default=None)
     is_fork: bool = field(default=False)
@@ -1563,7 +1567,9 @@ class SessionApp(App):
     def _stopped_records(self) -> dict[str, session_state.SessionRecord]:
         """Open records for this project with no live tmux session behind them.
 
-        These are the sessions a restart (or any out-of-band kill) took away.
+        These are the sessions a restart (or any out-of-band kill) took away,
+        plus the ones the user parked. Both render here; only the unparked ones
+        are swept up by "Restore stopped sessions".
         Ad hoc sessions are excluded because they are not project-scoped and so
         never appear on a project's home screen.
         """
@@ -1732,11 +1738,12 @@ class SessionApp(App):
         claimed_claude_ids: set[str] = set()
 
         stopped_records = self._stopped_records()
+        restorable = {n: r for n, r in stopped_records.items() if not r.parked}
 
         items: list[ListItem] = []
         if not searching:
-            if stopped_records:
-                count = len(stopped_records)
+            if restorable:
+                count = len(restorable)
                 plural = "s" if count != 1 else ""
                 items.append(
                     ListItem(
@@ -1850,8 +1857,11 @@ class SessionApp(App):
             label_text = self._build_session_label(info, state_suffix)
             active_items.append(ListItem(Label(label_text, markup=True), id=item_id))
 
-        # Stopped sessions sit in the same section as running ones: the circle
-        # colour carries the distinction, so there is no need to split them out.
+        # Stopped and parked sessions sit in the same section as running ones:
+        # the icon carries the distinction. They are collected separately only
+        # so the section reads running, then parked, then stopped.
+        parked_items: list[ListItem] = []
+        stopped_items: list[ListItem] = []
         for sname, rec in sorted(stopped_records.items()):
             display_name = sname.split("/", 1)[1] if "/" in sname else sname
             is_worktree = rec.session_type == "worktree"
@@ -1877,6 +1887,7 @@ class SessionApp(App):
                 tmux_session=sname,
                 is_active=False,
                 is_stopped=True,
+                is_parked=rec.parked,
                 branch=branch,
                 claude_session_id=cs_id,
                 claude_state=cs.state if cs else None,
@@ -1884,7 +1895,10 @@ class SessionApp(App):
             )
             self._session_map[item_id] = info
             label_text = self._build_session_label(info, "")
-            active_items.append(ListItem(Label(label_text, markup=True), id=item_id))
+            bucket = parked_items if rec.parked else stopped_items
+            bucket.append(ListItem(Label(label_text, markup=True), id=item_id))
+
+        active_items += parked_items + stopped_items
 
         if active_items:
             items.append(
@@ -2631,18 +2645,26 @@ class SessionApp(App):
                 f"{ICON_GREEN_CIRCLE} {session.name}{fork}"
                 f"  [dim]({BRANCH_ICON} {session.branch})[/]{state_suffix}"
             )
-        icon = ICON_ORANGE_CIRCLE if session.is_stopped else ICON_BLACK_CIRCLE
+        if session.is_parked:
+            icon = ICON_PARKED
+        elif session.is_stopped:
+            icon = ICON_ORANGE_CIRCLE
+        else:
+            icon = ICON_BLACK_CIRCLE
         return f"{icon} {session.name}{fork}  [dim]({BRANCH_ICON} {session.branch})[/]"
 
     # -- Stopping and terminating --
 
-    async def _end_session(self, session: SessionInfo, *, terminate: bool) -> None:
+    async def _end_session(
+        self, session: SessionInfo, *, terminate: bool, park: bool = False
+    ) -> None:
         """Kill a session's tmux session, and set its intent.
 
-        The single handler behind both menu items and both outcomes of the
+        The single handler behind every menu item and every outcome of the
         `Ctrl-A x` prompt. Stopping leaves the record open so the session comes
-        back orange; terminating forgets it, which is the only way a session
-        stops being open.
+        back orange; parking does the same but flags the record, so it comes
+        back blue and the bulk restore skips it; terminating forgets it, which
+        is the only way a session stops being open.
         """
         try:
             if session.is_active:
@@ -2659,7 +2681,13 @@ class SessionApp(App):
             if terminate:
                 session_state.mark_closed(session.tmux_session)
             else:
-                session_state.touch(session.tmux_session, session.claude_session_id)
+                # `park=False` on a plain stop would un-park an already-parked
+                # session, so only a park ever writes the flag.
+                session_state.touch(
+                    session.tmux_session,
+                    session.claude_session_id,
+                    parked=True if park else None,
+                )
             self._init_git_info()
             await self._show_home()
         except (TmuxError, ConfigError, GitError) as e:
@@ -2674,9 +2702,9 @@ class SessionApp(App):
         await self._show_terminate_prompt(target)
 
     async def _show_terminate_prompt(self, target: LaunchTarget) -> None:
-        """Terminate / stop / cancel, defaulting to terminate.
+        """Terminate / park / stop / cancel, defaulting to terminate.
 
-        Three options, not two: the `confirm-before` this replaces could be
+        More than two options: the `confirm-before` this replaces could be
         answered `n`, and losing that would be a regression. Cancel re-attaches
         immediately rather than dropping the user on the home screen, so it is
         a true no-op.
@@ -2697,6 +2725,14 @@ class SessionApp(App):
                             markup=True,
                         ),
                         id="tp-terminate",
+                    ),
+                    ListItem(
+                        Label(
+                            f"Park  [dim]— set it aside "
+                            f"{ICON_PARKED}, history preserved[/]",
+                            markup=True,
+                        ),
+                        id="tp-park",
                     ),
                     ListItem(
                         Label(
@@ -2745,17 +2781,24 @@ class SessionApp(App):
             branch="",
         )
         self._pending_close_target = None
-        await self._end_session(session, terminate=event.item.id == "tp-terminate")
+        await self._end_session(
+            session,
+            terminate=event.item.id == "tp-terminate",
+            park=event.item.id == "tp-park",
+        )
 
     async def _restore_stopped_sessions(self) -> None:
         """Relaunch every stopped session in this project, attaching to none.
 
         Each comes back resuming its most recent conversation, so a forced
-        restart costs the user one keypress. Project config is deliberately not
-        applied here — it runs when the user actually attaches to one.
+        restart costs the user one keypress. Parked sessions are left alone —
+        they were set aside deliberately, unlike the ones a restart took away.
+        Project config is deliberately not applied here — it runs when the user
+        actually attaches to one.
         """
         failures: list[str] = []
-        for name, rec in sorted(self._stopped_records().items()):
+        records = {n: r for n, r in self._stopped_records().items() if not r.parked}
+        for name, rec in sorted(records.items()):
             sessions = get_sessions_for_path(rec.path)
             resume_id = sessions[0].session_id if sessions else rec.claude_session_id
             try:
@@ -2840,6 +2883,7 @@ class SessionApp(App):
         # already a choice. Both land in one handler, as the tmux prompt does.
         if session.session_type != "claude":
             if session.is_active:
+                items.append(ListItem(Label("Park session"), id="sa-park"))
                 items.append(ListItem(Label("Stop session"), id="sa-stop"))
             if session.is_active or session.is_stopped:
                 items.append(ListItem(Label("Terminate session"), id="sa-terminate"))
@@ -2864,6 +2908,8 @@ class SessionApp(App):
             )
             if session.is_active:
                 status_label = "active"
+            elif session.is_parked:
+                status_label = "parked"
             elif session.is_stopped:
                 status_label = "stopped"
             else:
@@ -4168,8 +4214,12 @@ class SessionApp(App):
             await self._show_fork_title_form(session)
         elif action == "sa-viewlog":
             await self._show_log_picker(session)
-        elif action in ("sa-stop", "sa-terminate"):
-            await self._end_session(session, terminate=action == "sa-terminate")
+        elif action in ("sa-park", "sa-stop", "sa-terminate"):
+            await self._end_session(
+                session,
+                terminate=action == "sa-terminate",
+                park=action == "sa-park",
+            )
         elif action == "sa-terminal":
             await self._show_terminal_mode(session)
         elif action == "sa-vscode":
