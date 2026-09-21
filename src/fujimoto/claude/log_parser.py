@@ -494,6 +494,21 @@ def get_sessions_for_path(project_path: Path) -> list[ClaudeSession]:
             except ClaudeLogError:
                 failed += 1
                 continue
+            except Exception as exc:
+                # An entry shape the parser doesn't know is a bug to fix, and
+                # the traceback is how it gets fixed — but this runs on the
+                # home screen's render path, so raising here would take the
+                # whole TUI down over one unreadable transcript. Same contract
+                # as `search.iter_hits`: drop the log, say so in the log.
+                debug.log_exception("claude.session_unparsed", exc)
+                debug.log(
+                    "claude.session_unparsed",
+                    log=debug.rp(jsonl_file),
+                    error=type(exc).__name__,
+                    detail=debug.rv(str(exc)),
+                )
+                failed += 1
+                continue
 
     sessions.sort(key=lambda s: s.last_activity, reverse=True)
     latest = sessions[0].session_id if sessions else "none"

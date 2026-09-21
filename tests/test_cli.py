@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rich.console import Console
+from rich.markup import MarkupError
 
 import pytest
 
@@ -5819,6 +5820,58 @@ class TestTranscriptSearchModeToggles:
 
 class TestTranscriptSearchBatches:
     @pytest.mark.asyncio
+    async def test_a_batch_in_flight_when_results_are_cleared_is_dropped(self) -> None:
+        """The crash this guards: `DuplicateIds` on `sr-0` mid-search.
+
+        `ListView.clear()` yields, so a batch the outgoing scan had already
+        handed to the event loop lands *during* the clear. Bumping the token
+        after that await left it looking current, so it mounted `sr-0` into
+        the list the fresh scan then appended its own `sr-0` to.
+        """
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                stale = app._search_token
+                app._apply_search_batch(stale, 1, 2, (_make_hit("aaa"),))
+                await app._clear_search_results()
+                # Queued before the clear, delivered after it.
+                app._apply_search_batch(stale, 2, 2, (_make_hit("bbb"),))
+                app._apply_search_batch(app._search_token, 1, 2, (_make_hit("ccc"),))
+                results = app.query_one("#search-results", ListView)
+                assert [item.id for item in results.children] == ["sr-0"]
+                assert [h.session.session_id for h in app._search_hits] == ["ccc"]
+
+    @pytest.mark.asyncio
+    async def test_a_row_that_cannot_be_mounted_is_skipped(self) -> None:
+        """One unrenderable result costs that result, not the session."""
+        app = SessionApp()
+        with _patch_git_info():
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.pause()
+                build = app._build_search_result_item
+
+                def explode(index, hit, max_width):
+                    if hit.session.session_id == "bad":
+                        raise ValueError("unmountable")
+                    return build(index, hit, max_width)
+
+                with patch.object(app, "_build_search_result_item", explode):
+                    app._apply_search_batch(
+                        app._search_token,
+                        2,
+                        2,
+                        (_make_hit("bad"), _make_hit("good")),
+                    )
+                results = app.query_one("#search-results", ListView)
+                assert [item.id for item in results.children] == ["sr-0"]
+                assert [h.session.session_id for h in app._search_hits] == ["good"]
+                # The row id still indexes into the hits it was built from.
+                assert app._search_result_map["sr-0"].claude_session_id == "good"
+
+    @pytest.mark.asyncio
     async def test_batch_appends_rows_and_reports_progress(self) -> None:
         app = SessionApp()
         with _patch_git_info():
@@ -8212,6 +8265,53 @@ class TestRawTranscriptFallback:
                 await pilot.pause()
                 assert len(app._log_matches) == 1
                 assert app._log_match_index == 0
+
+    @pytest.mark.asyncio
+    async def test_a_render_crash_falls_back_to_the_raw_log(
+        self, tmp_path: Path
+    ) -> None:
+        """Parsing is only half the risk — a widget can reject the text too."""
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl",
+            [{"type": "user", "message": {"content": "the needle"}}],
+        )
+        with (
+            _patch_git_info(worktrees=[wt]),
+            patch(
+                "fujimoto.cli._render_transcript",
+                side_effect=MarkupError("Expected markup value"),
+            ),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._show_session_log(_log_session(log, wt))
+                await pilot.pause()
+                assert len(app.query("#log-panel")) == 1
+                warning = str(app.query_one("#log-raw-warning", Static).visual)
+                assert "MarkupError" in warning
+                assert '"content": "the needle"' in self._rows(app)[0]
+
+    @pytest.mark.asyncio
+    async def test_a_raw_render_crash_is_an_error_screen(self, tmp_path: Path) -> None:
+        """Nothing simpler left to draw once the raw view itself fails."""
+        wt = tmp_path / "20260309-test"
+        log = _write_log(
+            tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "hi"}}]
+        )
+        with (
+            _patch_git_info(worktrees=[wt]),
+            patch("fujimoto.cli.read_transcript", side_effect=TypeError("boom")),
+            patch("fujimoto.cli._log_body", side_effect=ValueError("nope")),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._show_session_log(_log_session(log, wt))
+                await pilot.pause()
+                assert len(app.query("#log-panel")) == 0
+                assert "Could not display this log" in " ".join(
+                    str(w.visual) for w in app.query("#main > Static")
+                )
 
     @pytest.mark.asyncio
     async def test_an_unreadable_file_is_still_an_error(self, tmp_path: Path) -> None:

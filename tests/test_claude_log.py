@@ -457,6 +457,39 @@ class TestGetSessionsForPath:
         assert len(sessions) == 1
         assert sessions[0].session_id == "good"
 
+    def test_an_unexpected_parser_crash_is_skipped_too(self, tmp_path: Path) -> None:
+        """A shape the parser doesn't know must not take the home screen down.
+
+        `get_sessions_for_path` runs on every render, so an `AttributeError`
+        out of one transcript would crash the TUI rather than costing that one
+        log — the same contract `search.iter_hits` keeps.
+        """
+        encoded = "-test-project"
+        session_dir = tmp_path / "projects" / encoded
+        session_dir.mkdir(parents=True)
+        (session_dir / "good.jsonl").write_text(
+            _make_entry(timestamp="2026-03-09T12:00:00.000Z", text="Done.") + "\n"
+        )
+        (session_dir / "bad.jsonl").write_text("{}\n")
+
+        real = parse_session
+
+        def explode(path: Path):
+            if path.name == "bad.jsonl":
+                raise AttributeError("'list' object has no attribute 'get'")
+            return real(path)
+
+        with (
+            patch(
+                "fujimoto.claude.log_parser.get_claude_projects_dir",
+                return_value=tmp_path / "projects",
+            ),
+            patch("fujimoto.claude.log_parser.parse_session", explode),
+        ):
+            sessions = get_sessions_for_path(Path("/test/project"))
+
+        assert [s.session_id for s in sessions] == ["good"]
+
 
 class TestClaudeSessionIsActive:
     def _build_session(self, state: SessionState) -> ClaudeSession:

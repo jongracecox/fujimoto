@@ -534,6 +534,21 @@ responsible for running it off the event loop.
   traceback** plus `tui.log_raw_fallback`, and `iter_hits` logs
   `search.scan_failed` per log and a `failed=` count on `search.scan phase=done`.
   An unknown entry shape is a parser bug to fix, not just a view to degrade.
+- **Rendering is the other half of the same risk, and falls back the same way.**
+  A transcript can parse cleanly and still carry text a widget refuses — a
+  `Collapsible` title is parsed as markup, so a stray `[` raised `MarkupError`
+  out of `_render_log_view`, well past the parse. `_show_session_log` therefore
+  wraps the render too: an exception from it drops `_log_messages`, sets
+  `_log_parse_error` and re-renders raw, which builds nothing but `Static`s. A
+  failure of the *raw* render is an error screen (`tui.log_render_failed` in the
+  debug log), since there is nothing simpler left to draw.
+- **A parse failure must not reach the home render path.**
+  `get_sessions_for_path` runs on every render, and it caught only
+  `ClaudeLogError` — so an `AttributeError` from one unknown entry shape took
+  the whole TUI down rather than costing that one transcript. It now catches
+  `Exception` per log, counting it into the same `failed=` field and logging
+  `claude.session_unparsed` **with the traceback**. Same contract as
+  `iter_hits`, for the same reason.
 - **`check_action` makes the footer context-aware.** `s` and `r` show only on
   the home screen, the mode toggles only where they toggle something, and `n`/`N`
   only when a log search has matches to step through. Two details:
@@ -674,6 +689,16 @@ Three custom exception types, all caught in `main()`:
     token; `_apply_search_batch` / `_search_failed` drop anything carrying a stale
     one. `_start_transcript_search` bumps *before* cancelling the group, and
     `_stop_transcript_search` (called from `_clear_main`) bumps again and cancels.
+    **`_clear_search_results` bumps it too, before awaiting `ListView.clear()`** —
+    that await is a yield point, and a batch queued on the event loop before it
+    was otherwise applied *during* the clear, mounting an `sr-0` that collided
+    with the fresh scan's own (`DuplicateIds`, taking the app down mid-search).
+  - **A row that won't mount costs that row, not the session.**
+    `_apply_search_batch` builds and appends each result inside a `try`, drops
+    the `_search_result_map` entry and logs `tui.search_row_failed` (with the
+    traceback) on failure, and appends to `_search_hits` only *after* the row is
+    mounted — so the `sr-{index}` ids stay in step with the hits a restore
+    indexes into.
   - Measured on 302 transcripts / 222 MB (every log on one machine, i.e. far
     beyond a single project): first results at ~50 ms, full scan 1.2–2.2 s, all
     off the event loop. A realistic single project is a handful of logs and
@@ -930,7 +955,7 @@ Things discovered during development that are easy to forget:
 - **Never splice arbitrary text into a console-markup string — assemble a `Content` instead.** Search snippets are raw transcript bytes cut at arbitrary offsets, and both of these silently corrupt the row: a fragment ending in `[` swallows the tag that follows it (`[dim]{"a": [[/]` renders the literal text `{"a": [[/]`), and a fragment ending in `\` escapes it (`[dim]path\[/]` renders `path[/]`). `rich.markup.escape` does **not** save you — it only escapes a `[` that still looks like a tag *in the fragment it is given*, so `escape('{"a": [')` returns the string unchanged. `Content.assemble(("text", "style"), ...)` never parses the text at all, resolves `$theme-variables` in the style, and — unlike a nested `[b]` inside `[dim]` — does not inherit the surrounding `dim` into the highlight. See `_render_snippet`.
 - **Anything built from transcript text must be `Content`, including a `Collapsible` title.** The `Content.assemble` rule below is usually stated about *bodies*, but a widget's title argument is parsed as markup too: `Collapsible(title=...)` hands the string to `Content.from_text(markup=True)`, so a `⚒ Bash  command: until [ "$(gh run list …` title raised `MarkupError: Expected markup value` and took the whole viewer down. The same applies to the viewer's header (a session title or first prompt) and the Claude-session picker rows (`_build_claude_session_items`), which mix a model-written title with a `[dim]` timestamp — that one is `Content.assemble`, since it is styled as well as arbitrary. Rule of thumb: if a string came out of a transcript, it reaches a widget as `Content` or not at all.
 - **`Static`/`Label` text in tests is read with `str(widget.render())`, not `.renderable`** — Textual 8 dropped the attribute. `render()` returns the *resolved* content, so console markup (`[dim]`, `[b]`) is gone from the string; assert on the plain text. And a `ListItem`'s own children are composed when the item mounts, so `item.query(Label)` needs an `await pilot.pause()` after a non-awaited `ListView.append`.
-- **A worker's `is_cancelled` is not a synchronisation primitive.** Cancelling a Textual worker (or letting `exclusive=True` supersede it) does not unwind work already queued on the event loop via `call_from_thread`. Anything a worker hands back must carry a generation token the handler checks — see `_search_token`. Bump the token *before* cancelling, so a batch in flight is stale from the moment the decision is made.
+- **A worker's `is_cancelled` is not a synchronisation primitive.** Cancelling a Textual worker (or letting `exclusive=True` supersede it) does not unwind work already queued on the event loop via `call_from_thread`. Anything a worker hands back must carry a generation token the handler checks — see `_search_token`. Bump the token *before* cancelling, so a batch in flight is stale from the moment the decision is made. **And before every `await` on the teardown path, not just the cancel** — `_clear_search_results` awaits `ListView.clear()`, which yields, so a queued batch was applied *during* the clear while its token still looked current. It mounted `sr-0` into the list the fresh scan then appended its own `sr-0` to, and Textual's `DuplicateIds` took the whole app down mid-search.
 - **OSC escape writes during a Textual run must go to `sys.__stdout__`, not `sys.stdout`.** Textual replaces `sys.stdout` with an internal capture while the app runs, so an OSC sequence (e.g. the `set_terminal_title` iTerm2/window-title escape) written to `sys.stdout` from inside a running app — such as `_init_git_info` updating the title on project switch — never reaches the terminal. `sys.__stdout__` stays connected to the real tty, so writing there works both before and during `app.run()`. This is why the session-manager title set at `main()` (pre-run) worked but the in-app update initially did not.
 
 ## Releases
