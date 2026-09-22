@@ -8834,6 +8834,41 @@ class TestSessionOrdering:
                 ]
 
     @pytest.mark.asyncio
+    async def test_legacy_direct_record_falls_back_to_last_seen(self) -> None:
+        """A record from before `created` must not sink below stamped rows.
+
+        A direct session has no directory age to borrow, so without this every
+        pre-upgrade one would sort to the bottom of the running group until it
+        was next relaunched.
+        """
+        old = session_state.SessionRecord(
+            cwd="/fake/repo",
+            project="test-proj",
+            session_type="direct",
+            last_seen="2026-09-22T18:00:00+00:00",
+        )
+        new = session_state.SessionRecord(
+            cwd="/fake/repo",
+            project="test-proj",
+            session_type="direct",
+            created="2026-09-22T09:00:00+00:00",
+        )
+        with _patch_git_info(
+            sessions=["test-proj/direct-1", "test-proj/direct-2"],
+            open_sessions={
+                "test-proj/direct-1": old,
+                "test-proj/direct-2": new,
+            },
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert self._row_ids(app) == [
+                    "ds-test-proj--direct-1",
+                    "ds-test-proj--direct-2",
+                ]
+
+    @pytest.mark.asyncio
     async def test_a_record_stamp_beats_the_directory_time(
         self, tmp_path: Path
     ) -> None:
