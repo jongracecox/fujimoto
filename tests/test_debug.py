@@ -851,7 +851,7 @@ class TestSessionStateInstrumentation:
         assert "session_state.mark_closed session=proj/ghost removed=False" in text
         assert "session_state.save" in text
 
-    def test_touch_and_rename_are_logged(self, tmp_path: Path, _state: Path) -> None:
+    def test_stop_and_rename_are_logged(self, tmp_path: Path, _state: Path) -> None:
         from fujimoto import session_state
 
         session_state.mark_open(
@@ -859,15 +859,16 @@ class TestSessionStateInstrumentation:
         )
         log_dir = tmp_path / "logs"
         debug.enable(redact=False, log_dir=log_dir)
-        session_state.touch("proj/wt", claude_session_id="abc123")
-        session_state.touch("proj/ghost")
+        session_state.mark_stopped("proj/wt", claude_session_id="abc123")
+        session_state.mark_stopped("proj/ghost", kind=session_state.StopKind.PARKED)
         session_state.rename("proj/wt", "proj/renamed")
         session_state.rename("proj/ghost", "proj/nope")
         debug.disable()
         text = self._log_text(log_dir)
-        assert "session_state.touch session=proj/wt found=True" in text
+        assert "session_state.mark_stopped session=proj/wt found=True" in text
         assert "claude_session=abc123" in text
-        assert "session_state.touch session=proj/ghost found=False" in text
+        assert "kind=stopped" in text
+        assert "session_state.mark_stopped session=proj/ghost found=False" in text
         assert "old=proj/wt new=proj/renamed found=True" in text
         assert "old=proj/ghost new=proj/nope found=False" in text
 

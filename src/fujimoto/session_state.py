@@ -4,18 +4,20 @@ Fujimoto is the only thing that ever changes a session's *intent*. A session
 the user terminated through fujimoto is forgotten; a session that disappeared
 any other way — an out-of-band ``tmux kill-session``, a closed terminal window,
 an ``exit`` in the pane, a tmux crash, a host restart — keeps its record and is
-shown as *stopped*, ready to resume.
-
-*Parking* is a user-chosen flavour of stopped: the record stays open exactly as
-a stop leaves it, but it is flagged so the home screen draws it blue and the
-bulk restore leaves it alone — a session set aside on purpose should not come
-back with the ones a crash took away.
+shown as *recovered*, ready to resume.
 
 That single rule is the whole design: there is no boot-time detection and no
 reconciliation pass. A record's presence means "open"; its absence means
 "closed", which is also what a session fujimoto has never launched looks like.
 Terminating therefore just deletes the record, and the store stays small
 without needing to age anything out.
+
+The same rule is what makes *recovery* detectable. Every way a session can be
+ended on purpose goes through fujimoto and writes a `StopKind` saying so, so a
+record with no live tmux session and no such stamp was taken away by something
+outside fujimoto — a host restart, a closed window, an out-of-band
+`tmux kill-session`. That is `StopKind.RECOVERED`, and it is the *default*
+rather than a thing anyone detects.
 
 State lives in ``~/.cache/fujimoto/sessions.json``, keyed by tmux session name
 so worktree, direct and ad hoc sessions are all covered uniformly — and so a
@@ -29,6 +31,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
 
 from fujimoto import debug
@@ -36,6 +39,37 @@ from fujimoto import debug
 
 def _state_path() -> Path:
     return Path.home() / ".cache" / "fujimoto" / "sessions.json"
+
+
+class StopKind(StrEnum):
+    """Why a session is not running — as far as fujimoto was ever told.
+
+    `STOPPED` and `PARKED` are both user decisions, and differ only in
+    intention: parking says "I mean to come back to this", stopping says "I am
+    done for now, this may not be needed again". `RECOVERED` is the absence of
+    a decision, which is why it is the default — nothing but a deliberate stop
+    ever writes a kind, so a record wearing the default lost its session to
+    something outside fujimoto.
+    """
+
+    RECOVERED = "recovered"
+    STOPPED = "stopped"
+    PARKED = "parked"
+
+    @classmethod
+    def from_raw(cls, raw: object) -> StopKind:
+        """Coerce a stored value, defaulting to `RECOVERED`.
+
+        A record written by a fujimoto that predates this field, or edited by
+        hand into nonsense, reads as recovered — the same reading a record
+        gets when nobody stopped it.
+        """
+        if isinstance(raw, str):
+            try:
+                return cls(raw)
+            except ValueError:
+                pass
+        return cls.RECOVERED
 
 
 @dataclass
@@ -49,10 +83,10 @@ class SessionRecord:
     session_type: str = ""
     branch: str = ""
     claude_session_id: str | None = None
-    # Parked is a *flavour* of stopped, not a third intent: the record is open
-    # either way, and the flag only changes which icon the home screen draws
-    # and whether "Restore stopped sessions" sweeps it up.
-    parked: bool = False
+    # How the session last stopped, if it is not running. The record is open
+    # either way — this only picks the icon the home screen draws, and which
+    # section it draws it in.
+    stop_kind: StopKind = StopKind.RECOVERED
     last_seen: str = ""
 
     @property
@@ -102,7 +136,6 @@ def load_state() -> dict[str, SessionRecord]:
         "session_type",
         "branch",
         "claude_session_id",
-        "parked",
     }
     for name, raw in data.items():
         if not isinstance(raw, dict) or not isinstance(raw.get("cwd"), str):
@@ -112,11 +145,13 @@ def load_state() -> dict[str, SessionRecord]:
             debug.log("session_state.skipped", session=debug.rv(name))
             continue
         kwargs = {k: v for k, v in raw.items() if k in fields}
-        # A record written by a fujimoto that predates parking has no flag, and
-        # a hand-edited one may have the wrong type; either way it is not parked.
-        kwargs["parked"] = bool(kwargs.get("parked"))
         records[name] = SessionRecord(
             **kwargs,
+            # `parked` is what a fujimoto from before recovery wrote; honour it
+            # so an upgrade doesn't re-label a shelved session as recovered.
+            stop_kind=StopKind.from_raw(
+                raw.get("stop_kind") or (StopKind.PARKED if raw.get("parked") else None)
+            ),
             last_seen=raw.get("last_seen") or "",
         )
     debug.log_once(
@@ -156,8 +191,9 @@ def mark_open(
 ) -> None:
     """Record that a session is open. Called on every launch and reconnect.
 
-    Launching clears the parked flag: a session you are sitting in is not
-    parked, whatever it was before.
+    Launching resets the stop kind: a session you are sitting in has not been
+    stopped at all, whatever it was before. Which also means that if this one
+    disappears without fujimoto being told, it reads as recovered.
     """
     state = load_state()
     existing = state.get(tmux_name)
@@ -195,34 +231,37 @@ def mark_closed(tmux_name: str) -> None:
         save_state(state)
 
 
-def touch(
+def mark_stopped(
     tmux_name: str,
     claude_session_id: str | None = None,
     *,
-    parked: bool | None = None,
+    kind: StopKind = StopKind.STOPPED,
 ) -> None:
-    """Refresh a record without changing its intent (used when stopping).
+    """Record that the user stopped a session, keeping it open and resumable.
 
-    `parked` is tri-state: `None` leaves the flag alone, so an ordinary stop of
-    an already-parked session does not quietly un-park it.
+    Writing the kind is the whole point: it is the stamp that distinguishes a
+    session the user put down from one something else took away. It always
+    overwrites, so a park followed by a stop reads as stopped — the record
+    should say what the user last decided.
     """
     state = load_state()
     record = state.get(tmux_name)
     if record is None:
-        debug.log("session_state.touch", session=debug.rv(tmux_name), found=False)
+        debug.log(
+            "session_state.mark_stopped", session=debug.rv(tmux_name), found=False
+        )
         return
     debug.log(
-        "session_state.touch",
+        "session_state.mark_stopped",
         session=debug.rv(tmux_name),
         found=True,
         claude_session=claude_session_id or "unchanged",
-        parked="unchanged" if parked is None else parked,
+        kind=kind.value,
     )
     record.last_seen = _now()
     if claude_session_id is not None:
         record.claude_session_id = claude_session_id
-    if parked is not None:
-        record.parked = parked
+    record.stop_kind = kind
     save_state(state)
 
 

@@ -29,6 +29,7 @@ from fujimoto.cli import (
     ICON_GEAR,
     ICON_ORANGE_CIRCLE,
     ICON_PARKED,
+    ICON_RECOVERED,
     ICON_SHIELD,
     LaunchTarget,
     SessionApp,
@@ -51,6 +52,7 @@ from fujimoto.cli import (
     main,
 )
 from fujimoto import session_state
+from fujimoto.session_state import StopKind
 from fujimoto.config import ConfigError
 from fujimoto.git import GitError
 from fujimoto.tmux import TmuxError
@@ -4966,7 +4968,7 @@ def _record(
     project: str = "test-proj",
     session_type: str = "worktree",
     claude_session_id: str | None = None,
-    parked: bool = False,
+    stop_kind: StopKind = StopKind.STOPPED,
 ):
     """Build an open-session record whose directory actually exists."""
     from fujimoto.session_state import SessionRecord
@@ -4979,7 +4981,7 @@ def _record(
         session_type=session_type,
         branch=f"worktree/{name}" if session_type == "worktree" else "feat/test",
         claude_session_id=claude_session_id,
-        parked=parked,
+        stop_kind=stop_kind,
     )
 
 
@@ -5013,7 +5015,6 @@ class TestStoppedSessions:
                 await pilot.pause()
                 assert app._session_map["wt-wt-a"].is_active is True
                 assert app._session_map["wt-wt-a"].is_stopped is False
-                assert "Restore" not in _list_text(app)
 
     @pytest.mark.asyncio
     async def test_stopped_worktree_leaves_inactive_section(
@@ -5048,8 +5049,7 @@ class TestStoppedSessions:
             app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.pause()
-                assert app._stopped_records() == {}
-                assert "Restore" not in _list_text(app)
+                assert app._idle_records() == {}
 
     @pytest.mark.asyncio
     async def test_stopped_direct_session_renders(self, tmp_path: Path) -> None:
@@ -5086,13 +5086,13 @@ class TestStoppedSessions:
 class TestParkedSessions:
     @pytest.mark.asyncio
     async def test_renders_blue_p(self, tmp_path: Path) -> None:
-        records = {"test-proj/wt-a": _record(tmp_path, parked=True)}
+        records = {"test-proj/wt-a": _record(tmp_path, stop_kind=StopKind.PARKED)}
         with _patch_git_info(open_sessions=records):
             app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.pause()
                 info = app._session_map["wt-wt-a"]
-                assert info.is_parked is True
+                assert info.stop_kind is StopKind.PARKED
                 # Parked is a flavour of stopped, so everything that keys off
                 # is_stopped (resume, terminate, the sessions section) still works.
                 assert info.is_stopped is True
@@ -5102,7 +5102,9 @@ class TestParkedSessions:
     async def test_sorts_between_running_and_stopped(self, tmp_path: Path) -> None:
         records = {
             "test-proj/wt-live": _record(tmp_path, name="wt-live"),
-            "test-proj/wt-park": _record(tmp_path, name="wt-park", parked=True),
+            "test-proj/wt-park": _record(
+                tmp_path, name="wt-park", stop_kind=StopKind.PARKED
+            ),
             "test-proj/wt-stop": _record(tmp_path, name="wt-stop"),
         }
         with _patch_git_info(
@@ -5119,31 +5121,6 @@ class TestParkedSessions:
                     if i.id and i.id.startswith("wt-")
                 ]
                 assert rows == ["wt-wt-live", "wt-wt-park", "wt-wt-stop"]
-
-    @pytest.mark.asyncio
-    async def test_restore_row_ignores_parked(self, tmp_path: Path) -> None:
-        records = {
-            "test-proj/wt-a": _record(tmp_path, name="wt-a"),
-            "test-proj/wt-b": _record(tmp_path, name="wt-b", parked=True),
-        }
-        with _patch_git_info(open_sessions=records):
-            with patch("fujimoto.cli.create_session") as create:
-                app = SessionApp()
-                async with app.run_test() as pilot:
-                    await pilot.pause()
-                    assert "Restore 1 stopped session" in _list_text(app)
-                    await app._restore_stopped_sessions()
-        create.assert_called_once()
-        assert create.call_args.args[0] == "test-proj/wt-a"
-
-    @pytest.mark.asyncio
-    async def test_all_parked_hides_the_restore_row(self, tmp_path: Path) -> None:
-        records = {"test-proj/wt-a": _record(tmp_path, parked=True)}
-        with _patch_git_info(open_sessions=records):
-            app = SessionApp()
-            async with app.run_test() as pilot:
-                await pilot.pause()
-                assert "Restore" not in _list_text(app)
 
     @pytest.mark.asyncio
     async def test_park_flags_the_record_and_launch_clears_it(
@@ -5173,19 +5150,22 @@ class TestParkedSessions:
                 with patch("fujimoto.cli.kill_session") as kill:
                     await app._end_session(session, terminate=False, park=True)
                 kill.assert_called_once_with("test-proj/wt-a")
-                assert session_state.load_state()["test-proj/wt-a"].parked is True
+                record = session_state.load_state()["test-proj/wt-a"]
+                assert record.stop_kind is StopKind.PARKED
 
-                # Relaunching is how a session leaves the parked state.
+                # Relaunching is how a session leaves the parked state — and
+                # arms recovery, so a crash from here reads as recovered.
                 session_state.mark_open(
                     "test-proj/wt-a",
                     cwd=tmp_path,
                     project="test-proj",
                     session_type="worktree",
                 )
-                assert session_state.load_state()["test-proj/wt-a"].parked is False
+                record = session_state.load_state()["test-proj/wt-a"]
+                assert record.stop_kind is StopKind.RECOVERED
 
     @pytest.mark.asyncio
-    async def test_stopping_a_parked_session_leaves_the_flag(
+    async def test_stopping_a_parked_session_records_the_new_choice(
         self, tmp_path: Path
     ) -> None:
         from fujimoto import session_state
@@ -5209,10 +5189,13 @@ class TestParkedSessions:
                     project="test-proj",
                     session_type="worktree",
                 )
-                session_state.touch("test-proj/wt-a", parked=True)
+                session_state.mark_stopped("test-proj/wt-a", kind=StopKind.PARKED)
                 with patch("fujimoto.cli.kill_session"):
                     await app._end_session(session, terminate=False)
-                assert session_state.load_state()["test-proj/wt-a"].parked is True
+                # Park and stop are both statements of intent, so the latest
+                # one wins rather than the first one sticking.
+                record = session_state.load_state()["test-proj/wt-a"]
+                assert record.stop_kind is StopKind.STOPPED
 
     @pytest.mark.asyncio
     async def test_actions_menu_offers_park_and_says_parked(
@@ -5245,8 +5228,7 @@ class TestParkedSessions:
                     path=tmp_path / "wt-a",
                     tmux_session="test-proj/wt-a",
                     is_active=False,
-                    is_stopped=True,
-                    is_parked=True,
+                    stop_kind=StopKind.PARKED,
                     branch="worktree/wt-a",
                 )
                 await app._show_session_actions(parked)
@@ -5257,93 +5239,110 @@ class TestParkedSessions:
                 assert "parked" in info
 
 
-class TestRestoreStoppedSessions:
+class TestRecoveredSessions:
+    """A session nobody stopped — the laptop restarted, the window closed."""
+
     @pytest.mark.asyncio
-    async def test_row_shows_count_and_pluralises(self, tmp_path: Path) -> None:
-        records = {"test-proj/wt-a": _record(tmp_path)}
+    async def test_renders_with_the_recovered_icon(self, tmp_path: Path) -> None:
+        records = {"test-proj/wt-a": _record(tmp_path, stop_kind=StopKind.RECOVERED)}
         with _patch_git_info(open_sessions=records):
             app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.pause()
-                assert "Restore 1 stopped session" in _list_text(app)
-                assert "sessions" not in _list_text(app).split("Restore 1")[1][:20]
-
-        records["test-proj/wt-b"] = _record(tmp_path, name="wt-b")
-        with _patch_git_info(open_sessions=records):
-            app = SessionApp()
-            async with app.run_test() as pilot:
-                await pilot.pause()
-                assert "Restore 2 stopped sessions" in _list_text(app)
+                info = app._session_map["wt-wt-a"]
+                assert info.stop_kind is StopKind.RECOVERED
+                # Still stopped for every purpose that matters: resume,
+                # terminate and the session actions menu all key off this.
+                assert info.is_stopped is True
+                label = app._build_session_label(info, "")
+                assert label.startswith(ICON_RECOVERED)
 
     @pytest.mark.asyncio
-    async def test_creates_detached_sessions_resuming_conversations(
+    async def test_gets_its_own_section_above_the_sessions(
         self, tmp_path: Path
     ) -> None:
-        records = {"test-proj/wt-a": _record(tmp_path, claude_session_id="rec-id")}
-        cs = _fake_claude_session(tmp_path / "wt-a", session_id="live-id")
-        with _patch_git_info(open_sessions=records, claude_sessions_fn=lambda _p: [cs]):
-            with patch("fujimoto.cli.create_session") as create:
-                app = SessionApp()
-                async with app.run_test() as pilot:
-                    await pilot.pause()
-                    await app._restore_stopped_sessions()
-        create.assert_called_once()
-        args, kwargs = create.call_args
-        assert args[0] == "test-proj/wt-a"
-        # The live transcript wins over the id recorded at launch time.
-        assert kwargs["resume_session_id"] == "live-id"
-        assert kwargs["system_prompt"] is None
+        records = {
+            "test-proj/wt-gone": _record(
+                tmp_path, name="wt-gone", stop_kind=StopKind.RECOVERED
+            ),
+            "test-proj/wt-stop": _record(tmp_path, name="wt-stop"),
+        }
+        with _patch_git_info(open_sessions=records):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                text = _list_text(app)
+                assert "───── recovered ─────" in text
+                assert text.index("───── recovered ─────") < text.index(
+                    "───── sessions ─────"
+                )
+                rows = [
+                    i.id
+                    for i in app.query("#home-list").first(ListView).children
+                    if i.id and i.id.startswith("wt-")
+                ]
+                assert rows == ["wt-wt-gone", "wt-wt-stop"]
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_recorded_id(self, tmp_path: Path) -> None:
-        records = {"test-proj/wt-a": _record(tmp_path, claude_session_id="rec-id")}
+    async def test_no_section_when_nothing_was_recovered(self, tmp_path: Path) -> None:
+        records = {"test-proj/wt-a": _record(tmp_path, stop_kind=StopKind.PARKED)}
         with _patch_git_info(open_sessions=records):
-            with patch("fujimoto.cli.create_session") as create:
-                app = SessionApp()
-                async with app.run_test() as pilot:
-                    await pilot.pause()
-                    await app._restore_stopped_sessions()
-        assert create.call_args.kwargs["resume_session_id"] == "rec-id"
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert "recovered" not in _list_text(app)
 
     @pytest.mark.asyncio
-    async def test_no_conversation_launches_fresh(self, tmp_path: Path) -> None:
-        records = {"test-proj/wt-a": _record(tmp_path)}
-        with _patch_git_info(open_sessions=records):
-            with patch("fujimoto.cli.create_session") as create:
-                app = SessionApp()
-                async with app.run_test() as pilot:
-                    await pilot.pause()
-                    await app._restore_stopped_sessions()
-        assert create.call_args.kwargs["resume_session_id"] is None
-        assert create.call_args.kwargs["system_prompt"] is not None
+    async def test_a_launch_that_is_never_stopped_reads_as_recovered(
+        self, tmp_path: Path
+    ) -> None:
+        # The whole detection mechanism: nothing but a deliberate stop ever
+        # writes a kind, so a session that just vanished keeps the default.
+        session_state.mark_open(
+            "test-proj/wt-a",
+            cwd=tmp_path,
+            project="test-proj",
+            session_type="worktree",
+        )
+        record = session_state.load_state()["test-proj/wt-a"]
+        assert record.stop_kind is StopKind.RECOVERED
 
     @pytest.mark.asyncio
-    async def test_selecting_the_row_restores(self, tmp_path: Path) -> None:
-        records = {"test-proj/wt-a": _record(tmp_path)}
+    async def test_the_bulk_restore_row_is_gone(self, tmp_path: Path) -> None:
+        # It could only restart the claude processes, not the terminals and
+        # window layout the user actually lost, so it never earned its row.
+        records = {"test-proj/wt-a": _record(tmp_path, stop_kind=StopKind.RECOVERED)}
         with _patch_git_info(open_sessions=records):
-            with patch("fujimoto.cli.create_session") as create:
-                app = SessionApp()
-                async with app.run_test() as pilot:
-                    await pilot.pause()
-                    event = SimpleNamespace(item=SimpleNamespace(id="action-restore"))
-                    await app.on_home_selected(event)  # type: ignore[arg-type]
-        create.assert_called_once()
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert "Restore" not in _list_text(app)
+                ids = [i.id for i in app.query("#home-list").first(ListView).children]
+                assert "action-restore" not in ids
 
     @pytest.mark.asyncio
-    async def test_failure_is_surfaced(self, tmp_path: Path) -> None:
-        records = {"test-proj/wt-a": _record(tmp_path)}
-        with _patch_git_info(open_sessions=records):
-            with patch("fujimoto.cli.create_session", side_effect=RuntimeError("nope")):
-                app = SessionApp()
-                async with app.run_test() as pilot:
-                    await pilot.pause()
-                    await app._restore_stopped_sessions()
-                    await pilot.pause()
-                    text = " ".join(
-                        str(w.render())
-                        for w in app.query("#main").first().query(Static)
+    async def test_actions_menu_says_recovered(self, tmp_path: Path) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await app._show_session_actions(
+                    SessionInfo(
+                        name="wt-a",
+                        session_type="worktree",
+                        project="test-proj",
+                        path=tmp_path / "wt-a",
+                        tmux_session="test-proj/wt-a",
+                        is_active=False,
+                        stop_kind=StopKind.RECOVERED,
+                        branch="worktree/wt-a",
                     )
-                    assert "Could not restore" in text
+                )
+                await pilot.pause()
+                info = " ".join(
+                    str(w.render()) for w in app.query("#main").first().query(Static)
+                )
+                assert "recovered" in info
 
 
 class TestStopAndTerminate:
@@ -5355,7 +5354,7 @@ class TestStopAndTerminate:
             path=tmp_path / "wt-a",
             tmux_session="test-proj/wt-a",
             is_active=active,
-            is_stopped=stopped,
+            stop_kind=StopKind.STOPPED if stopped else None,
             branch="worktree/wt-a",
             claude_session_id="cid",
         )
@@ -5627,7 +5626,8 @@ class TestTerminatePrompt:
                     event = SimpleNamespace(item=SimpleNamespace(id="tp-park"))
                     await app.on_terminate_prompt_selected(event)  # type: ignore[arg-type]
                 kill.assert_called_once_with("test-proj/wt-a")
-                assert session_state.load_state()["test-proj/wt-a"].parked is True
+                record = session_state.load_state()["test-proj/wt-a"]
+                assert record.stop_kind is StopKind.PARKED
 
     @pytest.mark.asyncio
     async def test_cancel_reattaches(self, tmp_path: Path) -> None:

@@ -262,10 +262,11 @@ fujimoto
 ### Home Screen
 
 ```
-🟠 Restore 2 stopped sessions
 + New worktree session
 + New session in <project>
 + Ad hoc session
+───── recovered ─────
+🔄 20260306-flaky-test-hunt     (worktree)
 ───── sessions ─────
 🟢 20260309-cleanup-ui          (worktree)
 🟢 direct-1                     (direct @ main)
@@ -290,40 +291,44 @@ what you had open instead:
 | | Meaning |
 |---|---|
 | 🟢 | Running right now. |
-| 🅿️ | **Parked** — stopped on purpose and set aside. Resume it whenever you like; **Restore** leaves it where it is. |
-| 🟠 | **Stopped** — not running, but you never told fujimoto you were done with it. Resume it and carry on. |
+| 🔄 | **Recovered** — it was running, and something outside fujimoto took it away. Resume it and carry on. |
+| 🅿️ | **Parked** — set aside on purpose, and you mean to come back to it. |
+| 🟠 | **Stopped** — you ended it deliberately; it may not be needed again. Still resumable. |
 | ⚫ | An inactive worktree: terminated through fujimoto, or never launched from it. |
 
 The rule is simply that fujimoto is the only thing that changes a session's
-status. Terminating one *through fujimoto* marks it done; anything else — a
-host restart, `tmux kill-session` from another terminal, closing the window,
-`exit` in the pane — leaves it stopped and resumable. There is no guessing
-about why a session went away.
+status, and it only changes it when *you* do. Terminating a session through
+fujimoto marks it done; stopping or parking one records which of those you
+chose. Anything else — a host restart, `tmux kill-session` from another
+terminal, closing the window, `exit` in the pane — leaves the record wearing no
+decision at all, which is exactly what makes it recoverable. There is no
+guessing, and nothing to detect at boot.
 
-Sessions are listed running first, then parked, then stopped, so the ones
-still in flight stay at the top.
+**Recovered sessions get their own section at the top of the home screen**,
+above the running ones, because they are the only rows on the screen you did
+not put there. Select one to resume it. Once you do — or once you stop, park or
+terminate it — it leaves the section and takes its place among the rest.
 
-**Restore** appears at the top of the home screen whenever something is
-stopped. It relaunches every stopped session in the project at once, each
-resuming its most recent conversation, and attaches to none of them — pick the
-one you want to sit in from the list. Parked sessions are skipped: you put them
-down deliberately, unlike the ones a restart took away.
+Everything else is listed running first, then parked, then stopped, so the work
+still in flight stays at the top.
 
 **Stop** ends the claude process but keeps the session history: the transcript
 is untouched and the conversation resumes where it left off. Any task claude
 was part-way through is interrupted, so stop at a natural break.
 
-**Park** does exactly what Stop does, but flags the session so it shows as 🅿️
-and sits out the bulk restore — for work you are consciously shelving rather
-than pausing. Launching or resuming a parked session un-parks it.
+**Park** does exactly what Stop does. The two differ only in what you are
+saying: park for work you mean to pick up again, stop for work you are done
+with for now. The icon is the whole difference, and it is there so a glance at
+the list tells you which is which.
 
 #### Filtering sessions by name — `/`
 
 Press `/` on the home screen to open a filter box, then type. Matching is live
 and case-insensitive, against session names and branch names, and covers the
-**sessions** (running, parked and stopped), **inactive worktrees** and **previous claude
-sessions** lists at once. While a filter is active the action rows
-(`+ New …`, settings, switch project) are hidden so only matches remain.
+**recovered**, **sessions** (running, parked and stopped), **inactive
+worktrees** and **previous claude sessions** lists at once. While a filter is
+active the action rows (`+ New …`, settings, switch project) are hidden so only
+matches remain.
 
 | Key | While filtering |
 |-----|-----------------|
@@ -335,7 +340,7 @@ sessions** lists at once. While a filter is active the action rows
 
 The home screen polls Claude state every few seconds, but only for sessions it
 already knows about. Press `r` to re-read everything: running tmux sessions,
-worktrees on disk, the stopped-session store and every transcript. Use it after
+worktrees on disk, the open-session store and every transcript. Use it after
 creating a worktree or starting a session from another window. The current
 filter and the highlighted row are kept.
 
