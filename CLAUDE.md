@@ -646,11 +646,19 @@ Three custom exception types, all caught in `main()`:
   created (`20260922-…`), so a name sort gets two sessions made on the same day
   in an arbitrary order — and got `direct-10` before `direct-2` outright. Each
   section of the home screen is now sorted by `_order_key`, which falls through
-  three levels: the record's `created` stamp (real creation order, to the
+  four levels: the record's `created` stamp (real creation order, to the
   second), the directory's creation time (`_creation_time` — `st_birthtime`
-  where it exists, else `st_ctime`), and finally `_natural_key(name)`, which
-  compares runs of digits numerically. The groups themselves are untouched:
-  recovered, then running, parked and stopped, then inactive worktrees. Within the *running*
+  where it exists, else `st_ctime`), the record's `last_seen`, and finally
+  `_natural_key(name)`, which compares runs of digits numerically.
+  **The last two levels exist for records written before `created` did.** A
+  legacy *worktree* record borrows its directory's age, which is the real
+  thing; a legacy *direct* or *ad hoc* record has no such directory (its cwd is
+  usually the repo root, whose age says nothing), so it borrows `last_seen` —
+  an upper bound, but one that keeps it interleaved instead of sinking every
+  pre-upgrade row to the bottom of its group. Both correct themselves the first
+  time the session is relaunched, since `mark_open` stamps `created`.
+  The groups themselves are untouched: recovered, then running, parked and
+  stopped, then inactive worktrees. Within the *running*
   group, direct and worktree rows interleave by creation rather than being
   listed kind-by-kind — both are just running.
   **The stats live in `_init_git_info`, not in the render path** (see "Nothing

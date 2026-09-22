@@ -1646,6 +1646,15 @@ class SessionApp(App):
         stamp = _parse_created(record.created) if record is not None else 0.0
         if not stamp and path is not None:
             stamp = self._creation_times.get(str(path), 0.0)
+        if not stamp and record is not None:
+            # Last resort for a record written before `created` existed and
+            # with no directory age to borrow — a direct or ad hoc session,
+            # whose cwd is usually the repo root and so says nothing about when
+            # the session began. `last_seen` is an upper bound rather than the
+            # real thing, but it keeps a legacy row interleaved with stamped
+            # ones instead of sinking the whole lot to the bottom of the group.
+            # It corrects itself the first time the session is relaunched.
+            stamp = _parse_created(record.last_seen)
         return (stamp, _natural_key(name))
 
     def _order_key_for_path(self, path: Path) -> tuple[float, tuple[object, ...]]:
