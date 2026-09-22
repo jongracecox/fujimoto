@@ -161,6 +161,8 @@ the session ended.
 | closed / no record | stopped | — | ⚫ | inactive worktrees |
 
 Within the *sessions* section rows are ordered running, parked, then stopped.
+Inside each of those groups — and inside *inactive worktrees* — rows are
+**newest-created first** (see "Every group reads newest-first" below).
 
 **Every deliberate end writes a `stop_kind`, and that is the entire recovery
 mechanism.** Stop and Park both call `mark_stopped`, which stamps
@@ -260,7 +262,10 @@ as JSON in `~/.cache/fujimoto/sessions.json` (same graceful-degradation pattern
 as `settings.py`: missing file, unreadable cache or corrupt JSON yield an empty
 state, never an error):
 - `SessionRecord` dataclass: `cwd`, `project`, `session_type`, `branch`,
-  `claude_session_id`, `stop_kind`, `last_seen`. Only `cwd` is required — every
+  `claude_session_id`, `stop_kind`, `created`, `last_seen`. `created` is
+  stamped by the *first* `mark_open` and preserved by every later one, so it is
+  the session's creation order rather than its last reconnect; it is what the
+  home screen sorts by. Only `cwd` is required — every
   other field defaults, so a record written by a different fujimoto version
   still loads. `StopKind.from_raw` coerces the stored kind for the same reason —
   an unknown or missing value reads as `RECOVERED`, and a legacy `parked: true`
@@ -637,6 +642,21 @@ Three custom exception types, all caught in `main()`:
   `uv tool install --force --reinstall --no-cache .`, and verify with
   `fujimoto --version` (the `.devN` suffix moves) or by grepping the installed
   `site-packages/fujimoto/cli.py` for something the change added.
+- **Every group reads newest-first.** A worktree name carries the *day* it was
+  created (`20260922-…`), so a name sort gets two sessions made on the same day
+  in an arbitrary order — and got `direct-10` before `direct-2` outright. Each
+  section of the home screen is now sorted by `_order_key`, which falls through
+  three levels: the record's `created` stamp (real creation order, to the
+  second), the directory's creation time (`_creation_time` — `st_birthtime`
+  where it exists, else `st_ctime`), and finally `_natural_key(name)`, which
+  compares runs of digits numerically. The groups themselves are untouched:
+  recovered, then running, parked and stopped, then inactive worktrees. Within the *running*
+  group, direct and worktree rows interleave by creation rather than being
+  listed kind-by-kind — both are just running.
+  **The stats live in `_init_git_info`, not in the render path** (see "Nothing
+  in the home render path may touch the disk"): it fills
+  `_creation_times: dict[str, float]` for every worktree and every open
+  record's cwd, and `_build_home_items` only reads that dict.
 - **Remembering sessions across a restart**: `session_state.py` records every session as open at launch — in `main()`, **before** `launch_claude_in_tmux` blocks on the attach, so a host that dies mid-session still has a record to come back as. `_init_git_info` loads the pruned state into `_open_sessions`; `_idle_records()` derives the open-but-not-running set for the current project; `_build_home_items` splits those by `stop_kind` — `RECOVERED` into its own section above *sessions*, `PARKED`/`STOPPED` into *sessions* after the running rows — and excludes all of them from *inactive worktrees*. `SessionInfo.stop_kind` carries the record's kind into the TUI and `SessionInfo.is_stopped` is *derived* from it (an open record with no live session), so there is one source of truth for which flavour of not-running a row is. There is deliberately no bulk-restore row: relaunching N claude processes does not restore the terminals and window arrangement a crash actually took. `_end_session(session, terminate=..., park=...)` is the single handler behind every menu item and every outcome of the `Ctrl-A x` prompt; it tolerates a `kill_session` failure only when `session_exists` confirms the session is already gone (otherwise marking a live session closed would hide it). `_do_delete_worktree` and `on_rename_submitted` keep the store honest via `mark_closed` / `rename`.
 - **Session metadata**: `.fujimoto/meta.json` stored in worktree directory records the base branch for cherry-pick targeting, the `source_root` (main repo) for project-config source resolution, and — for forks — `forked_from_session_id` plus `forked_from_worktree`. The `.fujimoto/` directory contains a `.gitignore` with `*` so its contents are automatically ignored by git.
 - **Project config (`.fujimoto.yaml`)**: An optional, committed per-project file (`project_config.py`) declaring files to copy/link into a worktree and init commands to run. Applied centrally in `main()`'s launch loop (parent process, **before** `tmux attach`) by `_apply_worktree_config(working_dir)`, for **every** worktree connection mode (new, reconnect-to-live, relaunch/resume) — so copy/link/init run on each connect, not just creation. `_do_create_and_launch` no longer applies config; it only creates the worktree and stores meta. Key mechanics:

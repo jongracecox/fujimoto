@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -160,6 +161,42 @@ def _claude_state_label(state: SessionState) -> str:
     if state == SessionState.IDLE:
         return f" [dim]{ICON_ZZZ} idle[/]"
     return ""
+
+
+def _natural_key(name: str) -> tuple[object, ...]:
+    """Split a name so embedded numbers sort numerically.
+
+    `direct-10` has to sort after `direct-2`, which a plain string comparison
+    gets backwards — and the name is the only ordering signal left for a
+    session whose creation time is unknown.
+    """
+    parts = re.split(r"(\d+)", name)
+    return tuple((1, int(p)) if p.isdigit() else (0, p) for p in parts if p != "")
+
+
+def _creation_time(path: Path) -> float:
+    """When a directory was created, as epoch seconds (0.0 if unknown).
+
+    `st_birthtime` is the real thing and exists on macOS; elsewhere `st_ctime`
+    is the closest available (inode change time, which for a directory nothing
+    has moved is its creation). Either way this is a *stat per worktree*, so it
+    belongs in `_init_git_info`, never in the home render path.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return 0.0
+    return float(getattr(st, "st_birthtime", st.st_ctime))
+
+
+def _parse_created(stamp: str) -> float:
+    """Epoch seconds for a `SessionRecord.created` stamp (0.0 if unusable)."""
+    if not stamp:
+        return 0.0
+    try:
+        return datetime.fromisoformat(stamp).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def _relative_time(dt: datetime) -> str:
@@ -1247,6 +1284,10 @@ class SessionApp(App):
         # branch. Resolving it runs subprocesses, and `_build_home_items` runs
         # on every `/` keystroke, so it is memoized like `_claude_cache`.
         self._direct_cwd_cache: dict[str, tuple[Path, str]] = {}
+        # Creation time (epoch seconds) per worktree/session directory, used to
+        # order every home-screen section newest-first. Filled by
+        # `_init_git_info` because it is one `stat` per directory.
+        self._creation_times: dict[str, float] = {}
         # -- Transcript search (`s`) --
         self._on_search: bool = False
         self._transcript_query: str = ""
@@ -1386,13 +1427,28 @@ class SessionApp(App):
                 self._project_name, self._project_root
             )
             if project_dir.exists():
-                self._existing_worktrees = sorted(
-                    [d for d in project_dir.iterdir() if d.is_dir()],
-                    key=lambda p: p.name,
-                    reverse=True,
-                )
+                self._existing_worktrees = [
+                    d for d in project_dir.iterdir() if d.is_dir()
+                ]
         except ConfigError:
             pass
+
+        # One stat per worktree and per open-session directory, so the render
+        # path can order rows without touching the disk. Records carry their
+        # own `created` stamp; the directory time is the fallback for the ones
+        # written before that field existed, and for worktrees with no record.
+        self._creation_times = {}
+        record_paths = [r.path for r in self._open_sessions.values()]
+        for path in [*self._existing_worktrees, *record_paths]:
+            key = str(path)
+            if key not in self._creation_times:
+                self._creation_times[key] = _creation_time(path)
+        self._existing_worktrees.sort(key=self._order_key_for_path, reverse=True)
+        debug.log(
+            "tui.creation_times",
+            resolved=sum(1 for t in self._creation_times.values() if t),
+            unknown=sum(1 for t in self._creation_times.values() if not t),
+        )
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Hide bindings that don't apply to the view on screen.
@@ -1569,6 +1625,36 @@ class SessionApp(App):
         else:
             self.query_one("#home-list").focus()
         self._poll_timer = self.set_interval(3, self._poll_session_states)
+
+    def _order_key(
+        self,
+        *,
+        name: str,
+        path: Path | None = None,
+        record: session_state.SessionRecord | None = None,
+    ) -> tuple[float, tuple[object, ...]]:
+        """Sort key placing the most recently created session first.
+
+        Every home-screen group is ordered by this, so a row's position means
+        the same thing whether it is running, parked, stopped or recovered. The
+        record's `created` stamp is the real creation order (a worktree name
+        only carries the *day*); the directory's creation time covers records
+        written before that field existed, and worktrees with no record at all;
+        the name is the last resort, compared naturally so `direct-10` lands
+        after `direct-2`.
+        """
+        stamp = _parse_created(record.created) if record is not None else 0.0
+        if not stamp and path is not None:
+            stamp = self._creation_times.get(str(path), 0.0)
+        return (stamp, _natural_key(name))
+
+    def _order_key_for_path(self, path: Path) -> tuple[float, tuple[object, ...]]:
+        """`_order_key` for a worktree directory (used to sort them in place)."""
+        return self._order_key(
+            name=path.name,
+            path=path,
+            record=self._open_sessions.get(session_name(self._project_name, path.name)),
+        )
 
     def _idle_records(self) -> dict[str, session_state.SessionRecord]:
         """Open records for this project with no live tmux session behind them.
@@ -1773,10 +1859,11 @@ class SessionApp(App):
             sname = session_name(self._project_name, wt.name)
             worktree_session_names.add(sname)
 
-        direct_sessions: list[str] = []
-        for sname in sorted(self._active_sessions):
-            if sname not in worktree_session_names:
-                direct_sessions.append(sname)
+        direct_sessions = sorted(
+            (s for s in self._active_sessions if s not in worktree_session_names),
+            key=lambda s: self._order_key(name=s, record=self._open_sessions.get(s)),
+            reverse=True,
+        )
 
         # Active sessions section
         active_worktrees = [
@@ -1785,7 +1872,10 @@ class SessionApp(App):
             if session_name(self._project_name, wt.name) in self._active_sessions
         ]
 
-        active_items: list[ListItem] = []
+        # Running rows are collected with their sort key rather than appended in
+        # two passes: a direct session and a worktree session are both just
+        # running, so they interleave by creation like everything else.
+        running: list[tuple[tuple[float, tuple[object, ...]], ListItem]] = []
 
         for sname in direct_sessions:
             item_id = f"ds-{sname.replace('/', '--')}"
@@ -1813,10 +1903,15 @@ class SessionApp(App):
                 claude_state=cs_state,
             )
             self._session_map[item_id] = info
-            active_items.append(
-                ListItem(
-                    Label(self._build_session_label(info, state_suffix), markup=True),
-                    id=item_id,
+            running.append(
+                (
+                    self._order_key(name=sname, record=self._open_sessions.get(sname)),
+                    ListItem(
+                        Label(
+                            self._build_session_label(info, state_suffix), markup=True
+                        ),
+                        id=item_id,
+                    ),
                 )
             )
 
@@ -1846,7 +1941,15 @@ class SessionApp(App):
             )
             self._session_map[item_id] = info
             label_text = self._build_session_label(info, state_suffix)
-            active_items.append(ListItem(Label(label_text, markup=True), id=item_id))
+            running.append(
+                (
+                    self._order_key_for_path(wt),
+                    ListItem(Label(label_text, markup=True), id=item_id),
+                )
+            )
+
+        running.sort(key=lambda entry: entry[0], reverse=True)
+        active_items: list[ListItem] = [item for _, item in running]
 
         # Parked and stopped sessions sit in the same section as running ones:
         # the icon carries the distinction, and all three are sessions the user
@@ -1857,7 +1960,13 @@ class SessionApp(App):
         parked_items: list[ListItem] = []
         stopped_items: list[ListItem] = []
         recovered_items: list[ListItem] = []
-        for sname, rec in sorted(idle_records.items()):
+        for sname, rec in sorted(
+            idle_records.items(),
+            key=lambda item: self._order_key(
+                name=item[0], path=item[1].path, record=item[1]
+            ),
+            reverse=True,
+        ):
             display_name = sname.split("/", 1)[1] if "/" in sname else sname
             is_worktree = rec.session_type == "worktree"
             branch = rec.branch or (

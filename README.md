@@ -321,6 +321,12 @@ saying: park for work you mean to pick up again, stop for work you are done
 with for now. The icon is the whole difference, and it is there so a glance at
 the list tells you which is which.
 
+Within every group — running, parked, stopped, and inactive worktrees — the
+most recently created session is listed first. Ordering uses the time a session
+was first launched (or, failing that, when its worktree directory was created),
+so two sessions started on the same day still appear in the order you made
+them.
+
 #### Filtering sessions by name — `/`
 
 Press `/` on the home screen to open a filter box, then type. Matching is live
