@@ -118,6 +118,85 @@ class TestMarkOpen:
         )
         assert session_state.load_state()["proj/wt"].created == first
 
+    def test_backfill_uses_the_worktree_directory_age(
+        self, _isolate_state: Path, tmp_path: Path
+    ) -> None:
+        """A legacy record must not claim it was created at upgrade time.
+
+        Stamping `_now()` here made every months-old session leap to the top of
+        the home screen the first time it was relaunched.
+        """
+        wt = tmp_path / "20260901-old-work"
+        wt.mkdir()
+        _isolate_state.parent.mkdir(parents=True, exist_ok=True)
+        _isolate_state.write_text(
+            json.dumps(
+                {"proj/wt": {"cwd": str(wt), "last_seen": "2026-09-02T00:00:00+00:00"}}
+            )
+        )
+        session_state.mark_open(
+            "proj/wt", cwd=wt, project="proj", session_type="worktree"
+        )
+        created = session_state.load_state()["proj/wt"].created
+        expected = session_state._directory_created(wt)
+        assert created == expected
+        assert created != ""
+        # And emphatically not "now".
+        assert created < session_state._now()
+
+    def test_backfill_uses_last_seen_for_a_direct_session(
+        self, _isolate_state: Path, tmp_path: Path
+    ) -> None:
+        """A direct session's cwd is the repo, whose age is the clone's."""
+        _isolate_state.parent.mkdir(parents=True, exist_ok=True)
+        _isolate_state.write_text(
+            json.dumps(
+                {
+                    "proj/direct-1": {
+                        "cwd": str(tmp_path),
+                        "last_seen": "2026-09-02T00:00:00+00:00",
+                    }
+                }
+            )
+        )
+        session_state.mark_open(
+            "proj/direct-1", cwd=tmp_path, project="proj", session_type="direct"
+        )
+        record = session_state.load_state()["proj/direct-1"]
+        assert record.created == "2026-09-02T00:00:00+00:00"
+
+    def test_backfill_falls_back_to_now_with_nothing_to_go_on(
+        self, _isolate_state: Path, tmp_path: Path
+    ) -> None:
+        _isolate_state.parent.mkdir(parents=True, exist_ok=True)
+        _isolate_state.write_text(json.dumps({"proj/direct-1": {"cwd": str(tmp_path)}}))
+        session_state.mark_open(
+            "proj/direct-1", cwd=tmp_path, project="proj", session_type="direct"
+        )
+        assert session_state.load_state()["proj/direct-1"].created
+
+    def test_backfill_of_a_worktree_with_no_directory_uses_last_seen(
+        self, _isolate_state: Path, tmp_path: Path
+    ) -> None:
+        gone = tmp_path / "deleted"
+        _isolate_state.parent.mkdir(parents=True, exist_ok=True)
+        _isolate_state.write_text(
+            json.dumps(
+                {
+                    "proj/wt": {
+                        "cwd": str(gone),
+                        "last_seen": "2026-09-02T00:00:00+00:00",
+                    }
+                }
+            )
+        )
+        session_state.mark_open(
+            "proj/wt", cwd=gone, project="proj", session_type="worktree"
+        )
+        assert (
+            session_state.load_state()["proj/wt"].created == "2026-09-02T00:00:00+00:00"
+        )
+
     def test_created_is_backfilled_for_an_older_record(
         self, _isolate_state: Path, tmp_path: Path
     ) -> None:

@@ -650,6 +650,15 @@ Three custom exception types, all caught in `main()`:
   second), the directory's creation time (`_creation_time` — `st_birthtime`
   where it exists, else `st_ctime`), the record's `last_seen`, and finally
   `_natural_key(name)`, which compares runs of digits numerically.
+  **A stampless record is backfilled on its next launch, not stamped `now`.**
+  `mark_open` writing `_now()` for an existing record was the bug that made
+  this feature look broken: every legacy session leapt to the top of the list
+  the first time it was relaunched, so the order shuffled as sessions were
+  used. `session_state._backfill_created` estimates instead — a worktree from
+  its directory's age, a direct or ad hoc session from `last_seen` — and only
+  a genuinely new record (no `existing`) gets `_now()`. The read-side fallbacks
+  below stay as the safety net for records that have not been relaunched yet.
+
   **The last two levels exist for records written before `created` did.** A
   legacy *worktree* record borrows its directory's age, which is the real
   thing; a legacy *direct* or *ad hoc* record has no such directory (its cwd is

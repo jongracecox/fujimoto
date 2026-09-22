@@ -191,6 +191,40 @@ def save_state(state: dict[str, SessionRecord]) -> None:
     debug.log("session_state.save", path=debug.rp(path), records=len(state))
 
 
+def _directory_created(path: Path) -> str:
+    """When a directory was made, as an ISO-8601 stamp ("" if unknown).
+
+    `st_birthtime` is the real thing on macOS; elsewhere `st_ctime` is the
+    closest available for a directory nothing has moved.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return ""
+    stamp = getattr(st, "st_birthtime", st.st_ctime)
+    return datetime.fromtimestamp(stamp, tz=timezone.utc).isoformat()
+
+
+def _backfill_created(existing: SessionRecord, cwd: Path, session_type: str) -> str:
+    """Estimate when an already-open session began, for a record with no stamp.
+
+    Every record written before `created` existed hits this on its first launch
+    after the upgrade, and stamping it with *now* would be a lie that puts a
+    months-old session at the top of the home screen — which is worse than the
+    name sort it replaced, because it shuffles the list as sessions are used.
+
+    A worktree's directory age is the real answer. A direct or ad hoc session
+    has no directory of its own — its cwd is usually the repo root, whose age
+    is the clone's, not the session's — so it falls back to `last_seen`: too
+    recent, but bounded by when the session actually existed.
+    """
+    if session_type == "worktree":
+        stamp = _directory_created(cwd)
+        if stamp:
+            return stamp
+    return existing.last_seen or _now()
+
+
 def mark_open(
     tmux_name: str,
     *,
@@ -213,8 +247,15 @@ def mark_open(
     if claude_session_id is None and existing is not None:
         claude_session_id = existing.claude_session_id
     # A reconnect is not a creation: keep the original stamp so a long-lived
-    # session doesn't jump to the top of the list every time it is reopened.
-    created = existing.created if existing is not None and existing.created else _now()
+    # session doesn't jump to the top of the list every time it is reopened,
+    # and estimate one for a record written before the field existed rather
+    # than claiming it was created now.
+    if existing is None:
+        created = _now()
+    elif existing.created:
+        created = existing.created
+    else:
+        created = _backfill_created(existing, cwd, session_type)
     state[tmux_name] = SessionRecord(
         cwd=str(cwd),
         project=project,
@@ -233,6 +274,7 @@ def mark_open(
         branch=debug.rref(branch),
         claude_session=claude_session_id or "none",
         new_record=existing is None,
+        created=created,
     )
     save_state(state)
 
