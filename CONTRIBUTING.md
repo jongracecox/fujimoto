@@ -330,13 +330,15 @@ https://docs.pypi.org/trusted-publishers/
    - Press `Ctrl-A t` to split, then `Ctrl-A x` — it must fall back to the
      original `kill pane? (y/n)` confirm and leave the session alone
    - Simulate a restart with `tmux kill-server` while sessions are open, then
-     run `fujimoto`: every session should come back 🟠, with a
-     **Restore N stopped sessions** row that relaunches them all detached
+     run `fujimoto`: every session should come back 🔄 in a **recovered**
+     section above *sessions*, since nothing told fujimoto they were ending
+   - Resume one — it goes 🟢, and the recovered section shrinks; stop it and it
+     comes back 🟠 in *sessions*, not 🔄
    - Terminate one through the menu, then `tmux kill-server` again — the
-     terminated one must stay ⚫ while the others return 🟠
+     terminated one must stay ⚫ while the others return 🔄
    - Park a session (menu item or the `Ctrl-A x` prompt): it renders 🅿️ above
-     the 🟠 rows, the **Restore** row's count drops by one and leaves it alone,
-     and launching it clears the flag back to 🟢
+     the 🟠 rows and inside *sessions*, never in *recovered*, and launching it
+     puts it back to 🟢
    - Check `~/.cache/fujimoto/sessions.json` holds a record per open session
      and nothing for terminated ones
    As with `Ctrl-A f`, `tmux send-keys` cannot drive these bindings; write to an

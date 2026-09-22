@@ -145,24 +145,93 @@ class TestMarkClosed:
         assert set(session_state.load_state()) == {"proj/b"}
 
 
-class TestTouch:
+class TestMarkStopped:
     def test_keeps_record_open(self, tmp_path: Path) -> None:
         session_state.mark_open(
             "proj/wt", cwd=tmp_path, project="proj", session_type="worktree"
         )
-        session_state.touch("proj/wt")
+        session_state.mark_stopped("proj/wt")
         assert "proj/wt" in session_state.load_state()
 
     def test_records_claude_id(self, tmp_path: Path) -> None:
         session_state.mark_open(
             "proj/wt", cwd=tmp_path, project="proj", session_type="worktree"
         )
-        session_state.touch("proj/wt", "xyz")
+        session_state.mark_stopped("proj/wt", "xyz")
         assert session_state.load_state()["proj/wt"].claude_session_id == "xyz"
 
+    def test_stamps_the_kind_so_it_is_not_taken_for_a_crash(
+        self, tmp_path: Path
+    ) -> None:
+        session_state.mark_open(
+            "proj/wt", cwd=tmp_path, project="proj", session_type="worktree"
+        )
+        assert (
+            session_state.load_state()["proj/wt"].stop_kind
+            is session_state.StopKind.RECOVERED
+        )
+        session_state.mark_stopped("proj/wt")
+        assert (
+            session_state.load_state()["proj/wt"].stop_kind
+            is session_state.StopKind.STOPPED
+        )
+
+    def test_the_latest_decision_wins(self, tmp_path: Path) -> None:
+        session_state.mark_open(
+            "proj/wt", cwd=tmp_path, project="proj", session_type="worktree"
+        )
+        session_state.mark_stopped("proj/wt", kind=session_state.StopKind.PARKED)
+        session_state.mark_stopped("proj/wt")
+        assert (
+            session_state.load_state()["proj/wt"].stop_kind
+            is session_state.StopKind.STOPPED
+        )
+
     def test_unknown_name_is_noop(self) -> None:
-        session_state.touch("proj/nope")
+        session_state.mark_stopped("proj/nope")
         assert session_state.load_state() == {}
+
+
+class TestStopKind:
+    def test_absent_field_reads_as_recovered(self, _isolate_state: Path) -> None:
+        # Both an older fujimoto's records and a session nothing ever stopped.
+        _isolate_state.parent.mkdir(parents=True)
+        _isolate_state.write_text(json.dumps({"s": {"cwd": "/tmp/a"}}))
+        assert session_state.load_state()["s"].stop_kind is (
+            session_state.StopKind.RECOVERED
+        )
+
+    def test_legacy_parked_flag_is_honoured(self, _isolate_state: Path) -> None:
+        # An upgrade must not re-label something shelved on purpose as a crash.
+        _isolate_state.parent.mkdir(parents=True)
+        _isolate_state.write_text(json.dumps({"s": {"cwd": "/tmp/a", "parked": True}}))
+        assert session_state.load_state()["s"].stop_kind is (
+            session_state.StopKind.PARKED
+        )
+
+    def test_nonsense_value_reads_as_recovered(self, _isolate_state: Path) -> None:
+        _isolate_state.parent.mkdir(parents=True)
+        _isolate_state.write_text(
+            json.dumps(
+                {
+                    "s": {"cwd": "/tmp/a", "stop_kind": "banana"},
+                    "t": {"cwd": "/tmp/b", "stop_kind": 7},
+                }
+            )
+        )
+        state = session_state.load_state()
+        assert state["s"].stop_kind is session_state.StopKind.RECOVERED
+        assert state["t"].stop_kind is session_state.StopKind.RECOVERED
+
+    def test_round_trips_through_json(self, tmp_path: Path) -> None:
+        session_state.mark_open(
+            "proj/wt", cwd=tmp_path, project="proj", session_type="worktree"
+        )
+        session_state.mark_stopped("proj/wt", kind=session_state.StopKind.PARKED)
+        assert (
+            session_state.load_state()["proj/wt"].stop_kind
+            is session_state.StopKind.PARKED
+        )
 
 
 class TestRename:
