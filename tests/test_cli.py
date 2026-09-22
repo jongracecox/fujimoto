@@ -8768,6 +8768,31 @@ class TestSessionOrdering:
                 assert self._row_ids(app) == ["wt-wt-b", "wt-wt-a"]
 
     @pytest.mark.asyncio
+    async def test_recovered_sessions_ordered_among_themselves(
+        self, tmp_path: Path
+    ) -> None:
+        """The recovered section is a group like any other, so it sorts too."""
+        records = {
+            "test-proj/wt-a": _record(
+                tmp_path,
+                name="wt-a",
+                stop_kind=StopKind.RECOVERED,
+                created="2026-09-22T09:00:00+00:00",
+            ),
+            "test-proj/wt-b": _record(
+                tmp_path,
+                name="wt-b",
+                stop_kind=StopKind.RECOVERED,
+                created="2026-09-22T18:00:00+00:00",
+            ),
+        }
+        with _patch_git_info(open_sessions=records):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert self._row_ids(app) == ["wt-wt-b", "wt-wt-a"]
+
+    @pytest.mark.asyncio
     async def test_inactive_worktrees_fall_back_to_directory_creation_time(
         self, tmp_path: Path
     ) -> None:
