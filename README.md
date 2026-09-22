@@ -321,7 +321,8 @@ saying: park for work you mean to pick up again, stop for work you are done
 with for now. The icon is the whole difference, and it is there so a glance at
 the list tells you which is which.
 
-Within every group — running, parked, stopped, and inactive worktrees — the
+Within every group — recovered, running, parked, stopped, and inactive
+worktrees — the
 most recently created session is listed first. Ordering uses the time a session
 was first launched, so two sessions started on the same day still appear in the
 order you made them. Sessions that predate this (fujimoto never recorded their
