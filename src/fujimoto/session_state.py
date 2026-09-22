@@ -87,6 +87,12 @@ class SessionRecord:
     # either way — this only picks the icon the home screen draws, and which
     # section it draws it in.
     stop_kind: StopKind = StopKind.RECOVERED
+    # When the session was first opened, in ISO-8601. The home screen orders
+    # every section newest-first, and a name only carries the day a worktree
+    # was created — this is what gives two sessions created on the same day a
+    # defined order. Empty on records written before it existed, which then
+    # fall back to the worktree directory's creation time.
+    created: str = ""
     last_seen: str = ""
 
     @property
@@ -136,6 +142,7 @@ def load_state() -> dict[str, SessionRecord]:
         "session_type",
         "branch",
         "claude_session_id",
+        "created",
     }
     for name, raw in data.items():
         if not isinstance(raw, dict) or not isinstance(raw.get("cwd"), str):
@@ -145,6 +152,10 @@ def load_state() -> dict[str, SessionRecord]:
             debug.log("session_state.skipped", session=debug.rv(name))
             continue
         kwargs = {k: v for k, v in raw.items() if k in fields}
+        # A record from before `created` existed — or a hand-edited one with
+        # the wrong type — must still load, just without an ordering stamp.
+        created = kwargs.get("created")
+        kwargs["created"] = created if isinstance(created, str) else ""
         records[name] = SessionRecord(
             **kwargs,
             # `parked` is what a fujimoto from before recovery wrote; honour it
@@ -201,12 +212,16 @@ def mark_open(
     # blank out an id recorded when the session was first launched.
     if claude_session_id is None and existing is not None:
         claude_session_id = existing.claude_session_id
+    # A reconnect is not a creation: keep the original stamp so a long-lived
+    # session doesn't jump to the top of the list every time it is reopened.
+    created = existing.created if existing is not None and existing.created else _now()
     state[tmux_name] = SessionRecord(
         cwd=str(cwd),
         project=project,
         session_type=session_type,
         branch=branch,
         claude_session_id=claude_session_id,
+        created=created,
         last_seen=_now(),
     )
     debug.log(

@@ -57,6 +57,22 @@ class TestLoadState:
         )
         assert session_state.load_state()["s"].cwd == "/tmp/a"
 
+    def test_tolerates_a_non_string_created(self, _isolate_state: Path) -> None:
+        # A record predating `created`, and a hand-edited one with the wrong
+        # type, both have to load — just without an ordering stamp.
+        _isolate_state.parent.mkdir(parents=True)
+        _isolate_state.write_text(
+            json.dumps(
+                {
+                    "old": {"cwd": "/tmp/a"},
+                    "bad": {"cwd": "/tmp/b", "created": 17},
+                }
+            )
+        )
+        state = session_state.load_state()
+        assert state["old"].created == ""
+        assert state["bad"].created == ""
+
     def test_unreadable_cache_is_empty(self, _isolate_state: Path) -> None:
         _isolate_state.parent.mkdir(parents=True)
         _isolate_state.write_text("{}")
@@ -87,7 +103,31 @@ class TestMarkOpen:
         assert record.branch == "worktree/wt"
         assert record.claude_session_id == "abc"
         assert record.last_seen
+        assert record.created
         assert record.path == tmp_path
+
+    def test_created_survives_a_reconnect(self, tmp_path: Path) -> None:
+        # Reopening a session is not creating one: the stamp the home screen
+        # orders by must not jump to now.
+        session_state.mark_open(
+            "proj/wt", cwd=tmp_path, project="proj", session_type="worktree"
+        )
+        first = session_state.load_state()["proj/wt"].created
+        session_state.mark_open(
+            "proj/wt", cwd=tmp_path, project="proj", session_type="worktree"
+        )
+        assert session_state.load_state()["proj/wt"].created == first
+
+    def test_created_is_backfilled_for_an_older_record(
+        self, _isolate_state: Path, tmp_path: Path
+    ) -> None:
+        _isolate_state.parent.mkdir(parents=True)
+        _isolate_state.write_text(json.dumps({"proj/wt": {"cwd": str(tmp_path)}}))
+        assert session_state.load_state()["proj/wt"].created == ""
+        session_state.mark_open(
+            "proj/wt", cwd=tmp_path, project="proj", session_type="worktree"
+        )
+        assert session_state.load_state()["proj/wt"].created
 
     def test_reconnect_keeps_known_claude_id(self, tmp_path: Path) -> None:
         # A plain reconnect passes no resume id; it must not blank out the id

@@ -4969,6 +4969,7 @@ def _record(
     session_type: str = "worktree",
     claude_session_id: str | None = None,
     stop_kind: StopKind = StopKind.STOPPED,
+    created: str = "",
 ):
     """Build an open-session record whose directory actually exists."""
     from fujimoto.session_state import SessionRecord
@@ -4982,6 +4983,7 @@ def _record(
         branch=f"worktree/{name}" if session_type == "worktree" else "feat/test",
         claude_session_id=claude_session_id,
         stop_kind=stop_kind,
+        created=created,
     )
 
 
@@ -8690,3 +8692,165 @@ class TestLogViewerDebugInventory:
         assert "tui.log_raw_fallback" in text
         assert "claude.read_raw" in text
         assert "raw=yes" in text
+
+
+class TestSessionOrdering:
+    """Every home-screen group reads newest-first, by real creation order."""
+
+    def test_natural_key_compares_numbers_numerically(self) -> None:
+        from fujimoto.cli import _natural_key
+
+        assert _natural_key("direct-2") < _natural_key("direct-10")
+        assert _natural_key("20260308-a") < _natural_key("20260309-a")
+
+    def test_parse_created_tolerates_a_missing_or_junk_stamp(self) -> None:
+        from fujimoto.cli import _parse_created
+
+        assert _parse_created("") == 0.0
+        assert _parse_created("not-a-date") == 0.0
+        assert _parse_created("2026-09-22T10:00:00+00:00") > 0.0
+
+    def test_creation_time_of_a_missing_directory_is_zero(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _creation_time
+
+        assert _creation_time(tmp_path / "gone") == 0.0
+        assert _creation_time(tmp_path) > 0.0
+
+    @staticmethod
+    def _row_ids(app: SessionApp) -> list[str]:
+        return [
+            item.id
+            for item in app.query_one("#home-list").children
+            if item.id and (item.id.startswith("wt-") or item.id.startswith("ds-"))
+        ]
+
+    @pytest.mark.asyncio
+    async def test_stopped_sessions_ordered_by_created_stamp(
+        self, tmp_path: Path
+    ) -> None:
+        """Two sessions made the same day still have a defined order."""
+        records = {
+            "test-proj/wt-early": _record(
+                tmp_path, name="wt-early", created="2026-09-22T09:00:00+00:00"
+            ),
+            "test-proj/wt-late": _record(
+                tmp_path, name="wt-late", created="2026-09-22T17:00:00+00:00"
+            ),
+        }
+        with _patch_git_info(open_sessions=records):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert self._row_ids(app) == ["wt-wt-late", "wt-wt-early"]
+
+    @pytest.mark.asyncio
+    async def test_parked_sessions_ordered_among_themselves(
+        self, tmp_path: Path
+    ) -> None:
+        records = {
+            "test-proj/wt-a": _record(
+                tmp_path,
+                name="wt-a",
+                stop_kind=StopKind.PARKED,
+                created="2026-09-22T09:00:00+00:00",
+            ),
+            "test-proj/wt-b": _record(
+                tmp_path,
+                name="wt-b",
+                stop_kind=StopKind.PARKED,
+                created="2026-09-22T18:00:00+00:00",
+            ),
+        }
+        with _patch_git_info(open_sessions=records):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert self._row_ids(app) == ["wt-wt-b", "wt-wt-a"]
+
+    @pytest.mark.asyncio
+    async def test_inactive_worktrees_fall_back_to_directory_creation_time(
+        self, tmp_path: Path
+    ) -> None:
+        """No record means no stamp — the directory's own age decides."""
+        wt1 = tmp_path / "20260922-first"
+        wt2 = tmp_path / "20260922-second"
+        times = {"20260922-first": 100.0, "20260922-second": 200.0}
+        with (
+            _patch_git_info(worktrees=[wt1, wt2]),
+            patch(
+                "fujimoto.cli._creation_time",
+                side_effect=lambda p: times.get(p.name, 0.0),
+            ),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert self._row_ids(app) == [
+                    "wt-20260922-second",
+                    "wt-20260922-first",
+                ]
+
+    @pytest.mark.asyncio
+    async def test_direct_sessions_ordered_numerically_without_records(self) -> None:
+        with _patch_git_info(
+            sessions=["test-proj/direct-2", "test-proj/direct-10"],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert self._row_ids(app) == [
+                    "ds-test-proj--direct-10",
+                    "ds-test-proj--direct-2",
+                ]
+
+    @pytest.mark.asyncio
+    async def test_running_direct_and_worktree_rows_interleave(
+        self, tmp_path: Path
+    ) -> None:
+        """A running row's position is its creation order, not its kind."""
+        wt = tmp_path / "20260922-work"
+        record = session_state.SessionRecord(
+            cwd=str(tmp_path),
+            project="test-proj",
+            session_type="direct",
+            created="2026-09-22T12:00:00+00:00",
+        )
+        with (
+            _patch_git_info(
+                sessions=["test-proj/20260922-work", "test-proj/direct-1"],
+                worktrees=[wt],
+                open_sessions={"test-proj/direct-1": record},
+            ),
+            patch("fujimoto.cli._creation_time", side_effect=lambda p: 0.0),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                # The direct session has a stamp; the worktree has none, so it
+                # sorts below rather than being grouped ahead of it.
+                assert self._row_ids(app) == [
+                    "ds-test-proj--direct-1",
+                    "wt-20260922-work",
+                ]
+
+    @pytest.mark.asyncio
+    async def test_a_record_stamp_beats_the_directory_time(
+        self, tmp_path: Path
+    ) -> None:
+        records = {
+            "test-proj/wt-a": _record(
+                tmp_path, name="wt-a", created="2026-09-22T18:00:00+00:00"
+            ),
+            "test-proj/wt-b": _record(tmp_path, name="wt-b"),
+        }
+        with (
+            _patch_git_info(open_sessions=records),
+            patch(
+                "fujimoto.cli._creation_time",
+                side_effect=lambda p: 200.0 if p.name == "wt-b" else 100.0,
+            ),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert self._row_ids(app) == ["wt-wt-a", "wt-wt-b"]
