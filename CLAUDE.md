@@ -161,8 +161,8 @@ the session ended.
 | closed / no record | stopped | — | ⚫ | inactive worktrees |
 
 Within the *sessions* section rows are ordered running, parked, then stopped.
-Inside each of those groups — and inside *inactive worktrees* — rows are
-**newest-created first** (see "Every group reads newest-first" below).
+Inside each of those groups — and inside *recovered* and *inactive worktrees* —
+rows are **newest-created first** (see "Every group reads newest-first" below).
 
 **Every deliberate end writes a `stop_kind`, and that is the entire recovery
 mechanism.** Stop and Park both call `mark_stopped`, which stamps
