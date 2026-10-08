@@ -110,7 +110,7 @@ Scaffold a fully commented starter file with:
 fujimoto --create-config      # writes .fujimoto.yaml to the main clone's root
 ```
 
-All three sections are optional:
+Every section is optional:
 
 ```yaml
 # Copy files from the main repo into the new worktree.
@@ -137,6 +137,10 @@ init:
     when: always
     continue_on_error: true
     cwd: "{{ source_dir }}"    # optional; defaults to the worktree root
+
+# Extra claude CLI arguments for every session in this project (a list, or a
+# string split like a shell would). A session's own saved launch options win.
+claude_args: [--plugin-dir, ./plugins]
 ```
 
 Notes:
@@ -151,6 +155,9 @@ Notes:
   `continue_on_error: true`. `{{ source_dir }}` and `{{ worktree_dir }}` expand
   to the main repo and worktree paths. On failure you're prompted to acknowledge
   the error before the screen is handed to the session.
+- **`claude_args`** applies to worktree and direct sessions alike (ad hoc
+  sessions have no project). See [Launch options](#launch-options) for how it
+  interacts with options saved per session.
 - fujimoto itself never creates a `.venv` — that's `uv` (or your tooling)
   running inside the worktree. Use an `init: [uv sync]` entry to set one up.
 
@@ -429,7 +436,47 @@ Select any session to see contextual options:
 difference is only whether fujimoto offers it back to you, and how eagerly.
 
 All session types also offer **Open terminal**, **Open in VS Code** and
-**Rename**.
+**Rename**, and **Launch options** — see [Launch options](#launch-options).
+
+### Launch options
+
+To start claude with extra CLI arguments (`--plugin-dir`, `--model`, …), press
+**Shift+Enter** instead of Enter on whatever launches the session — a branch
+in the create flow, *Launch* / *Resume* / *Fork session* in the session menu,
+*Ad hoc session* on the home screen. A dialog opens pre-filled with the options
+the launch would otherwise use; edit them and press Enter to launch, or Escape
+to cancel. Typing is shell-style, so quote arguments that contain spaces. The
+dialog links to the [claude CLI flags reference](https://code.claude.com/docs/en/cli-reference#cli-flags);
+click it to open it in your browser.
+
+Whatever you launch with is **saved for that session**, so later launches —
+relaunching a stopped, parked or recovered session, or launching a worktree
+again after terminating it — reuse them with a plain Enter. Shift+Enter always
+shows the dialog with the saved options, ready to change.
+
+To change them without launching, use **Launch options** in the session menu.
+The item shows the current options and where they come from; Enter in its
+dialog saves them for the next launch. Editing a running session's options
+does not touch the running claude; they apply the next time it starts. The
+item is offered for worktrees and Claude conversations always, and for direct
+and ad hoc sessions while they are running or stopped, since that is when they
+have a record to save onto.
+
+Options are looked up in this order: the session's saved options, a fork's
+parent's options, then `claude_args` in `.fujimoto.yaml`. Saving options that
+match the project default clears the override, so the session goes back to
+following `.fujimoto.yaml`. Saving an empty field is a deliberate "no options".
+
+Where they are saved: a worktree keeps them in its `.fujimoto/meta.json`, so
+they last as long as the worktree. A direct session keeps them on its session
+record, and when it is terminated they move to its Claude conversation, so
+resuming that transcript later brings them back.
+
+Shift+Enter only reaches fujimoto as its own key in terminals that speak the
+kitty keyboard protocol (kitty, Ghostty, WezTerm, recent iTerm2); elsewhere,
+e.g. macOS Terminal.app, it arrives as a plain Enter. **`o`** does the same on
+any list and works in every terminal. Options can't be changed on a running
+session — stop it first.
 
 ### View Session Log
 
@@ -543,6 +590,7 @@ These options are set per-session and don't affect your global tmux config.
 | Key | Action |
 |-----|--------|
 | `Enter` | Select |
+| `Shift+Enter` / `o` | Launch with options (see [Launch options](#launch-options)) |
 | `/` | Filter sessions by name (home screen) |
 | `s` | Search inside session transcripts (home screen) |
 | `r` | Refresh the session list (home screen) |

@@ -37,7 +37,8 @@ src/fujimoto/
 ├── git.py        # Git subprocess wrappers
 ├── tmux.py       # tmux session management
 ├── debug.py      # --debug / --debug-redacted diagnostic logging + redaction
-├── project_config.py  # Optional per-project .fujimoto.yaml (copy/link/init)
+├── project_config.py  # Optional per-project .fujimoto.yaml (copy/link/init/claude_args)
+├── launch_options.py  # Extra claude CLI args per session: resolve, save, replay
 ├── templates/    # Packaged scaffolds (fujimoto.yaml.template)
 └── claude/
     ├── __init__.py      # Re-exports public API

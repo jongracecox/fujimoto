@@ -114,7 +114,8 @@ src/fujimoto/
 ├── settings.py   # persistent user settings (~/.cache/fujimoto/settings.json)
 ├── session_state.py   # which sessions the user still considers open
 ├── debug.py      # --debug / --debug-redacted diagnostic logging + redaction
-├── project_config.py  # optional per-project .fujimoto.yaml (copy/link/init worktree setup)
+├── project_config.py  # optional per-project .fujimoto.yaml (copy/link/init worktree setup, claude_args)
+├── launch_options.py  # extra claude CLI args per session (resolve / save / replay)
 ├── templates/
 │   ├── __init__.py
 │   └── fujimoto.yaml.template  # commented scaffold written by `fujimoto --create-config`
@@ -215,6 +216,7 @@ row on the home screen without buying the user anything.
 - `build_worktree_path(project, title, project_root=None)` — with env var: `{root}/{project}/{YYYYMMDD}-{slug}`; with fallback: `<project_root>/.fujimoto/worktrees/{YYYYMMDD}-{slug}`
 - `get_project_worktrees_dir(project, project_root=None)` — with env var: `{root}/{project}`; with fallback: `<project_root>/.fujimoto/worktrees/`
 - `store_session_meta(path, base_branch, source_root=None, forked_from_session_id=None, forked_from_worktree=None)` / `read_session_meta(path)` — JSON metadata. `source_root` records the main repo the worktree was created from, so `project_config` can resolve copy/link sources on later launches (older worktrees without it fall back to deriving the root via `git.get_main_worktree_root`). The two `forked_from_*` keys record that the worktree was created by forking another session and where that session was running; keeping both in the worktree means a fork stays identifiable even if the source Claude transcript is deleted. All optional keys are omitted when `None`.
+- `has_session_meta(path)` / `read_claude_args(path)` / `write_claude_args(path, args)` — a worktree's saved launch options, stored as a `claude_args` list in `meta.json`. `read_claude_args` returns `None` for "no override" (distinct from `[]`, an explicit "no options"); `write_claude_args(None)` removes the key, and the writer only ever updates an existing `meta.json`, so it cannot plant one in a directory fujimoto did not create as a worktree.
 - `config_once_applied(path)` / `mark_config_once_applied(path)` — presence-of-marker-file flag (`.fujimoto/config_once_applied`) recording that `once` project-config actions have run for the worktree.
 - `get_next_direct_session_name(project, sessions)` — computes `{project}/direct-N`
 - `get_next_adhoc_session_name(sessions)` — computes `adhoc-N`
@@ -262,7 +264,9 @@ as JSON in `~/.cache/fujimoto/sessions.json` (same graceful-degradation pattern
 as `settings.py`: missing file, unreadable cache or corrupt JSON yield an empty
 state, never an error):
 - `SessionRecord` dataclass: `cwd`, `project`, `session_type`, `branch`,
-  `claude_session_id`, `stop_kind`, `created`, `last_seen`. `created` is
+  `claude_session_id`, `stop_kind`, `created`, `last_seen`, `claude_args`
+  (saved launch options for a non-worktree session; `None` = no override, and
+  `mark_open` preserves it — only `set_claude_args` changes it). `created` is
   stamped by the *first* `mark_open` and preserved by every later one, so it is
   the session's creation order rather than its last reconnect; it is what the
   home screen sorts by. Only `cwd` is required — every
@@ -278,7 +282,7 @@ state, never an error):
   `mark_closed(name)`, `mark_stopped(name, claude_session_id=None, *,
   kind=StopKind.STOPPED)` (the stamp that keeps a deliberate stop from being
   read as a crash; it always overwrites, so the user's latest decision wins),
-  `rename(old, new)`, `prune()`.
+  `rename(old, new)`, `set_claude_args(name, args)`, `prune()`.
 - **A record's presence means "open"; its absence means "closed"** — which is
   also what a session fujimoto has never launched looks like. `mark_closed`
   therefore just deletes the record, and there is no reconciliation pass and
@@ -300,7 +304,9 @@ pydantic):
   (`copy`/`link`/`init`) because `copy` would shadow `BaseModel.copy()` — the
   Python attributes are `copy_entries` / `link_entries` / `init_commands`.
   `on_error` (default `ABORT`) governs the caller's reaction to a hard init
-  failure.
+  failure. `claude_args` (default `[]`) is the project's default launch
+  options; a single string is `shlex.split` by a `field_validator`, so both
+  `claude_args: [--a, b]` and `claude_args: --a b` work.
 - `load_project_config(project_root)` — returns an empty config if the file is
   absent; raises `ConfigError` (reusing `config.ConfigError`) on malformed YAML
   or validation failure (config errors are surfaced, not swallowed).
@@ -318,6 +324,31 @@ pydantic):
 - `template_text()` / `write_config_template(project_root)` — read the bundled
   `templates/fujimoto.yaml.template` (via `importlib.resources`) and scaffold it
   into a repo (refusing to overwrite an existing file).
+
+**`launch_options.py`** — Extra `claude` CLI arguments ("launch options") per
+session:
+- `resolve(working_dir, tmux_name, claude_session_id, *, parent_dir,
+  parent_session_id)` → `Resolved(args, source)`. First hit wins: the
+  session's saved options (`Source.SESSION`), a fork parent's
+  (`Source.PARENT`), the project's `.fujimoto.yaml` `claude_args`
+  (`Source.PROJECT`), nothing (`Source.NONE`).
+- `saved_args(...)` checks three stores in order: the worktree's `meta.json`,
+  the `session_state` record (by tmux name), and
+  `~/.cache/fujimoto/launch_options.json` keyed by Claude conversation id.
+- `save(working_dir, tmux_name, claude_session_id, args)` writes to the
+  worktree's meta if it has one, otherwise to the record and (when the id is
+  known) the conversation cache. **An `args` equal to the project default
+  clears the override instead**, so a session that never asked for anything
+  different keeps following `.fujimoto.yaml` as it changes.
+- `remember_for_conversation(id, args)` — the conversation cache; called by
+  `SessionApp._keep_launch_options` on terminate, because terminate deletes
+  the record that held a direct session's options.
+- `parse(text)` / `render(args)` — `shlex.split` / `shlex.join`;
+  `LaunchOptionsError` on an unbalanced quote.
+- `project_default(working_dir)` reads `.fujimoto.yaml` from
+  `get_main_worktree_root(working_dir)`, so a worktree and a direct session
+  find the same file; any `GitError`/`ConfigError` contributes `()` (a
+  malformed config is already surfaced on the home screen).
 
 **`debug.py`** — Diagnostic logging for support (`--debug` / `--debug-redacted`):
 - Owns a process-wide optional `DebugLogger`. Every helper (`log`, `log_once`,
@@ -391,7 +422,7 @@ pydantic):
 - `list_all_sessions()` — lists all active tmux session names
 - `list_project_sessions(project)` — lists active tmux sessions for a project
 - `session_name(project, dir)` — naming convention: `{project}/{dir}`
-- `build_claude_command(system_prompt, resume_session_id, fork_session)` — composes the `claude` invocation. The flags **compose** rather than exclude each other (they used to be mutually exclusive): a fork needs `--resume <id> --fork-session` *and* `--append-system-prompt` together.
+- `build_claude_command(system_prompt, resume_session_id, fork_session, extra_args)` — composes the `claude` invocation. `extra_args` (the launch options) come straight after `claude`, each `shlex.quote`d since tmux runs the string through a shell. The flags **compose** rather than exclude each other (they used to be mutually exclusive): a fork needs `--resume <id> --fork-session` *and* `--append-system-prompt` together.
 - `create_session(name, dir, system_prompt, resume_session_id, fork_session)` — creates detached session, applies the configured prefix, runs the command from `build_claude_command`
 - `create_session_with_command(name, dir, command)` — like `create_session` but with custom command
 - `kill_session(name)` — `tmux kill-session -t`
@@ -438,7 +469,7 @@ responsible for running it off the event loop.
 **`cli.py`** — Textual TUI with async view management:
 - `LogBody` — frozen dataclass `(widget, text, folds)`: one highlightable body in the log viewer, its source text, and the `Collapsible`s that hide it. `Spans` is the alias for its `(start, end)` match offsets
 - `SessionInfo` — dataclass for session state (type, project, path, tmux name, active status, claude_session_id, claude_state, is_fork)
-- `LaunchTarget` — `NamedTuple` describing what `main()` should launch: `(project, working_dir, tmux_name, session_type, resume_session_id, forked_from_session_id, forked_from_worktree)`. A `NamedTuple` rather than a dataclass so existing index-based access keeps working.
+- `LaunchTarget` — `NamedTuple` describing what `main()` should launch: `(project, working_dir, tmux_name, session_type, resume_session_id, forked_from_session_id, forked_from_worktree, claude_args)`. `claude_args` is `None` unless the launch options dialog chose them for this launch. A `NamedTuple` rather than a dataclass so existing index-based access keeps working.
 - `SessionApp` — main app class with CSS styling
 - Module-level helpers: `_claude_state_label(state)`, `_relative_time(dt)`, `_get_claude_sessions(root, worktrees)`, `_is_fork_worktree(path)`, `_build_fork_system_prompt(project, working_dir, parent_worktree, base_branch)`, `_fit_snippet(snippet, max_width)` / `_render_snippet(snippet, max_width)` (search-result snippet rendering — see the `Content.assemble` gotcha), `_match_spans(text, matcher)` / `_highlight(text, spans)` / `_log_body(text, folds)` (log-viewer match highlighting, split so the regex half can run in a worker thread and only the `Content` half touches widgets), `_tool_collapsible(title, …)` (a `Collapsible` whose title is `Content`, never markup)
 - Instance helpers: `_build_session_label(session, state_suffix)` — the single source of truth for session row text (including the 🍴 fork marker), used by `_show_home`'s render of direct *and* worktree rows and by `_poll_session_states` for in-place updates; `_build_claude_session_items(sessions, prefix)` — shared row rendering for the resume (`rp-*`), fork (`fp-*`) and log-viewer (`lp-*`) pickers; `_matching_worktree(path)` — the project worktree a path refers to, compared by `resolve()`; `_direct_session_cwd(tmux_name)` — where a `direct-N` row really runs and on what branch (memoized in `_direct_cwd_cache`); `_resume_target(project, cwd, session=None)` — the tmux name and session type a resume should use
@@ -465,7 +496,7 @@ responsible for running it off the event loop.
   `_search_query`. Guarded on `_on_home`, so `r` is inert in other views.
 - Home screen sections: actions ("New worktree session", "New session in X", "Ad hoc session"), recovered 🔄 (only when there are any — see Session Status), sessions — running 🟢, parked 🅿️ and stopped 🟠 together, since the icon carries the distinction (with Claude state indicators on the running ones), inactive worktrees, previous Claude sessions (resumable, capped at 5), switch project
 - Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
-- Session actions submenu (in order): for active sessions, Connect → Fork session → Resume previous session; for inactive worktrees, Resume previous session → Fork session → Launch (resume is the more common action when picking an idle worktree). Then: View session log (whenever the path has a previous Claude session), Open terminal, Open in VS Code, Rename, Park session and Stop session (active only), Terminate session (active or stopped), Finish (worktree only), Cancel. Park, Stop and Terminate are separate menu items rather than one item plus a prompt — a menu is already a choice — but all route into the single `_end_session(session, terminate=..., park=...)` handler, which is also what the `Ctrl-A x` prompt calls. Claude-session items show just "Resume" + View session log + Open terminal/VS Code + Cancel. "Fork session" is always inserted at index 1 (`items.insert(1, ...)`) so its position holds across both layouts.
+- Session actions submenu (in order): for active sessions, Connect → Fork session → Resume previous session; for inactive worktrees, Resume previous session → Fork session → Launch (resume is the more common action when picking an idle worktree). Then: View session log (whenever the path has a previous Claude session), Open terminal, Open in VS Code, Rename, Park session and Stop session (active only), Terminate session (active or stopped), Finish (worktree only), Cancel. Park, Stop and Terminate are separate menu items rather than one item plus a prompt — a menu is already a choice — but all route into the single `_end_session(session, terminate=..., park=...)` handler, which is also what the `Ctrl-A x` prompt calls. Claude-session items show just "Resume" + View session log + Open terminal/VS Code + Launch options + Cancel. "Launch options" sits after Rename for every session that has somewhere to save them (see the launch-options design decision). "Fork session" is always inserted at index 1 (`items.insert(1, ...)`) so its position holds across both layouts.
 - "Resume previous session" auto-launches the sole candidate when only one previous Claude session exists for the path, skipping the picker. Two or more sessions still show the picker.
 - Fork flow: `sa-fork` → `#fork-title-input` → `#fork-branch-list` (parent branch (default) / parent's base / another branch → the shared `_show_branch_picker`) → conversation picker `#fork-picker` (`fp-{i}`, only when >1 candidate) → the shared `_finalize_create` / `_do_create_and_launch`. Offered for worktree *and* direct sessions that have at least one previous Claude session.
 - Session log viewer: `sa-viewlog` → `_show_log_picker` → `_show_session_log`. The
@@ -674,6 +705,47 @@ Three custom exception types, all caught in `main()`:
   in the home render path may touch the disk"): it fills
   `_creation_times: dict[str, float]` for every worktree and every open
   record's cwd, and `_build_home_items` only reads that dict.
+- **Launch options (Shift+Enter / `o`)**: every launch goes through
+  `SessionApp._launch(target)` — never `self._launch_target = …; self.exit()`
+  directly — which is the single place the dialog can intercept. Mechanics:
+  - `action_launch_with_options` sets `_launch_options_armed` and then fires
+    the focused widget's own Enter (`ListView.action_select_cursor()` /
+    `Input.action_submit()`), so it reuses every existing handler. The flag
+    **survives the steps in between** (a title box, a branch list, a
+    conversation picker) and is dropped by `_show_home` and
+    `_show_session_search`; `_launch` consumes it.
+  - `_LAUNCH_OPTION_WIDGETS` lists the widgets where it means anything;
+    `check_action` uses it to show the binding only there.
+  - An armed launch of a **running** session just connects, with a warning
+    toast: options belong to a claude process, and that one already exists.
+  - `LaunchOptionsDialog` is a `ModalScreen` pre-filled from
+    `launch_options.resolve`, so editing is the normal case. Escape cancels
+    the launch (it does **not** fall back to defaults), and a `shlex` error
+    stays in the dialog. Its link to the claude CLI flags docs
+    (`CLAUDE_CLI_FLAGS_URL`) is a `[@click=screen.open_docs]` action, not a
+    `[link=…]` style: Textual captures the mouse, and `App` has an `open_url`
+    method but no `action_open_url`, so the dialog's own `action_open_docs`
+    calls it.
+  - `main()` calls `_launch_claude_args(target, resolved_name)` after
+    `mark_open` (so a direct session's record exists to save onto): an
+    explicit choice is saved and used; otherwise it resolves, and an
+    inherited (fork-parent) value is saved onto the fork so it outlives the
+    parent.
+  - **The session menu edits them without launching** (`sa-options`, after
+    Rename). Its label is `Content` built by `_launch_options_label` (the
+    options are user text) and shows the resolved options plus their
+    `Source`. `_edit_launch_options` opens the same dialog with
+    `editing=True` (only the hint differs), saves via `launch_options.save`
+    and re-renders the menu with the highlight back on the item.
+    `_can_edit_launch_options` hides it from a direct/ad hoc row with no open
+    record, where there is nothing to save onto. Only a `claude` row passes
+    its `claude_session_id` to `save`: a direct row's id is just the latest
+    transcript in its directory, which may belong to a different session.
+  - **Where they live is chosen by lifetime.** Terminate deletes the
+    `SessionRecord`, so options kept only there would vanish exactly when the
+    user expects "terminate, relaunch with Enter" to reuse them. A worktree's
+    `meta.json` outlives a terminate; a direct session's options are copied to
+    the conversation cache by `_keep_launch_options` before `mark_closed`.
 - **Remembering sessions across a restart**: `session_state.py` records every session as open at launch — in `main()`, **before** `launch_claude_in_tmux` blocks on the attach, so a host that dies mid-session still has a record to come back as. `_init_git_info` loads the pruned state into `_open_sessions`; `_idle_records()` derives the open-but-not-running set for the current project; `_build_home_items` splits those by `stop_kind` — `RECOVERED` into its own section above *sessions*, `PARKED`/`STOPPED` into *sessions* after the running rows — and excludes all of them from *inactive worktrees*. `SessionInfo.stop_kind` carries the record's kind into the TUI and `SessionInfo.is_stopped` is *derived* from it (an open record with no live session), so there is one source of truth for which flavour of not-running a row is. There is deliberately no bulk-restore row: relaunching N claude processes does not restore the terminals and window arrangement a crash actually took. `_end_session(session, terminate=..., park=...)` is the single handler behind every menu item and every outcome of the `Ctrl-A x` prompt; it tolerates a `kill_session` failure only when `session_exists` confirms the session is already gone (otherwise marking a live session closed would hide it). `_do_delete_worktree` and `on_rename_submitted` keep the store honest via `mark_closed` / `rename`.
 - **Session metadata**: `.fujimoto/meta.json` stored in worktree directory records the base branch for cherry-pick targeting, the `source_root` (main repo) for project-config source resolution, and — for forks — `forked_from_session_id` plus `forked_from_worktree`. The `.fujimoto/` directory contains a `.gitignore` with `*` so its contents are automatically ignored by git.
 - **Project config (`.fujimoto.yaml`)**: An optional, committed per-project file (`project_config.py`) declaring files to copy/link into a worktree and init commands to run. Applied centrally in `main()`'s launch loop (parent process, **before** `tmux attach`) by `_apply_worktree_config(working_dir)`, for **every** worktree connection mode (new, reconnect-to-live, relaunch/resume) — so copy/link/init run on each connect, not just creation. `_do_create_and_launch` no longer applies config; it only creates the worktree and stores meta. Key mechanics:
@@ -1023,6 +1095,13 @@ Things discovered during development that are easy to forget:
 - **Anything built from transcript text must be `Content`, including a `Collapsible` title.** The `Content.assemble` rule below is usually stated about *bodies*, but a widget's title argument is parsed as markup too: `Collapsible(title=...)` hands the string to `Content.from_text(markup=True)`, so a `⚒ Bash  command: until [ "$(gh run list …` title raised `MarkupError: Expected markup value` and took the whole viewer down. The same applies to the viewer's header (a session title or first prompt) and the Claude-session picker rows (`_build_claude_session_items`), which mix a model-written title with a `[dim]` timestamp — that one is `Content.assemble`, since it is styled as well as arbitrary. Rule of thumb: if a string came out of a transcript, it reaches a widget as `Content` or not at all.
 - **`Static`/`Label` text in tests is read with `str(widget.render())`, not `.renderable`** — Textual 8 dropped the attribute. `render()` returns the *resolved* content, so console markup (`[dim]`, `[b]`) is gone from the string; assert on the plain text. And a `ListItem`'s own children are composed when the item mounts, so `item.query(Label)` needs an `await pilot.pause()` after a non-awaited `ListView.append`.
 - **A worker's `is_cancelled` is not a synchronisation primitive.** Cancelling a Textual worker (or letting `exclusive=True` supersede it) does not unwind work already queued on the event loop via `call_from_thread`. Anything a worker hands back must carry a generation token the handler checks — see `_search_token`. Bump the token *before* cancelling, so a batch in flight is stale from the moment the decision is made. **And before every `await` on the teardown path, not just the cancel** — `_clear_search_results` awaits `ListView.clear()`, which yields, so a queued batch was applied *during* the clear while its token still looked current. It mounted `sr-0` into the list the fresh scan then appended its own `sr-0` to, and Textual's `DuplicateIds` took the whole app down mid-search.
+- **Shift+Enter is not a portable key.** Fed to Textual's `XTermParser`:
+  `\r` → `enter`, the kitty-protocol `ESC[13;2u` → `shift+enter`, but xterm's
+  modifyOtherKeys form `ESC[27;2;13~` (what tmux emits with `extended-keys`
+  on) → **no key at all**. So in a legacy terminal Shift+Enter is a plain
+  Enter, and if the TUI runs inside tmux it can be swallowed outright. That is
+  why the launch-options binding is `shift+enter,o`: `o` is the fallback that
+  works everywhere a list has focus (an `Input` types it instead).
 - **OSC escape writes during a Textual run must go to `sys.__stdout__`, not `sys.stdout`.** Textual replaces `sys.stdout` with an internal capture while the app runs, so an OSC sequence (e.g. the `set_terminal_title` iTerm2/window-title escape) written to `sys.stdout` from inside a running app — such as `_init_git_info` updating the title on project switch — never reaches the terminal. `sys.__stdout__` stays connected to the real tty, so writing there works both before and during `app.run()`. This is why the session-manager title set at `main()` (pre-run) worked but the in-app update initially did not.
 
 ## Releases
