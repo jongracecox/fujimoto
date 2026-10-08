@@ -94,6 +94,12 @@ class SessionRecord:
     # fall back to the worktree directory's creation time.
     created: str = ""
     last_seen: str = ""
+    # Extra `claude` arguments saved from the launch options dialog, replayed
+    # on every relaunch. None means "no override" (follow `.fujimoto.yaml`);
+    # an empty list is an explicit choice of no options. Worktrees keep theirs
+    # in `meta.json` instead, which outlives a terminate — see
+    # `launch_options`.
+    claude_args: list[str] | None = None
 
     @property
     def path(self) -> Path:
@@ -156,6 +162,7 @@ def load_state() -> dict[str, SessionRecord]:
         # the wrong type — must still load, just without an ordering stamp.
         created = kwargs.get("created")
         kwargs["created"] = created if isinstance(created, str) else ""
+        claude_args = raw.get("claude_args")
         records[name] = SessionRecord(
             **kwargs,
             # `parked` is what a fujimoto from before recovery wrote; honour it
@@ -164,6 +171,12 @@ def load_state() -> dict[str, SessionRecord]:
                 raw.get("stop_kind") or (StopKind.PARKED if raw.get("parked") else None)
             ),
             last_seen=raw.get("last_seen") or "",
+            claude_args=(
+                list(claude_args)
+                if isinstance(claude_args, list)
+                and all(isinstance(a, str) for a in claude_args)
+                else None
+            ),
         )
     debug.log_once(
         "session-state-load",
@@ -264,6 +277,9 @@ def mark_open(
         claude_session_id=claude_session_id,
         created=created,
         last_seen=_now(),
+        # Launch options are set separately (`set_claude_args`); a launch on
+        # its own must not forget the ones saved earlier.
+        claude_args=existing.claude_args if existing is not None else None,
     )
     debug.log(
         "session_state.mark_open",
@@ -319,6 +335,22 @@ def mark_stopped(
     if claude_session_id is not None:
         record.claude_session_id = claude_session_id
     record.stop_kind = kind
+    save_state(state)
+
+
+def set_claude_args(tmux_name: str, args: list[str] | None) -> None:
+    """Save (or, with None, clear) the launch options of an open session."""
+    state = load_state()
+    record = state.get(tmux_name)
+    debug.log(
+        "session_state.set_claude_args",
+        session=debug.rv(tmux_name),
+        found=record is not None,
+        cleared=args is None,
+    )
+    if record is None:
+        return
+    record.claude_args = args
     save_state(state)
 
 

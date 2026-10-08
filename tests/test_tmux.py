@@ -281,6 +281,15 @@ class TestBuildClaudeCommand:
     def test_resume_only(self) -> None:
         assert build_claude_command(resume_session_id="abc") == "claude --resume abc"
 
+    def test_extra_args_come_first_and_are_quoted(self) -> None:
+        assert (
+            build_claude_command(
+                resume_session_id="abc",
+                extra_args=("--plugin-dir", "my plugins", "$HOME"),
+            )
+            == "claude --plugin-dir 'my plugins' '$HOME' --resume abc"
+        )
+
     def test_resume_ignores_fork_flag_without_id(self) -> None:
         assert build_claude_command(fork_session=True) == "claude"
 
@@ -599,6 +608,7 @@ class TestLaunchClaudeInTmux:
                 system_prompt=None,
                 resume_session_id=None,
                 fork_session=False,
+                extra_args=(),
             )
             mock_attach.assert_called_once_with("proj/20260309-test")
 

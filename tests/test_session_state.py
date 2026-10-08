@@ -402,3 +402,29 @@ class TestStatePath:
             session_state._state_path()
             == tmp_path / ".cache" / "fujimoto" / "sessions.json"
         )
+
+
+class TestClaudeArgs:
+    def test_set_persists_and_survives_relaunch(self, tmp_path: Path) -> None:
+        kwargs = dict(cwd=tmp_path, project="proj", session_type="direct")
+        session_state.mark_open("proj/direct-1", **kwargs)
+        session_state.set_claude_args("proj/direct-1", ["--a", "b c"])
+        session_state.mark_open("proj/direct-1", **kwargs)
+        assert session_state.load_state()["proj/direct-1"].claude_args == [
+            "--a",
+            "b c",
+        ]
+        session_state.set_claude_args("proj/direct-1", None)
+        assert session_state.load_state()["proj/direct-1"].claude_args is None
+
+    def test_set_on_unknown_session_is_noop(self) -> None:
+        session_state.set_claude_args("proj/nope", ["--a"])
+        assert session_state.load_state() == {}
+
+    @pytest.mark.parametrize("raw", ["--a", [1], None])
+    def test_malformed_stored_value_reads_none(self, raw, _isolate_state) -> None:
+        _isolate_state.parent.mkdir(parents=True)
+        _isolate_state.write_text(
+            json.dumps({"proj/x": {"cwd": "/tmp", "claude_args": raw}})
+        )
+        assert session_state.load_state()["proj/x"].claude_args is None

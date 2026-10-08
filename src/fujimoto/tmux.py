@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 from fujimoto import debug
@@ -459,15 +461,18 @@ def build_claude_command(
     system_prompt: str | None = None,
     resume_session_id: str | None = None,
     fork_session: bool = False,
+    extra_args: Sequence[str] = (),
 ) -> str:
     """Compose the `claude` invocation for a new tmux session.
 
     The flags compose rather than exclude each other: a forked session needs
     both `--resume <id> --fork-session` (to inherit the conversation) and
     `--append-system-prompt` (to tell it that it is a fork and where the
-    original worktree lives).
+    original worktree lives). `extra_args` are the user's launch options;
+    they come first and are shell-quoted, since tmux runs the result through
+    a shell.
     """
-    parts = ["claude"]
+    parts = ["claude", *(shlex.quote(a) for a in extra_args)]
     if resume_session_id:
         parts.append(f"--resume {resume_session_id}")
         if fork_session:
@@ -484,11 +489,13 @@ def create_session(
     system_prompt: str | None = None,
     resume_session_id: str | None = None,
     fork_session: bool = False,
+    extra_args: Sequence[str] = (),
 ) -> None:
     claude_cmd = build_claude_command(
         system_prompt=system_prompt,
         resume_session_id=resume_session_id,
         fork_session=fork_session,
+        extra_args=extra_args,
     )
     debug.log(
         "tmux.create_session",
@@ -585,6 +592,7 @@ def launch_claude_in_tmux(
     system_prompt: str | None = None,
     resume_session_id: str | None = None,
     fork_session: bool = False,
+    extra_args: Sequence[str] = (),
 ) -> None:
     name = tmux_name or session_name(project_name, working_dir.name)
     debug.log(
@@ -603,5 +611,6 @@ def launch_claude_in_tmux(
             system_prompt=system_prompt,
             resume_session_id=resume_session_id,
             fork_session=fork_session,
+            extra_args=extra_args,
         )
         attach_session(name)

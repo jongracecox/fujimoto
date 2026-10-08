@@ -216,6 +216,54 @@ def read_session_meta(worktree_path: Path) -> dict[str, str]:
     return meta
 
 
+def has_session_meta(worktree_path: Path) -> bool:
+    """Whether the directory carries fujimoto worktree metadata."""
+    return (_get_meta_dir(worktree_path) / META_FILENAME).is_file()
+
+
+def _load_meta_raw(worktree_path: Path) -> dict[str, object]:
+    try:
+        meta = json.loads((_get_meta_dir(worktree_path) / META_FILENAME).read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def read_claude_args(worktree_path: Path) -> list[str] | None:
+    """The launch options saved in a worktree's metadata, if it has any.
+
+    None means "no override saved" — distinct from an empty list, which is an
+    explicit choice to launch with no options at all.
+    """
+    raw = _load_meta_raw(worktree_path).get("claude_args")
+    if not isinstance(raw, list):
+        return None
+    args = [a for a in raw if isinstance(a, str)]
+    return args if len(args) == len(raw) else None
+
+
+def write_claude_args(worktree_path: Path, args: list[str] | None) -> None:
+    """Save (or, with None, clear) a worktree's launch options.
+
+    Only ever updates an existing `meta.json` — a directory fujimoto did not
+    create as a worktree has no business growing one.
+    """
+    if not has_session_meta(worktree_path):
+        return
+    meta = _load_meta_raw(worktree_path)
+    if args is None:
+        meta.pop("claude_args", None)
+    else:
+        meta["claude_args"] = args
+    (_get_meta_dir(worktree_path) / META_FILENAME).write_text(json.dumps(meta))
+    debug.log(
+        "config.write_claude_args",
+        worktree=debug.rp(worktree_path),
+        cleared=args is None,
+        count=len(args or []),
+    )
+
+
 CONFIG_ONCE_MARKER = "config_once_applied"
 
 
