@@ -10,6 +10,7 @@ from __future__ import annotations
 import glob as globmod
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -18,7 +19,14 @@ from importlib import resources
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from fujimoto import debug
 
@@ -116,6 +124,21 @@ class ProjectConfig(BaseModel):
     link_entries: list[LinkEntry] = Field(default_factory=list, alias="link")
     init_commands: list[InitCommand] = Field(default_factory=list, alias="init")
     on_error: OnError = OnError.ABORT
+    # Extra `claude` arguments every session in the project launches with,
+    # unless the session has saved options of its own.
+    claude_args: list[str] = Field(default_factory=list)
+
+    @field_validator("claude_args", mode="before")
+    @classmethod
+    def _split_claude_args(cls, value: object) -> object:
+        # A single string is split like a shell would, so
+        # `claude_args: --plugin-dir ./plugins` works as well as a list.
+        if isinstance(value, str):
+            try:
+                return shlex.split(value)
+            except ValueError as exc:
+                raise ValueError(f"cannot split claude_args: {exc}") from exc
+        return value
 
 
 @dataclass
@@ -164,6 +187,7 @@ def load_project_config(project_root: Path) -> ProjectConfig:
         link=len(config.link_entries),
         init=len(config.init_commands),
         on_error=config.on_error,
+        claude_args=len(config.claude_args),
     )
     return config
 

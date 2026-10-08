@@ -657,6 +657,13 @@ def rp(value: object) -> str:
     return _logger.path_value(value) if _logger is not None else str(value)
 
 
+def rargs(args: Iterable[str]) -> str:
+    """Render a command line, keeping flags and redacting values (no-op when off)."""
+    if _logger is None:
+        return " ".join(str(a) for a in args)
+    return _logger.args(args)
+
+
 def rref(value: object) -> str:
     """Redact a git ref, keeping `main`/`HEAD` readable (no-op when off)."""
     if _logger is None or not _logger.redact:

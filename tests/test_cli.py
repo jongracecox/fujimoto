@@ -31,6 +31,8 @@ from fujimoto.cli import (
     ICON_PARKED,
     ICON_RECOVERED,
     ICON_SHIELD,
+    CLAUDE_CLI_FLAGS_URL,
+    LaunchOptionsDialog,
     LaunchTarget,
     SessionApp,
     SessionInfo,
@@ -42,6 +44,7 @@ from fujimoto.cli import (
     SNIPPET_MATCH_STYLE,
     _fit_snippet,
     _get_claude_sessions,
+    _launch_claude_args,
     _highlight,
     _match_spans,
     _relative_time,
@@ -51,9 +54,14 @@ from fujimoto.cli import (
     _tool_summary,
     main,
 )
-from fujimoto import session_state
+from fujimoto import launch_options, session_state
 from fujimoto.session_state import StopKind
-from fujimoto.config import ConfigError
+from fujimoto.config import (
+    ConfigError,
+    read_claude_args,
+    store_session_meta,
+    write_claude_args,
+)
 from fujimoto.git import GitError
 from fujimoto.tmux import TmuxError
 
@@ -110,6 +118,12 @@ def _patch_git_info(
                 return_value=worktree_root or Path("/nonexistent"),
             ),
             patch("fujimoto.cli.session_name", side_effect=lambda p, d: f"{p}/{d}"),
+            # The session menu's launch-options label looks up the project's
+            # `.fujimoto.yaml` via git; keep that off the real git too.
+            patch(
+                "fujimoto.launch_options.get_main_worktree_root",
+                side_effect=GitError("not in a test repo"),
+            ),
             # Never shell out to a real tmux from a test: an unpatched lookup
             # would make every direct row fall back to the project root.
             patch(
@@ -155,9 +169,15 @@ def _clean_argv(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def _isolate_session_state(tmp_path: Path):
     """Keep the TUI tests off the real ~/.cache/fujimoto/sessions.json."""
-    with patch(
-        "fujimoto.session_state._state_path",
-        return_value=tmp_path / "session-state" / "sessions.json",
+    with (
+        patch(
+            "fujimoto.session_state._state_path",
+            return_value=tmp_path / "session-state" / "sessions.json",
+        ),
+        patch(
+            "fujimoto.launch_options._cache_path",
+            return_value=tmp_path / "session-state" / "launch_options.json",
+        ),
     ):
         yield
 
@@ -953,6 +973,7 @@ class TestMain:
                 system_prompt="test",
                 resume_session_id=None,
                 fork_session=False,
+                extra_args=(),
             )
 
     def test_no_launch_when_target_not_set(self) -> None:
@@ -998,6 +1019,7 @@ class TestMain:
                 system_prompt="test",
                 resume_session_id=None,
                 fork_session=False,
+                extra_args=(),
             )
 
 
@@ -4619,6 +4641,7 @@ class TestMainResume:
                 system_prompt=None,
                 resume_session_id="resume-session-id",
                 fork_session=False,
+                extra_args=(),
             )
 
     def test_fork_resumes_parent_with_fork_flag(self, tmp_path: Path) -> None:
@@ -8210,6 +8233,7 @@ class TestContextAwareBindings:
                     "Filter",
                     "Search transcripts",
                     "Refresh",
+                    "Launch with options",
                 }
 
     @pytest.mark.asyncio
@@ -8914,3 +8938,472 @@ class TestSessionOrdering:
             async with app.run_test() as pilot:
                 await pilot.pause()
                 assert self._row_ids(app) == ["wt-wt-a", "wt-wt-b"]
+
+
+class TestLaunchOptions:
+    """Shift+Enter / `o` asks for claude launch options before launching."""
+
+    async def _open_actions(self, app: SessionApp, pilot, item_id: str) -> None:
+        home_list = app.query_one("#home-list", ListView)
+        for i, item in enumerate(home_list.children):
+            if item.id == item_id:
+                home_list.index = i
+                break
+        await pilot.press("enter")
+        await pilot.pause()
+
+    @staticmethod
+    def _select(app: SessionApp, item_id: str) -> None:
+        actions = app.query_one("#session-actions", ListView)
+        actions.index = [i.id for i in actions.children].index(item_id)
+
+    @pytest.mark.asyncio
+    async def test_enter_launches_without_asking(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                self._select(app, "sa-launch")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+                assert app._launch_target.claude_args is None
+                assert not isinstance(app.screen, LaunchOptionsDialog)
+
+    @pytest.mark.asyncio
+    async def test_shift_enter_prefills_saved_options(self, tmp_path: Path) -> None:
+        root = tmp_path / "wts"
+        wt = root / "20260309-test"
+        with _patch_git_info(worktrees=[wt], worktree_root=root):
+            store_session_meta(wt, "main")
+            write_claude_args(wt, ["--plugin-dir", "my plugins"])
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                self._select(app, "sa-launch")
+                await pilot.press("shift+enter")
+                await pilot.pause()
+                assert isinstance(app.screen, LaunchOptionsDialog)
+                box = app.screen.query_one("#lo-input", Input)
+                assert box.value == "--plugin-dir 'my plugins'"
+                assert app._launch_target is None
+                box.value = "--model opus"
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+                assert app._launch_target.claude_args == ("--model", "opus")
+
+    @pytest.mark.asyncio
+    async def test_o_is_the_fallback_key(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                self._select(app, "sa-launch")
+                await pilot.press("o")
+                await pilot.pause()
+                assert isinstance(app.screen, LaunchOptionsDialog)
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+                assert app._launch_target.claude_args == ()
+
+    @pytest.mark.asyncio
+    async def test_dialog_links_to_cli_flags_docs(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                self._select(app, "sa-launch")
+                await pilot.press("o")
+                await pilot.pause()
+                assert isinstance(app.screen, LaunchOptionsDialog)
+                with patch.object(app, "open_url") as open_url:
+                    # "See the " is 8 cells; the link text starts after it.
+                    await pilot.click("#lo-docs", offset=(10, 0))
+                    await pilot.pause()
+                open_url.assert_called_once_with(CLAUDE_CLI_FLAGS_URL)
+                assert isinstance(app.screen, LaunchOptionsDialog)
+
+    @pytest.mark.asyncio
+    async def test_escape_cancels_the_launch(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                self._select(app, "sa-launch")
+                await pilot.press("shift+enter")
+                await pilot.pause()
+                await pilot.press("escape")
+                await pilot.pause()
+                assert not isinstance(app.screen, LaunchOptionsDialog)
+                assert app._launch_target is None
+                assert app._launch_options_armed is False
+                # A later plain Enter launches without asking again.
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+                assert app._launch_target.claude_args is None
+
+    @pytest.mark.asyncio
+    async def test_unparseable_options_stay_in_the_dialog(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                self._select(app, "sa-launch")
+                await pilot.press("shift+enter")
+                await pilot.pause()
+                app.screen.query_one("#lo-input", Input).value = "--x 'unclosed"
+                await pilot.press("enter")
+                await pilot.pause()
+                assert isinstance(app.screen, LaunchOptionsDialog)
+                error = str(app.screen.query_one("#lo-error", Static).render())
+                assert "Can't parse" in error
+                assert app._launch_target is None
+
+    @pytest.mark.asyncio
+    async def test_running_session_connects_without_asking(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(sessions=["test-proj/20260309-test"], worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                self._select(app, "sa-connect")
+                await pilot.press("shift+enter")
+                await pilot.pause()
+                assert not isinstance(app.screen, LaunchOptionsDialog)
+                assert app._launch_target is not None
+                assert app._launch_target.claude_args is None
+
+    @pytest.mark.asyncio
+    async def test_arming_survives_steps_and_resets_at_home(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                home_list.index = [i.id for i in home_list.children].index(
+                    "wt-20260309-test"
+                )
+                await pilot.press("shift+enter")
+                await pilot.pause()
+                assert app.query_one("#session-actions", ListView)
+                assert app._launch_options_armed is True
+                await pilot.press("escape")
+                await pilot.pause()
+                assert app._launch_options_armed is False
+
+    @pytest.mark.asyncio
+    async def test_binding_shown_only_on_launch_widgets(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert app.check_action("launch_with_options", ()) is True
+                await pilot.press("slash")
+                await pilot.pause()
+                assert app.check_action("launch_with_options", ()) is False
+                # Inert where it isn't offered.
+                await app.action_launch_with_options()
+                assert app._launch_options_armed is False
+
+    @pytest.mark.asyncio
+    async def test_shift_enter_submits_an_input(self, tmp_path: Path) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._show_direct_title_form()
+                await pilot.pause()
+                await pilot.press("shift+enter")
+                await pilot.pause()
+                assert isinstance(app.screen, LaunchOptionsDialog)
+
+    @pytest.mark.asyncio
+    async def test_fork_prefills_parent_options(self, tmp_path: Path) -> None:
+        parent = tmp_path / "parent"
+        child = tmp_path / "child"
+        for d in (parent, child):
+            d.mkdir()
+            store_session_meta(d, "main")
+        write_claude_args(parent, ["--plugin-dir", "./p"])
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app._launch_options_armed = True
+                app._launch(
+                    LaunchTarget(
+                        "test-proj",
+                        child,
+                        None,
+                        "worktree",
+                        forked_from_session_id="abc",
+                        forked_from_worktree=parent,
+                    )
+                )
+                await pilot.pause()
+                assert isinstance(app.screen, LaunchOptionsDialog)
+                box = app.screen.query_one("#lo-input", Input)
+                assert box.value == "--plugin-dir ./p"
+
+
+class TestLaunchClaudeArgs:
+    """`main()`'s half: resolve the options for a launch, saving new choices."""
+
+    def test_explicit_choice_is_saved_and_used(self, tmp_path: Path) -> None:
+        store_session_meta(tmp_path, "main")
+        target = LaunchTarget(
+            "p", tmp_path, None, "worktree", claude_args=("--model", "opus")
+        )
+        assert _launch_claude_args(target, "p/x") == ("--model", "opus")
+        assert read_claude_args(tmp_path) == ["--model", "opus"]
+
+    def test_saved_options_replay(self, tmp_path: Path) -> None:
+        store_session_meta(tmp_path, "main")
+        write_claude_args(tmp_path, ["--a"])
+        target = LaunchTarget("p", tmp_path, None, "worktree")
+        assert _launch_claude_args(target, "p/x") == ("--a",)
+
+    def test_fork_keeps_inherited_options(self, tmp_path: Path) -> None:
+        parent, child = tmp_path / "parent", tmp_path / "child"
+        for d in (parent, child):
+            d.mkdir()
+            store_session_meta(d, "main")
+        write_claude_args(parent, ["--a"])
+        target = LaunchTarget(
+            "p",
+            child,
+            None,
+            "worktree",
+            forked_from_session_id="abc",
+            forked_from_worktree=parent,
+        )
+        assert _launch_claude_args(target, "p/child") == ("--a",)
+        assert read_claude_args(child) == ["--a"]
+
+    def test_main_passes_options_to_tmux(self) -> None:
+        app1 = SessionApp.__new__(SessionApp)
+        app1._launch_target = LaunchTarget("proj", Path("/tmp/test"), None, "adhoc")
+        app2 = SessionApp.__new__(SessionApp)
+        app2._launch_target = None
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]),
+            patch.object(app1, "run"),
+            patch.object(app2, "run"),
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
+            patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli.take_pending_action", return_value=None),
+            patch("fujimoto.cli._session_branch", return_value=""),
+            patch("fujimoto.cli._session_terminal_title", return_value="t"),
+            patch("fujimoto.cli._launch_claude_args", return_value=("--x",)),
+        ):
+            main()
+        assert mock_launch.call_args.kwargs["extra_args"] == ("--x",)
+
+
+class TestTerminateKeepsLaunchOptions:
+    @pytest.mark.asyncio
+    async def test_direct_session_options_move_to_its_conversation(
+        self, tmp_path: Path
+    ) -> None:
+        session_state.mark_open(
+            "test-proj/direct-1",
+            cwd=tmp_path,
+            project="test-proj",
+            session_type="direct",
+            claude_session_id="conv-1",
+        )
+        session_state.set_claude_args("test-proj/direct-1", ["--a"])
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                session = SessionInfo(
+                    name="direct-1",
+                    session_type="direct",
+                    project="test-proj",
+                    path=tmp_path,
+                    tmux_session="test-proj/direct-1",
+                    is_active=False,
+                    branch="",
+                    stop_kind=StopKind.STOPPED,
+                )
+                await app._end_session(session, terminate=True)
+        assert launch_options.saved_args(tmp_path, None, "conv-1") == ("--a",)
+
+    @pytest.mark.asyncio
+    async def test_nothing_to_keep(self, tmp_path: Path) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                session = SessionInfo(
+                    name="direct-1",
+                    session_type="direct",
+                    project="test-proj",
+                    path=tmp_path,
+                    tmux_session="test-proj/direct-1",
+                    is_active=False,
+                    branch="",
+                    claude_session_id="conv-1",
+                )
+                app._keep_launch_options(session)
+        assert launch_options.saved_args(tmp_path, None, "conv-1") is None
+
+
+class TestLaunchOptionsMenu:
+    """The session menu edits saved launch options without launching."""
+
+    async def _open_actions(self, app: SessionApp, pilot, item_id: str) -> None:
+        home_list = app.query_one("#home-list", ListView)
+        home_list.index = [i.id for i in home_list.children].index(item_id)
+        await pilot.press("enter")
+        await pilot.pause()
+
+    @staticmethod
+    def _ids(app: SessionApp) -> list[str]:
+        return [i.id for i in app.query_one("#session-actions", ListView).children]
+
+    @staticmethod
+    def _label(app: SessionApp) -> str:
+        item = app.query_one("#sa-options", ListItem)
+        return str(item.query_one(Label).render())
+
+    @pytest.mark.asyncio
+    async def test_edit_saves_without_launching(self, tmp_path: Path) -> None:
+        root = tmp_path / "wts"
+        wt = root / "20260309-test"
+        with _patch_git_info(worktrees=[wt], worktree_root=root):
+            store_session_meta(wt, "main")
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                assert "sa-options" in self._ids(app)
+                assert "(none)" in self._label(app)
+                actions = app.query_one("#session-actions", ListView)
+                actions.index = self._ids(app).index("sa-options")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert isinstance(app.screen, LaunchOptionsDialog)
+                app.screen.query_one("#lo-input", Input).value = "--plugin-dir ./p"
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is None
+                assert read_claude_args(wt) == ["--plugin-dir", "./p"]
+                # Back on the menu, on the same item, showing the new value.
+                actions = app.query_one("#session-actions", ListView)
+                assert actions.highlighted_child.id == "sa-options"
+                assert "--plugin-dir ./p" in self._label(app)
+                assert "saved for this session" in self._label(app)
+
+    @pytest.mark.asyncio
+    async def test_cancel_changes_nothing(self, tmp_path: Path) -> None:
+        root = tmp_path / "wts"
+        wt = root / "20260309-test"
+        with _patch_git_info(worktrees=[wt], worktree_root=root):
+            store_session_meta(wt, "main")
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                app._launch_options_armed = True
+                app._edit_launch_options(app._selected_session)
+                await pilot.pause()
+                assert app._launch_options_armed is False
+                await pilot.press("escape")
+                await pilot.pause()
+                assert not isinstance(app.screen, LaunchOptionsDialog)
+                assert read_claude_args(wt) is None
+
+    @pytest.mark.asyncio
+    async def test_running_session_is_told_when_it_applies(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "wts"
+        wt = root / "20260309-test"
+        with _patch_git_info(
+            sessions=["test-proj/20260309-test"], worktrees=[wt], worktree_root=root
+        ):
+            store_session_meta(wt, "main")
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_actions(app, pilot, "wt-20260309-test")
+                with patch.object(app, "notify") as mock_notify:
+                    app._edit_launch_options(app._selected_session)
+                    await pilot.pause()
+                    await pilot.press("enter")
+                    await pilot.pause()
+                assert "next time" in mock_notify.call_args.args[0]
+
+    def test_where_it_is_offered(self, tmp_path: Path) -> None:
+        def info(session_type: str, **kw) -> SessionInfo:
+            return SessionInfo(
+                name="x",
+                session_type=session_type,
+                project="p",
+                path=tmp_path,
+                tmux_session="p/x",
+                is_active=kw.get("is_active", False),
+                branch="",
+                stop_kind=kw.get("stop_kind"),
+            )
+
+        can = SessionApp._can_edit_launch_options
+        assert can(info("worktree"))
+        assert can(info("claude"))
+        assert can(info("direct", is_active=True))
+        assert can(info("direct", stop_kind=StopKind.STOPPED))
+        assert not can(info("direct"))
+
+    @pytest.mark.asyncio
+    async def test_claude_row_saves_by_conversation(self, tmp_path: Path) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                session = SessionInfo(
+                    name="conv",
+                    session_type="claude",
+                    project="test-proj",
+                    path=tmp_path,
+                    tmux_session="test-proj/direct-1",
+                    is_active=False,
+                    branch="",
+                    claude_session_id="conv-1",
+                )
+                await app._show_session_actions(session)
+                await pilot.pause()
+                app._edit_launch_options(session)
+                await pilot.pause()
+                app.screen.query_one("#lo-input", Input).value = "--a"
+                await pilot.press("enter")
+                await pilot.pause()
+        assert launch_options.saved_args(tmp_path, None, "conv-1") == ("--a",)
+
+    def test_long_options_are_clipped_in_the_label(self, tmp_path: Path) -> None:
+        store_session_meta(tmp_path, "main")
+        write_claude_args(tmp_path, ["--plugin-dir", "x" * 80])
+        app = SessionApp()
+        session = SessionInfo(
+            name="x",
+            session_type="worktree",
+            project="p",
+            path=tmp_path,
+            tmux_session="p/x",
+            is_active=False,
+            branch="",
+        )
+        label = app._launch_options_label(session).plain
+        assert "…" in label
+        assert len(label) < 110

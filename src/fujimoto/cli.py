@@ -35,7 +35,7 @@ from textual.widgets import (
     Static,
 )
 
-from fujimoto import debug
+from fujimoto import debug, launch_options
 from fujimoto.claude import (
     ClaudeLogError,
     ClaudeSession,
@@ -1049,6 +1049,28 @@ ConfigErrorDialog #ce-buttons {
     align: center middle;
     margin-top: 1;
 }
+
+LaunchOptionsDialog {
+    align: center middle;
+}
+
+LaunchOptionsDialog > #lo-dialog {
+    width: 90;
+    max-width: 95%;
+    height: auto;
+    padding: 1 2;
+    border: round $accent;
+    background: $surface;
+}
+
+LaunchOptionsDialog #lo-input {
+    margin-top: 1;
+}
+
+LaunchOptionsDialog #lo-error {
+    color: $error;
+    height: auto;
+}
 """
 
 
@@ -1139,6 +1161,97 @@ class ConfigErrorDialog(ModalScreen[None]):
         self.dismiss(None)
 
 
+# Linked from the launch options dialog. Textual captures the mouse, so the
+# click is handled as an action that calls `App.open_url`.
+CLAUDE_CLI_FLAGS_URL = "https://code.claude.com/docs/en/cli-reference#cli-flags"
+
+
+class LaunchOptionsDialog(ModalScreen["tuple[str, ...] | None"]):
+    """Edit the extra `claude` arguments for one launch.
+
+    Pre-filled with the options the launch would otherwise use, so editing is
+    the common case and retyping is not. Dismisses with the parsed arguments
+    (an empty tuple is a deliberate "no options"), or None on Escape, which
+    cancels the launch rather than falling back to the defaults.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(
+        self,
+        title: str,
+        resolved: launch_options.Resolved,
+        *,
+        editing: bool = False,
+    ) -> None:
+        super().__init__()
+        self._title = title
+        self._resolved = resolved
+        # Opened from the session menu: Enter saves without launching.
+        self._editing = editing
+
+    def compose(self) -> ComposeResult:
+        yield Container(
+            Label(f"Launch options — {self._title}", classes="form-label"),
+            Static(
+                f"[dim]Extra claude CLI arguments, e.g. "
+                f"--plugin-dir ./plugins. Current: "
+                f"{self._resolved.source.label}.[/]",
+                markup=True,
+            ),
+            Static(
+                "[dim]See the [/][@click=screen.open_docs][u]claude CLI flags "
+                "reference[/u][/] [dim](click to open)[/]",
+                markup=True,
+                id="lo-docs",
+            ),
+            Input(
+                value=launch_options.render(self._resolved.args),
+                placeholder="--plugin-dir ./plugins",
+                select_on_focus=False,
+                id="lo-input",
+            ),
+            Static("", id="lo-error"),
+            Static(
+                "[dim]Enter saves these for later launches of this session · "
+                "empty for none · Esc cancels[/]"
+                if self._editing
+                else "[dim]Enter launches and saves these for later launches of "
+                "this session · empty for none · Esc cancels[/]",
+                markup=True,
+                classes="hint",
+            ),
+            id="lo-dialog",
+        )
+
+    def on_mount(self) -> None:
+        box = self.query_one("#lo-input", Input)
+        box.focus()
+        box.cursor_position = len(box.value)
+
+    @on(Input.Submitted, "#lo-input")
+    def _submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        try:
+            args = launch_options.parse(event.value)
+        except launch_options.LaunchOptionsError as exc:
+            # Content, not markup: the message quotes what the user typed.
+            self.query_one("#lo-error", Static).update(
+                Content(f"Can't parse these options: {exc}")
+            )
+            return
+        self.dismiss(args)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_open_docs(self) -> None:
+        # App has `open_url` but no matching action, so a markup `@click`
+        # can't call it directly.
+        debug.log("tui.launch_options_docs")
+        self.app.open_url(CLAUDE_CLI_FLAGS_URL)
+
+
 @dataclass
 class SessionInfo:
     name: str
@@ -1164,6 +1277,26 @@ class SessionInfo:
         return not self.is_active and self.stop_kind is not None
 
 
+# Widgets on which Shift+Enter / `o` means "launch this, but ask for options":
+# every list or box whose Enter leads (perhaps via further steps) to a launch.
+_LAUNCH_OPTION_WIDGETS = frozenset(
+    {
+        "home-list",
+        "session-actions",
+        "resume-picker",
+        "title-input",
+        "branch-list",
+        "branch-picker-list",
+        "branch-filter",
+        "conflict-list",
+        "direct-title-input",
+        "fork-title-input",
+        "fork-branch-list",
+        "fork-picker",
+    }
+)
+
+
 class LaunchTarget(NamedTuple):
     """What `main()` should launch once the TUI exits.
 
@@ -1182,6 +1315,10 @@ class LaunchTarget(NamedTuple):
     resume_session_id: str | None = None
     forked_from_session_id: str | None = None
     forked_from_worktree: Path | None = None
+    # Launch options chosen in the dialog for *this* launch, which `main()`
+    # also saves as the session's options. None means "not asked" — use
+    # whatever is saved, inherited or configured (`launch_options.resolve`).
+    claude_args: tuple[str, ...] | None = None
 
 
 class SessionApp(App):
@@ -1216,6 +1353,16 @@ class SessionApp(App):
         # focus, and `check_action` hides both outside the viewer.
         Binding("n", "log_next_match", "Next match", show=True),
         Binding("N", "log_prev_match", "Previous match", show=True),
+        # Shift+Enter only arrives as its own key under the kitty keyboard
+        # protocol; a legacy terminal sends a plain Enter. `o` is the fallback
+        # that works everywhere — on a list, since an Input would type it.
+        Binding(
+            "shift+enter,o",
+            "launch_with_options",
+            "Launch with options",
+            key_display="⇧↵/o",
+            show=True,
+        ),
     ]
 
     def __init__(
@@ -1242,6 +1389,10 @@ class SessionApp(App):
         self._start_point: str = ""
         self._worktree_path: Path | None = None
         self._launch_target: LaunchTarget | None = None
+        # Set by Shift+Enter / `o`: the next launch from this flow asks for
+        # launch options first. Survives the steps between (a branch list, a
+        # conversation picker) and is dropped on returning home.
+        self._launch_options_armed: bool = False
         self._project_root: Path | None = None
         self._existing_worktrees: list[Path] = []
         self._session_map: dict[str, SessionInfo] = {}
@@ -1475,7 +1626,58 @@ class SessionApp(App):
             return self._on_search or self._on_log
         if action == "toggle_search_mode":
             return self._on_search
+        if action == "launch_with_options":
+            focused = self.focused
+            return focused is not None and focused.id in _LAUNCH_OPTION_WIDGETS
         return True
+
+    async def action_launch_with_options(self) -> None:
+        """Select the focused item like Enter, but ask for launch options."""
+        focused = self.focused
+        if focused is None or focused.id not in _LAUNCH_OPTION_WIDGETS:
+            return
+        self._launch_options_armed = True
+        debug.log("tui.launch_options_armed", widget=debug.rid(focused.id))
+        if isinstance(focused, ListView):
+            focused.action_select_cursor()
+        elif isinstance(focused, Input):
+            await focused.action_submit()
+
+    def _launch(self, target: LaunchTarget) -> None:
+        """Hand `target` to `main()`, asking for launch options if armed."""
+        if not self._launch_options_armed:
+            self._launch_target = target
+            self.exit()
+            return
+        self._launch_options_armed = False
+        name = target.tmux_name or session_name(target.project, target.working_dir.name)
+        if name in self._active_sessions:
+            # Options belong to a claude process, and this one is running.
+            self.notify(
+                "Session is already running — stop it to relaunch with options.",
+                severity="warning",
+            )
+            self._launch_target = target
+            self.exit()
+            return
+        resolved = launch_options.resolve(
+            target.working_dir,
+            name,
+            target.resume_session_id,
+            parent_dir=target.forked_from_worktree,
+            parent_session_id=target.forked_from_session_id,
+        )
+        display = name.split("/", 1)[1] if "/" in name else name
+
+        def chosen(args: tuple[str, ...] | None) -> None:
+            if args is None:
+                debug.log("tui.launch_options", outcome="cancelled")
+                return
+            debug.log("tui.launch_options", outcome="launch", count=len(args))
+            self._launch_target = target._replace(claude_args=args)
+            self.exit()
+
+        self.push_screen(LaunchOptionsDialog(display, resolved), chosen)
 
     async def _clear_main(self) -> None:
         self._stop_polling()
@@ -1587,6 +1789,8 @@ class SessionApp(App):
 
     async def _show_home(self) -> None:
         await self._clear_main()
+        # Back home means the flow that asked for launch options is over.
+        self._launch_options_armed = False
         self._on_home = True
         self.refresh_bindings()
         self._claude_cache = None
@@ -2278,6 +2482,7 @@ class SessionApp(App):
         `restore` re-renders the hits already collected rather than starting a
         fresh scan, which is what returning from a result's actions menu wants.
         """
+        self._launch_options_armed = False
         await self._clear_main()
         self._on_search = True
         self.refresh_bindings()
@@ -2820,6 +3025,7 @@ class SessionApp(App):
                         raise
                 self._active_sessions.discard(session.tmux_session)
             if terminate:
+                self._keep_launch_options(session)
                 session_state.mark_closed(session.tmux_session)
             else:
                 session_state.mark_stopped(
@@ -2831,6 +3037,23 @@ class SessionApp(App):
             await self._show_home()
         except (TmuxError, ConfigError, GitError) as e:
             await self._show_error(str(e))
+
+    def _keep_launch_options(self, session: SessionInfo) -> None:
+        """Carry a terminated session's launch options over to its transcript.
+
+        A worktree's options live in its `meta.json` and survive a terminate on
+        their own. Anything else keeps them on the session record, which a
+        terminate deletes — so key them by the Claude conversation instead,
+        and resuming that transcript later brings them back.
+        """
+        record = session_state.load_state().get(session.tmux_session)
+        if record is None or record.claude_args is None:
+            return
+        conversation = record.claude_session_id or session.claude_session_id
+        if conversation:
+            launch_options.remember_for_conversation(
+                conversation, tuple(record.claude_args)
+            )
 
     async def _open_pending_close(self) -> None:
         """Ask what `Ctrl-A x` should do, for a session that just detached."""
@@ -2979,6 +3202,11 @@ class SessionApp(App):
         if session.session_type != "claude":
             items.append(ListItem(Label("Rename"), id="sa-rename"))
 
+        if self._can_edit_launch_options(session):
+            items.append(
+                ListItem(Label(self._launch_options_label(session)), id="sa-options")
+            )
+
         # Park and Stop both keep the session's record open and resumable, and
         # say different things about whether you mean to come back; terminate
         # forgets it. Separate items rather than one item plus a prompt: a menu
@@ -3026,18 +3254,91 @@ class SessionApp(App):
         )
         self.query_one("#session-actions").focus()
 
+    # -- Launch options (menu) --
+
+    @staticmethod
+    def _can_edit_launch_options(session: SessionInfo) -> bool:
+        """Whether a menu edit of this session's options has somewhere to go.
+
+        A worktree keeps them in its meta and a Claude row by conversation id,
+        whatever state they are in. A direct or ad hoc session keeps them on
+        its open record, which only exists while it is running or stopped.
+        """
+        if session.session_type in ("worktree", "claude"):
+            return True
+        return session.is_active or session.is_stopped
+
+    @staticmethod
+    def _options_conversation(session: SessionInfo) -> str | None:
+        # Only a Claude row names one conversation; a direct row's
+        # `claude_session_id` is a guess at the latest one in its directory.
+        return session.claude_session_id if session.session_type == "claude" else None
+
+    def _resolve_session_options(self, session: SessionInfo) -> launch_options.Resolved:
+        return launch_options.resolve(
+            session.path,
+            session.tmux_session,
+            self._options_conversation(session),
+        )
+
+    def _launch_options_label(self, session: SessionInfo) -> Content:
+        resolved = self._resolve_session_options(session)
+        summary = launch_options.render(resolved.args) if resolved.args else "none"
+        if len(summary) > 50:
+            summary = summary[:49] + "…"
+        suffix = (
+            f" · {resolved.source.label}"
+            if resolved.source is not launch_options.Source.NONE
+            else ""
+        )
+        # Content, not markup: the options are whatever the user typed.
+        return Content.assemble("Launch options  ", (f"({summary}{suffix})", "dim"))
+
+    def _edit_launch_options(self, session: SessionInfo) -> None:
+        """Edit a session's saved launch options without launching it."""
+        # Shift+Enter on this item means the same as Enter: nothing launches.
+        self._launch_options_armed = False
+        resolved = self._resolve_session_options(session)
+
+        async def chosen(args: tuple[str, ...] | None) -> None:
+            if args is None:
+                debug.log("tui.launch_options_edit", outcome="cancelled")
+                return
+            launch_options.save(
+                session.path,
+                session.tmux_session,
+                self._options_conversation(session),
+                args,
+            )
+            debug.log("tui.launch_options_edit", outcome="saved", count=len(args))
+            self.notify(
+                "Launch options saved — they apply the next time the session starts."
+                if session.is_active
+                else "Launch options saved."
+            )
+            await self._show_session_actions(
+                session, from_search=self._actions_from_search
+            )
+            actions = self.query_one("#session-actions", ListView)
+            actions.index = [i.id for i in actions.children].index("sa-options")
+
+        self.push_screen(
+            LaunchOptionsDialog(session.name, resolved, editing=True), chosen
+        )
+
     # -- Resume session picker --
 
     def _launch_resume(self, session: SessionInfo, cs: ClaudeSession) -> None:
         tmux_name, session_type = self._resume_target(session.project, cs.cwd, session)
-        self._launch_target = LaunchTarget(
-            session.project,
-            cs.cwd,  # authoritative original directory from the session log
-            tmux_name,
-            session_type,
-            cs.session_id,
+        self._launch(
+            LaunchTarget(
+                session.project,
+                cs.cwd,  # authoritative original directory from the session log
+                tmux_name,
+                session_type,
+                cs.session_id,
+            )
         )
-        self.exit()
 
     async def _show_resume_session_picker(self, session: SessionInfo) -> None:
         self._selected_session = session
@@ -4015,15 +4316,16 @@ class SessionApp(App):
             return
         # Project config (copy/link/init) is applied in main() before launch,
         # uniformly across all connection modes.
-        self._launch_target = LaunchTarget(
-            self._project_name,
-            self._worktree_path,
-            None,
-            "worktree",
-            forked_from_session_id=fork_id,
-            forked_from_worktree=self._fork_parent_path if fork_id else None,
+        self._launch(
+            LaunchTarget(
+                self._project_name,
+                self._worktree_path,
+                None,
+                "worktree",
+                forked_from_session_id=fork_id,
+                forked_from_worktree=self._fork_parent_path if fork_id else None,
+            )
         )
-        self.exit()
 
     # -- Project switcher --
 
@@ -4234,14 +4536,15 @@ class SessionApp(App):
         all_sessions = set(list_all_sessions())
         tmux_name = get_next_adhoc_session_name(all_sessions)
         adhoc_dir = Path(tempfile.mkdtemp(prefix="fujimoto-adhoc-"))
-        self._launch_target = LaunchTarget(
-            "adhoc",
-            adhoc_dir,
-            tmux_name,
-            "adhoc",
-            None,
+        self._launch(
+            LaunchTarget(
+                "adhoc",
+                adhoc_dir,
+                tmux_name,
+                "adhoc",
+                None,
+            )
         )
-        self.exit()
 
     async def _launch_direct_session(self) -> None:
         await self._show_direct_title_form()
@@ -4277,35 +4580,40 @@ class SessionApp(App):
         action = event.item.id
 
         if action == "sa-connect":
-            self._launch_target = LaunchTarget(
-                session.project,
-                session.path,
-                session.tmux_session,
-                session.session_type,
-                None,
+            self._launch(
+                LaunchTarget(
+                    session.project,
+                    session.path,
+                    session.tmux_session,
+                    session.session_type,
+                    None,
+                )
             )
-            self.exit()
         elif action == "sa-launch":
-            self._launch_target = LaunchTarget(
-                session.project,
-                session.path,
-                session.tmux_session,
-                session.session_type,
-                None,
+            self._launch(
+                LaunchTarget(
+                    session.project,
+                    session.path,
+                    session.tmux_session,
+                    session.session_type,
+                    None,
+                )
             )
-            self.exit()
         elif action == "sa-resume":
             tmux_name, session_type = self._resume_target(
                 session.project, session.path, session
             )
-            self._launch_target = LaunchTarget(
-                session.project,
-                session.path,
-                tmux_name,
-                session_type,
-                session.claude_session_id,
+            self._launch(
+                LaunchTarget(
+                    session.project,
+                    session.path,
+                    tmux_name,
+                    session_type,
+                    session.claude_session_id,
+                )
             )
-            self.exit()
+        elif action == "sa-options":
+            self._edit_launch_options(session)
         elif action == "sa-resume-picker":
             await self._show_resume_session_picker(session)
         elif action == "sa-fork":
@@ -4487,14 +4795,15 @@ class SessionApp(App):
             return
         tmux_name = f"{self._project_name}/{slugify(value)}"
         project_path = self._project_cwd or Path(".")
-        self._launch_target = LaunchTarget(
-            self._project_name,
-            project_path,
-            tmux_name,
-            "direct",
-            None,
+        self._launch(
+            LaunchTarget(
+                self._project_name,
+                project_path,
+                tmux_name,
+                "direct",
+                None,
+            )
         )
-        self.exit()
 
     @on(Input.Submitted, "#rename-input")
     async def on_rename_submitted(self, event: Input.Submitted) -> None:
@@ -4629,14 +4938,15 @@ class SessionApp(App):
     async def on_conflict_selected(self, event: ListView.Selected) -> None:
         assert self._worktree_path is not None
         if event.item.id == "conflict-connect":
-            self._launch_target = LaunchTarget(
-                self._project_name,
-                self._worktree_path,
-                None,
-                "worktree",
-                None,
+            self._launch(
+                LaunchTarget(
+                    self._project_name,
+                    self._worktree_path,
+                    None,
+                    "worktree",
+                    None,
+                )
             )
-            self.exit()
         elif event.item.id == "conflict-suffix":
             suffix = 2
             while (
@@ -4914,6 +5224,34 @@ def _apply_worktree_config(working_dir: Path) -> bool:
     return True
 
 
+def _launch_claude_args(target: LaunchTarget, tmux_name: str) -> tuple[str, ...]:
+    """The extra `claude` arguments for a launch, saving any new choice.
+
+    Options picked in the dialog are this launch's *and* every later one's.
+    Otherwise the session's saved options apply, then a fork's parent's, then
+    the project's `.fujimoto.yaml` default. A fork that inherits its parent's
+    options keeps them, so it does not lose them if the parent goes away.
+    """
+    if target.claude_args is not None:
+        launch_options.save(
+            target.working_dir,
+            tmux_name,
+            target.resume_session_id,
+            target.claude_args,
+        )
+        return target.claude_args
+    resolved = launch_options.resolve(
+        target.working_dir,
+        tmux_name,
+        target.resume_session_id,
+        parent_dir=target.forked_from_worktree,
+        parent_session_id=target.forked_from_session_id,
+    )
+    if resolved.source is launch_options.Source.PARENT:
+        launch_options.save(target.working_dir, tmux_name, None, resolved.args)
+    return resolved.args
+
+
 def _create_config() -> None:
     """Scaffold a `.fujimoto.yaml` at the repo root (used by --create-config)."""
     try:
@@ -5088,6 +5426,7 @@ def main() -> None:
                     branch=_session_branch(working_dir),
                     claude_session_id=resume_id,
                 )
+                claude_args = _launch_claude_args(target, resolved_name)
                 launch_claude_in_tmux(
                     project_name,
                     working_dir,
@@ -5095,6 +5434,7 @@ def main() -> None:
                     system_prompt=system_prompt,
                     resume_session_id=resume_id,
                     fork_session=bool(fork_id),
+                    extra_args=claude_args,
                 )
                 # `Ctrl-A f` / `s` / `x` inside the session flag it and detach,
                 # handing the work to the TUI (which can show pickers/prompts).

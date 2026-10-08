@@ -9,7 +9,7 @@
 # .git/info/exclude or .gitignore — since it often references local-only files
 # like .env.
 #
-# Three sections, all optional:
+# Three worktree-setup sections, plus `claude_args` (at the end), all optional:
 #   copy  — files copied from the main repo into the worktree
 #   link  — files hard/symbolically linked into the worktree
 #   init  — commands run inside the worktree after copy/link
@@ -81,3 +81,16 @@
 #     when: always
 #     continue_on_error: true
 #     cwd: "{{ source_dir }}"     # optional; defaults to the worktree root
+
+# ---------------------------------------------------------------------------
+# claude_args: extra `claude` CLI arguments for every session in this project
+# ---------------------------------------------------------------------------
+# Applied to worktree and direct sessions launched from this project, unless a
+# session has saved launch options of its own (Shift+Enter, or `o` on a list,
+# opens the launch options dialog pre-filled with whatever would be used).
+# A list, or a single string split the way a shell would.
+# claude_args:
+#   - --plugin-dir
+#   - ./plugins
+#
+# claude_args: --plugin-dir ./plugins --model opus

@@ -363,3 +363,31 @@ class TestGetNextAdhocSessionName:
         sessions = {"adhoc-2"}
         result = get_next_adhoc_session_name(sessions)
         assert result == "adhoc-1"
+
+
+class TestClaudeArgsMeta:
+    def test_round_trip_keeps_other_meta(self, tmp_path: Path) -> None:
+        from fujimoto.config import read_claude_args, write_claude_args
+
+        store_session_meta(tmp_path, "main", source_root=Path("/src"))
+        assert read_claude_args(tmp_path) is None
+        write_claude_args(tmp_path, ["--a"])
+        assert read_claude_args(tmp_path) == ["--a"]
+        assert read_session_meta(tmp_path)["source_root"] == "/src"
+        write_claude_args(tmp_path, None)
+        assert read_claude_args(tmp_path) is None
+        assert read_session_meta(tmp_path)["base_branch"] == "main"
+
+    def test_no_meta_is_left_alone(self, tmp_path: Path) -> None:
+        from fujimoto.config import has_session_meta, write_claude_args
+
+        write_claude_args(tmp_path, ["--a"])
+        assert not has_session_meta(tmp_path)
+
+    @pytest.mark.parametrize("raw", ['{"claude_args": "x"}', "[]", "nope"])
+    def test_malformed_reads_none(self, tmp_path: Path, raw: str) -> None:
+        from fujimoto.config import read_claude_args
+
+        store_session_meta(tmp_path, "main")
+        (tmp_path / ".fujimoto" / "meta.json").write_text(raw)
+        assert read_claude_args(tmp_path) is None

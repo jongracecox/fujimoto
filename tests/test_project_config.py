@@ -499,3 +499,30 @@ def test_actions_record_what_ran(tmp_path: Path) -> None:
     assert any("copied .env" in a for a in result.actions)
     assert any("symlinked data.bin" in a for a in result.actions)
     assert any("ran: true" in a for a in result.actions)
+
+
+def test_claude_args_list(tmp_path: Path) -> None:
+    _write_config(tmp_path, "claude_args: [--plugin-dir, ./plugins]\n")
+    assert load_project_config(tmp_path).claude_args == ["--plugin-dir", "./plugins"]
+
+
+def test_claude_args_string_is_shell_split(tmp_path: Path) -> None:
+    _write_config(tmp_path, "claude_args: --plugin-dir 'my plugins'\n")
+    assert load_project_config(tmp_path).claude_args == ["--plugin-dir", "my plugins"]
+
+
+def test_claude_args_default_empty(tmp_path: Path) -> None:
+    _write_config(tmp_path, "on_error: abort\n")
+    assert load_project_config(tmp_path).claude_args == []
+
+
+def test_claude_args_unbalanced_quote_raises(tmp_path: Path) -> None:
+    _write_config(tmp_path, 'claude_args: "--a \'b"\n')
+    with pytest.raises(ConfigError):
+        load_project_config(tmp_path)
+
+
+def test_template_documents_claude_args() -> None:
+    from fujimoto.project_config import template_text
+
+    assert "claude_args" in template_text()
