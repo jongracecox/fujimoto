@@ -67,9 +67,11 @@ from fujimoto.config import (
     get_project_worktrees_dir,
     list_projects,
     mark_config_once_applied,
+    read_parent_session,
     read_session_meta,
     slugify,
     store_session_meta,
+    write_parent_session,
 )
 from fujimoto.git import (
     GitError,
@@ -5086,15 +5088,31 @@ def _build_system_prompt(session_type: str, project: str, working_dir: Path) -> 
     if session_type == "worktree":
         meta = read_session_meta(working_dir)
         base_branch = meta.get("base_branch", "unknown") if meta else "unknown"
-        return (
+        prompt = (
             f"You are working in a fujimoto worktree session for project '{project}'. "
             f"This is an isolated git worktree branched from '{base_branch}'. "
             "Focus your work on this worktree's branch."
         )
+        parent = read_parent_session(working_dir)
+        return f"{prompt} {_parent_system_prompt(parent)}" if parent else prompt
     return (
         f"You are working in a fujimoto direct session for project '{project}'. "
         "This is the project's main repository directory, not an isolated worktree. "
         "Be cautious with branch operations — other sessions may share this directory."
+    )
+
+
+def _parent_system_prompt(parent: str) -> str:
+    """Tell a session which session started it, and how to reach that one.
+
+    `parent` is a Claude Code peer address (`fujimoto new --parent`). This is
+    deliberately only the mechanics; what a child should report, and when, is
+    left to the prompt it was started with.
+    """
+    return (
+        f"This session was started by another Claude session, whose peer "
+        f"address is '{parent}'. To message it, use the SendMessage tool with "
+        f"to: '{parent}'."
     )
 
 
@@ -5358,7 +5376,11 @@ def _start_launch(target: LaunchTarget, *, attach: bool = True) -> str | None:
             meta.get("base_branch", "unknown"),
         )
     elif resume_id:
-        system_prompt = None
+        # A resumed conversation already carries its original context; only
+        # the parent link needs re-stating, since the appended system prompt
+        # does not survive into a new claude process.
+        parent = read_parent_session(working_dir)
+        system_prompt = _parent_system_prompt(parent) if parent else None
     else:
         system_prompt = _build_system_prompt(session_type, project_name, working_dir)
     if attach:
@@ -5413,6 +5435,7 @@ def _new_worktree_target(
     base: str | None = None,
     current: bool = False,
     claude_args: tuple[str, ...] | None = None,
+    parent: str | None = None,
 ) -> tuple[LaunchTarget, bool]:
     """Create a worktree for `fujimoto new <title>` and describe its launch.
 
@@ -5422,7 +5445,8 @@ def _new_worktree_target(
     branch when offline. A worktree that already exists for the title (same
     day, same slug) is connected to rather than duplicated, so re-running the
     command is idempotent. The flag returned with the target says whether the
-    worktree was created by this call.
+    worktree was created by this call. `parent` (a peer address) is recorded
+    in the worktree's meta either way, so the latest caller is the parent.
     """
     cwd = Path.cwd()
     project = get_project_name(cwd)
@@ -5430,6 +5454,8 @@ def _new_worktree_target(
     path = build_worktree_path(project, title, root)
     if path.exists():
         debug.log("cli.new", outcome="connect", path=debug.rp(path))
+        if parent:
+            write_parent_session(path, parent)
         target = LaunchTarget(project, path, None, "worktree", claude_args=claude_args)
         return target, False
 
@@ -5447,6 +5473,8 @@ def _new_worktree_target(
             pass  # Offline or no remote — proceed with local state
     create_worktree(path, start_point or base_branch, f"worktree/{path.name}", cwd=cwd)
     store_session_meta(path, base_branch, source_root=root)
+    if parent:
+        write_parent_session(path, parent)
     debug.log(
         "cli.new",
         outcome="created",
@@ -5476,6 +5504,7 @@ def _new_session_result(
         "working_dir": str(target.working_dir),
         "branch": _session_branch(target.working_dir),
         "claude_session_id": session_id,
+        "parent_session": read_parent_session(target.working_dir),
         "worktree_created": created,
         "session_started": started,
         "attach_command": f"tmux attach-session -t {shlex.quote(tmux_name)}",
@@ -5513,7 +5542,11 @@ def _prepare_new_session(
     already running is an error: it could only reach a new claude process.
     """
     target, created = _new_worktree_target(
-        args.title, base=args.base, current=args.current, claude_args=claude_args
+        args.title,
+        base=args.base,
+        current=args.current,
+        claude_args=claude_args,
+        parent=args.parent,
     )
     name = session_name(target.project, target.working_dir.name)
     running = session_exists(name)
@@ -5523,6 +5556,7 @@ def _prepare_new_session(
         running=running,
         detach=args.detach,
         prompt_chars=len(args.prompt or ""),
+        parent=debug.rv(args.parent) if args.parent else "none",
     )
     if running and args.prompt:
         _finish_debug_log()
@@ -5648,7 +5682,7 @@ def main() -> None:
         ),
         usage=(
             "fujimoto new TITLE [--base BRANCH | --current] [--prompt TEXT] "
-            "[--detach] [-- CLAUDE_ARGS...]"
+            "[--parent NAME] [--detach] [-- CLAUDE_ARGS...]"
         ),
     )
     new.add_argument("title", help="Session title, e.g. fix-unit-tests")
@@ -5667,6 +5701,14 @@ def main() -> None:
         "--prompt",
         metavar="TEXT",
         help="First message to send to the new claude session",
+    )
+    new.add_argument(
+        "--parent",
+        metavar="NAME",
+        help=(
+            "Peer address of the Claude session starting this one (as shown by "
+            "ListAgents); the new session is told it can message it"
+        ),
     )
     new.add_argument(
         "--detach",
