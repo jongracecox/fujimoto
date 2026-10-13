@@ -391,3 +391,38 @@ class TestClaudeArgsMeta:
         store_session_meta(tmp_path, "main")
         (tmp_path / ".fujimoto" / "meta.json").write_text(raw)
         assert read_claude_args(tmp_path) is None
+
+
+class TestParentSessionMeta:
+    def test_round_trip_keeps_other_meta(self, tmp_path: Path) -> None:
+        from fujimoto.config import read_parent_session, write_parent_session
+
+        store_session_meta(tmp_path, "main", source_root=Path("/src"))
+        assert read_parent_session(tmp_path) is None
+        write_parent_session(tmp_path, "20261013-parent-9f")
+        assert read_parent_session(tmp_path) == "20261013-parent-9f"
+        assert read_session_meta(tmp_path)["source_root"] == "/src"
+
+    def test_latest_parent_wins(self, tmp_path: Path) -> None:
+        from fujimoto.config import read_parent_session, write_parent_session
+
+        store_session_meta(tmp_path, "main")
+        write_parent_session(tmp_path, "first")
+        write_parent_session(tmp_path, "second")
+        assert read_parent_session(tmp_path) == "second"
+
+    def test_no_meta_is_left_alone(self, tmp_path: Path) -> None:
+        from fujimoto.config import has_session_meta, write_parent_session
+
+        write_parent_session(tmp_path, "p")
+        assert not has_session_meta(tmp_path)
+
+    @pytest.mark.parametrize(
+        "raw", ['{"parent_session": 3}', '{"parent_session": ""}', "[]", "nope"]
+    )
+    def test_malformed_reads_none(self, tmp_path: Path, raw: str) -> None:
+        from fujimoto.config import read_parent_session
+
+        store_session_meta(tmp_path, "main")
+        (tmp_path / ".fujimoto" / "meta.json").write_text(raw)
+        assert read_parent_session(tmp_path) is None

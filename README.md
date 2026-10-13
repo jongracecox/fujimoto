@@ -300,6 +300,7 @@ JSON, for scripts and other agents:
   "working_dir": "/Users/me/git/worktrees/myproject/20261013-fix-unit-tests",
   "branch": "worktree/20261013-fix-unit-tests",
   "claude_session_id": "8f0e…",
+  "parent_session": null,
   "worktree_created": true,
   "session_started": true,
   "attach_command": "tmux attach-session -t myproject/20261013-fix-unit-tests"
@@ -310,6 +311,29 @@ Each new Claude process started by `fujimoto new` gets its id from fujimoto
 (`claude --session-id`), so `claude_session_id` is known immediately, before
 any transcript exists. Output from `.fujimoto.yaml` init commands goes to
 stderr in this mode, so stdout is only the JSON.
+
+#### Sessions that start sessions
+
+A Claude session can use `fujimoto new` to hand work to another session, and
+the two can then talk using Claude Code's own cross-session messaging
+(`ListAgents` / `SendMessage`). Messages are addressed by a session's *peer
+name*, not its Claude session id, so two options set that up:
+
+```sh
+fujimoto new fix-flaky-test --prompt "…" \
+  --parent 20261013-my-session-9f \
+  -- --name 20261013-fix-flaky-test
+```
+
+- `--parent NAME` is the starting session's peer name (`ListAgents` reports
+  it as "This session is …"). It is saved in the worktree's metadata, and the
+  new session's system prompt tells it that address and to use `SendMessage`
+  to reach it. The parent is named again when the session is resumed, so the
+  link survives a relaunch.
+- `-- --name NAME` is Claude's own option for setting a session's peer name.
+  Choosing it up front gives the parent an address for the child before the
+  child is running. Since arguments after `--` are saved as launch options,
+  the name stays the same across relaunches.
 
 ### Home Screen
 

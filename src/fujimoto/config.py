@@ -264,6 +264,34 @@ def write_claude_args(worktree_path: Path, args: list[str] | None) -> None:
     )
 
 
+def read_parent_session(worktree_path: Path) -> str | None:
+    """The peer address of the Claude session that started this worktree.
+
+    Set by `fujimoto new --parent`. It is the name another session passes to
+    Claude Code's `SendMessage` (as listed by `ListAgents`), not a Claude
+    session id — a session id is not an address.
+    """
+    raw = _load_meta_raw(worktree_path).get("parent_session")
+    return raw if isinstance(raw, str) and raw else None
+
+
+def write_parent_session(worktree_path: Path, name: str) -> None:
+    """Record the parent session's peer address in a worktree's metadata.
+
+    Like `write_claude_args`, only ever updates an existing `meta.json`.
+    """
+    if not has_session_meta(worktree_path):
+        return
+    meta = _load_meta_raw(worktree_path)
+    meta["parent_session"] = name
+    (_get_meta_dir(worktree_path) / META_FILENAME).write_text(json.dumps(meta))
+    debug.log(
+        "config.write_parent_session",
+        worktree=debug.rp(worktree_path),
+        parent=debug.rv(name),
+    )
+
+
 CONFIG_ONCE_MARKER = "config_once_applied"
 
 

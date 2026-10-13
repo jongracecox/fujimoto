@@ -66,8 +66,10 @@ from fujimoto.config import (
     ConfigError,
     read_session_meta,
     read_claude_args,
+    read_parent_session,
     store_session_meta,
     write_claude_args,
+    write_parent_session,
 )
 from fujimoto.git import GitError
 from fujimoto.tmux import TmuxError
@@ -305,6 +307,20 @@ class TestNewWorktreeTarget:
         with pytest.raises(GitError):
             _new_worktree_target("x", base="nope")
 
+    def test_records_parent_on_create(self, git_repo: Path) -> None:
+        target, _ = _new_worktree_target("x", parent="p-9f")
+        assert read_parent_session(target.working_dir) == "p-9f"
+
+    def test_records_parent_on_connect(self, git_repo: Path) -> None:
+        _new_worktree_target("x", parent="first")
+        target, created = _new_worktree_target("x", parent="second")
+        assert created is False
+        assert read_parent_session(target.working_dir) == "second"
+
+    def test_no_parent_records_none(self, git_repo: Path) -> None:
+        target, _ = _new_worktree_target("x")
+        assert read_parent_session(target.working_dir) is None
+
     def test_passes_claude_args(self, git_repo: Path) -> None:
         target, _ = _new_worktree_target("x", claude_args=("--model", "opus"))
         assert target.claude_args == ("--model", "opus")
@@ -346,7 +362,7 @@ class TestNewSubcommand:
     ) -> None:
         mock_new, mock_app, mock_launch = self._run(monkeypatch, ["new", "fix"])
         mock_new.assert_called_once_with(
-            "fix", base=None, current=False, claude_args=None
+            "fix", base=None, current=False, claude_args=None, parent=None
         )
         assert mock_launch.call_args.args[1] == Path("/tmp/wt")
         assert mock_launch.call_args.kwargs["attach"] is True
@@ -361,6 +377,10 @@ class TestNewSubcommand:
         assert len(session_id) == 36
         record = session_state.load_state()["proj/wt"]
         assert record.claude_session_id == session_id
+
+    def test_parent_is_passed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        mock_new, _, _ = self._run(monkeypatch, ["new", "fix", "--parent", "p-9f"])
+        assert mock_new.call_args.kwargs["parent"] == "p-9f"
 
     def test_prompt_is_passed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _, _, mock_launch = self._run(
@@ -397,6 +417,7 @@ class TestNewSubcommand:
             "working_dir": "/tmp/wt",
             "branch": "worktree/wt",
             "claude_session_id": kwargs["session_id"],
+            "parent_session": None,
             "worktree_created": True,
             "session_started": True,
             "attach_command": "tmux attach-session -t proj/wt",
@@ -445,7 +466,11 @@ class TestNewSubcommand:
             ["new", "fix", "--base", "develop", "--", "--model", "opus"],
         )
         mock_new.assert_called_once_with(
-            "fix", base="develop", current=False, claude_args=("--model", "opus")
+            "fix",
+            base="develop",
+            current=False,
+            claude_args=("--model", "opus"),
+            parent=None,
         )
 
     def test_current(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1458,6 +1483,24 @@ class TestBuildSystemPrompt:
         assert "myproj" in prompt
         assert "main" in prompt
         assert "Focus your work on this worktree's branch" in prompt
+
+    def test_worktree_prompt_names_parent(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _build_system_prompt
+        from fujimoto.config import store_session_meta, write_parent_session
+
+        store_session_meta(tmp_path, "main")
+        write_parent_session(tmp_path, "20261013-parent-9f")
+        prompt = _build_system_prompt("worktree", "myproj", tmp_path)
+        assert "Focus your work on this worktree's branch" in prompt
+        assert "peer address is '20261013-parent-9f'" in prompt
+        assert "SendMessage" in prompt
+
+    def test_worktree_prompt_without_parent(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _build_system_prompt
+        from fujimoto.config import store_session_meta
+
+        store_session_meta(tmp_path, "main")
+        assert "SendMessage" not in _build_system_prompt("worktree", "p", tmp_path)
 
     def test_worktree_prompt_without_meta(self, tmp_path: Path) -> None:
         from fujimoto.cli import _build_system_prompt
@@ -5150,6 +5193,31 @@ class TestMainResume:
                 prompt=None,
                 attach=True,
             )
+
+    def test_resume_restates_parent_session(self, tmp_path: Path) -> None:
+        store_session_meta(tmp_path, "main")
+        write_parent_session(tmp_path, "p-9f")
+        app1 = SessionApp.__new__(SessionApp)
+        app1._launch_target = LaunchTarget(
+            "proj", tmp_path, "proj/wt", "worktree", "resume-session-id"
+        )
+        app2 = SessionApp.__new__(SessionApp)
+        app2._launch_target = None
+
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]),
+            patch.object(app1, "run"),
+            patch.object(app2, "run"),
+            patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
+            patch("fujimoto.cli._launch_claude_args", return_value=()),
+            patch("fujimoto.cli._session_branch", return_value="worktree/wt"),
+        ):
+            main()
+        system_prompt = mock_launch.call_args.kwargs["system_prompt"]
+        assert "peer address is 'p-9f'" in system_prompt
+        assert mock_launch.call_args.kwargs["resume_session_id"] == "resume-session-id"
 
     def test_fork_resumes_parent_with_fork_flag(self, tmp_path: Path) -> None:
         app1 = SessionApp.__new__(SessionApp)
