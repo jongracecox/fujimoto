@@ -1074,6 +1074,68 @@ LaunchOptionsDialog #lo-error {
 """
 
 
+class PagingListView(ListView):
+    """A `ListView` whose PageUp/PageDown/Home/End move the highlight.
+
+    Textual's `ListView` only binds up/down/enter, so the paging keys fall
+    through to the scroll container: the view moves but the highlight stays
+    put, and the next arrow key scrolls straight back to it. Here they move
+    the highlight instead, and the view follows it.
+    """
+
+    BINDINGS = [
+        Binding("pageup", "page_cursor(-1)", "Page up", show=False),
+        Binding("pagedown", "page_cursor(1)", "Page down", show=False),
+        Binding("home", "edge_cursor(-1)", "First", show=False),
+        Binding("end", "edge_cursor(1)", "Last", show=False),
+    ]
+
+    def _nearest_enabled(self, index: int, direction: int) -> int | None:
+        """The enabled row at `index`, else the nearest one, preferring `direction`."""
+        nodes = self._nodes
+        for step in (direction, -direction):
+            probe = index
+            while 0 <= probe < len(nodes):
+                if not nodes[probe].disabled:
+                    return probe
+                probe += step
+        return None
+
+    def action_page_cursor(self, direction: int) -> None:
+        """Move the highlight by one viewport's worth of rows."""
+        nodes = self._nodes
+        if not nodes:
+            return
+        if self.index is None:
+            self.action_edge_cursor(direction)
+            return
+        # Rows can be taller than one line (search results carry snippets),
+        # so count rows until their heights fill the viewport.
+        page = max(self.scrollable_content_region.height, 1)
+        index = self.index
+        covered = 0
+        while 0 <= index + direction < len(nodes):
+            covered += max(nodes[index + direction].outer_size.height, 1)
+            if covered > page:
+                break
+            index += direction
+        if index == self.index:
+            # Viewport too small to hold another row: still make progress.
+            index = max(0, min(len(nodes) - 1, index + direction))
+        target = self._nearest_enabled(index, direction)
+        if target is not None:
+            self.index = target
+
+    def action_edge_cursor(self, direction: int) -> None:
+        """Move the highlight to the first (-1) or last (1) selectable row."""
+        if not self._nodes:
+            return
+        start = 0 if direction < 0 else len(self._nodes) - 1
+        target = self._nearest_enabled(start, -direction)
+        if target is not None:
+            self.index = target
+
+
 class QuickTerminalPrompt(ModalScreen[bool]):
     BINDINGS = [
         Binding("escape", "answer_no", show=False),
@@ -1758,7 +1820,7 @@ class SessionApp(App):
                 Label("tmux is not installed", classes="form-label"),
                 Static("tmux is required to manage sessions."),
                 Static(""),
-                ListView(
+                PagingListView(
                     ListItem(
                         Label(
                             "Install with brew"
@@ -1820,7 +1882,7 @@ class SessionApp(App):
         await main.mount(
             Container(
                 search,
-                ListView(*self._build_home_items(), id="home-list"),
+                PagingListView(*self._build_home_items(), id="home-list"),
                 id="home-panel",
             )
         )
@@ -2501,7 +2563,7 @@ class SessionApp(App):
                     id="search-input",
                 ),
                 Static(self._search_status_text(), id="search-status", markup=True),
-                ListView(*self._build_search_result_items(), id="search-results"),
+                PagingListView(*self._build_search_result_items(), id="search-results"),
                 Static(
                     "[dim]ctrl+r regex · ctrl+t raw/text · ctrl+i case · "
                     "↑↓ pick · enter open · esc back[/]",
@@ -3080,7 +3142,7 @@ class SessionApp(App):
             Container(
                 Label(f"Terminate {display_name}?", classes="form-label"),
                 Static(str(target.working_dir), classes="session-info"),
-                ListView(
+                PagingListView(
                     ListItem(
                         Label(
                             "Terminate  [dim]— close it and mark it done[/]",
@@ -3248,7 +3310,7 @@ class SessionApp(App):
             Container(
                 Label(session.name, classes="form-label"),
                 Static(info_text, classes="session-info"),
-                ListView(*items, id="session-actions"),
+                PagingListView(*items, id="session-actions"),
                 id="actions-panel",
             )
         )
@@ -3358,7 +3420,7 @@ class SessionApp(App):
             Container(
                 Label(session.name, classes="form-label"),
                 Static("Resume previous session", classes="session-info"),
-                ListView(*items, id="resume-picker"),
+                PagingListView(*items, id="resume-picker"),
                 id="actions-panel",
             )
         )
@@ -3443,7 +3505,7 @@ class SessionApp(App):
             Container(
                 Label(session.name, classes="form-label"),
                 Static("View which session log?", classes="session-info"),
-                ListView(
+                PagingListView(
                     *self._build_claude_session_items(sessions, "lp"), id="log-picker"
                 ),
                 id="actions-panel",
@@ -3947,7 +4009,7 @@ class SessionApp(App):
                     "the fork inherits this branch's commits",
                     classes="session-info",
                 ),
-                ListView(*items, id="fork-branch-list"),
+                PagingListView(*items, id="fork-branch-list"),
                 id="create-panel",
             )
         )
@@ -3978,7 +4040,7 @@ class SessionApp(App):
             Container(
                 Label(session.name, classes="form-label"),
                 Static("Fork which session?", classes="session-info"),
-                ListView(*items, id="fork-picker"),
+                PagingListView(*items, id="fork-picker"),
                 id="actions-panel",
             )
         )
@@ -4071,7 +4133,7 @@ class SessionApp(App):
             Container(
                 Label(f"Finish: {session.name}", classes="form-label"),
                 Static(status_text, classes="branch-status"),
-                ListView(*items, id="finish-list"),
+                PagingListView(*items, id="finish-list"),
                 id="finish-panel",
             )
         )
@@ -4094,7 +4156,7 @@ class SessionApp(App):
             Container(
                 Label(f"Open terminal: {session.name}", classes="form-label"),
                 Static(str(session.path), classes="session-info"),
-                ListView(*items, id="terminal-mode-list"),
+                PagingListView(*items, id="terminal-mode-list"),
                 id="terminal-mode-panel",
             )
         )
@@ -4154,7 +4216,7 @@ class SessionApp(App):
                     classes="form-label",
                 ),
                 Static(warning, classes="warning-text"),
-                ListView(
+                PagingListView(
                     ListItem(Label("Delete"), id="confirm-yes"),
                     ListItem(Label("Cancel"), id="confirm-no"),
                     id="confirm-list",
@@ -4210,7 +4272,7 @@ class SessionApp(App):
         await main.mount(
             Container(
                 Label("Select Base Branch", classes="form-label"),
-                ListView(*items, id="branch-list"),
+                PagingListView(*items, id="branch-list"),
                 id="create-panel",
             )
         )
@@ -4241,7 +4303,7 @@ class SessionApp(App):
             Container(
                 Label("Select Branch", classes="form-label"),
                 Input(placeholder="Type to filter...", id="branch-filter"),
-                ListView(*items, id="branch-picker-list"),
+                PagingListView(*items, id="branch-picker-list"),
                 id="create-panel",
             )
         )
@@ -4273,7 +4335,7 @@ class SessionApp(App):
                     classes="form-label",
                 ),
                 Static(""),
-                ListView(
+                PagingListView(
                     ListItem(
                         Label("Connect to existing worktree"), id="conflict-connect"
                     ),
@@ -4355,7 +4417,7 @@ class SessionApp(App):
             Container(
                 Label("Switch Project", classes="form-label"),
                 Input(placeholder="Type to filter...", id="project-filter"),
-                ListView(*items, id="project-list"),
+                PagingListView(*items, id="project-list"),
                 id="project-panel",
             )
         )

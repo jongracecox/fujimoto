@@ -112,7 +112,9 @@ The Textual app cannot run simultaneously with tmux attach (both need the termin
 
 ### Adding a New View
 
-1. Add an `async def _show_*` method following the pattern above
+1. Add an `async def _show_*` method following the pattern above; build its
+   list as a `PagingListView`, not a bare `ListView`, so PgUp/PgDn move the
+   highlight
 2. Add a `@on(ListView.Selected, "#your-list-id")` handler
 3. Wire navigation from an existing view
 4. Add any new state to `__init__` with type annotations

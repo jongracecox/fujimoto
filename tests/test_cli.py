@@ -10,6 +10,7 @@ from rich.markup import MarkupError
 
 import pytest
 
+from textual.app import App, ComposeResult
 from textual.widgets import Collapsible, Input, Label, ListItem, ListView, Static
 
 from fujimoto.claude import (
@@ -34,6 +35,7 @@ from fujimoto.cli import (
     CLAUDE_CLI_FLAGS_URL,
     LaunchOptionsDialog,
     LaunchTarget,
+    PagingListView,
     SessionApp,
     SessionInfo,
     _build_fork_system_prompt,
@@ -1434,6 +1436,179 @@ class TestHomeSearch:
                 await pilot.pause()
                 assert app._selected_session is not None
                 assert app._selected_session.name == "20260308-add-logging"
+
+
+class _PagingApp(App):
+    """Minimal host for a `PagingListView` with a fixed row layout."""
+
+    def __init__(self, rows: int, disabled: set[int] | None = None) -> None:
+        super().__init__()
+        self._rows = rows
+        self._disabled = disabled or set()
+
+    def compose(self) -> ComposeResult:
+        yield PagingListView(
+            *(
+                ListItem(Label(f"row {i}"), disabled=i in self._disabled)
+                for i in range(self._rows)
+            ),
+            id="list",
+        )
+
+
+class TestPagingListView:
+    @pytest.mark.asyncio
+    async def test_pagedown_moves_highlight_by_a_page(self) -> None:
+        app = _PagingApp(rows=100)
+        async with app.run_test(size=(40, 10)) as pilot:
+            lv = app.query_one("#list", PagingListView)
+            lv.focus()
+            lv.index = 0
+            await pilot.pause()
+            page = lv.scrollable_content_region.height
+            await pilot.press("pagedown")
+            await pilot.pause()
+            assert lv.index == page
+            await pilot.press("pagedown")
+            await pilot.pause()
+            assert lv.index == 2 * page
+            await pilot.press("pageup")
+            await pilot.pause()
+            assert lv.index == page
+
+    @pytest.mark.asyncio
+    async def test_arrow_after_pagedown_stays_on_screen(self) -> None:
+        # The reported bug: an arrow key after paging scrolled back to the
+        # row that was highlighted before the page.
+        app = _PagingApp(rows=100)
+        async with app.run_test(size=(40, 10)) as pilot:
+            lv = app.query_one("#list", PagingListView)
+            lv.focus()
+            lv.index = 0
+            await pilot.pause()
+            await pilot.press("pagedown", "pagedown")
+            await pilot.pause()
+            paged = lv.index
+            assert paged is not None
+            await pilot.press("down")
+            await pilot.pause()
+            assert lv.index == paged + 1
+            assert lv.scroll_y > 0
+
+    @pytest.mark.asyncio
+    async def test_paging_clamps_at_the_ends(self) -> None:
+        app = _PagingApp(rows=12)
+        async with app.run_test(size=(40, 10)) as pilot:
+            lv = app.query_one("#list", PagingListView)
+            lv.focus()
+            lv.index = 0
+            await pilot.pause()
+            for _ in range(3):
+                await pilot.press("pagedown")
+            await pilot.pause()
+            assert lv.index == 11
+            for _ in range(3):
+                await pilot.press("pageup")
+            await pilot.pause()
+            assert lv.index == 0
+
+    @pytest.mark.asyncio
+    async def test_paging_skips_disabled_rows(self) -> None:
+        app = _PagingApp(rows=100, disabled=set(range(5, 30)))
+        async with app.run_test(size=(40, 10)) as pilot:
+            lv = app.query_one("#list", PagingListView)
+            lv.focus()
+            lv.index = 0
+            await pilot.pause()
+            await pilot.press("pagedown")
+            await pilot.pause()
+            # Lands on the first enabled row past the separator block.
+            assert lv.index == 30
+            await pilot.press("pageup")
+            await pilot.pause()
+            assert lv.index is not None
+            assert not lv.children[lv.index].disabled
+
+    @pytest.mark.asyncio
+    async def test_paging_falls_back_when_nothing_ahead_is_enabled(self) -> None:
+        app = _PagingApp(rows=100, disabled=set(range(3, 100)))
+        async with app.run_test(size=(40, 10)) as pilot:
+            lv = app.query_one("#list", PagingListView)
+            lv.focus()
+            lv.index = 0
+            await pilot.pause()
+            await pilot.press("pagedown")
+            await pilot.pause()
+            assert lv.index == 2
+
+    @pytest.mark.asyncio
+    async def test_home_and_end_skip_disabled_edges(self) -> None:
+        app = _PagingApp(rows=50, disabled={0, 49})
+        async with app.run_test(size=(40, 10)) as pilot:
+            lv = app.query_one("#list", PagingListView)
+            lv.focus()
+            lv.index = 10
+            await pilot.pause()
+            await pilot.press("end")
+            await pilot.pause()
+            assert lv.index == 48
+            await pilot.press("home")
+            await pilot.pause()
+            assert lv.index == 1
+
+    @pytest.mark.asyncio
+    async def test_paging_with_no_highlight_goes_to_an_edge(self) -> None:
+        app = _PagingApp(rows=50)
+        async with app.run_test(size=(40, 10)) as pilot:
+            lv = app.query_one("#list", PagingListView)
+            lv.focus()
+            lv.index = None
+            await pilot.pause()
+            await pilot.press("pagedown")
+            await pilot.pause()
+            assert lv.index == 49
+            lv.index = None
+            await pilot.press("pageup")
+            await pilot.pause()
+            assert lv.index == 0
+
+    @pytest.mark.asyncio
+    async def test_paging_an_empty_list_is_a_no_op(self) -> None:
+        app = _PagingApp(rows=0)
+        async with app.run_test(size=(40, 10)) as pilot:
+            lv = app.query_one("#list", PagingListView)
+            lv.focus()
+            await pilot.press("pagedown", "end")
+            await pilot.pause()
+            assert lv.index is None
+
+    @pytest.mark.asyncio
+    async def test_all_disabled_leaves_highlight_alone(self) -> None:
+        app = _PagingApp(rows=20, disabled=set(range(20)))
+        async with app.run_test(size=(40, 10)) as pilot:
+            lv = app.query_one("#list", PagingListView)
+            lv.focus()
+            await pilot.press("pagedown", "home")
+            await pilot.pause()
+            assert lv.index is None or lv.children[lv.index].disabled
+
+    @pytest.mark.asyncio
+    async def test_home_list_pages(self, tmp_path: Path) -> None:
+        worktrees = [tmp_path / f"20260309-wt-{i:02d}" for i in range(40)]
+        with _patch_git_info(worktrees=worktrees):
+            app = SessionApp()
+            async with app.run_test(size=(80, 24)) as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                assert isinstance(home_list, PagingListView)
+                home_list.focus()
+                await pilot.pause()
+                start = home_list.index
+                assert start is not None
+                await pilot.press("pagedown")
+                await pilot.pause()
+                assert home_list.index is not None
+                assert home_list.index > start + 1
+                assert not home_list.children[home_list.index].disabled
 
 
 class TestSessionAppHome:
