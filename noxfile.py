@@ -19,7 +19,7 @@ nox.options.reuse_existing_virtualenvs = True
 nox.options.sessions = ["tests"]
 
 PYTHON_VERSIONS = ["3.11", "3.12", "3.13", "3.14"]
-TEXTUAL_VERSIONS = ["8.0.2", "9.0.0"]
+TEXTUAL_VERSIONS = ["8.0.2", "8.2.8"]
 
 
 @nox.session(python=PYTHON_VERSIONS)

@@ -940,7 +940,7 @@ Coverage is reported automatically (configured in `pyproject.toml`).
 
 - `uv run nox` — default session: `tests` against every supported Python (3.11–3.14). Each session runs `uv sync --active --group=dev` into the nox-managed venv, then `pytest`.
 - `uv run nox -s tests-3.14` — single Python version.
-- `uv run nox -s tests_textual` — parametrized over `TEXTUAL_VERSIONS` (currently 8.0.2 and 9.0.0). Add new versions to the constant in `noxfile.py` to extend the matrix.
+- `uv run nox -s tests_textual` — parametrized over `TEXTUAL_VERSIONS` (currently 8.0.2 and 8.2.8). Add new versions to the constant in `noxfile.py` to extend the matrix.
 
 To add a new Python version: append it to `PYTHON_VERSIONS` in `noxfile.py`, add the classifier to `pyproject.toml`, and add the version to the CI matrix in `.github/workflows/tests.yml`. To add a dependency-pin matrix for a new package, follow the `tests_textual` pattern: define a `*_VERSIONS` list and parametrize a session with `@nox.parametrize`.
 
