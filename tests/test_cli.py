@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,6 +48,9 @@ from fujimoto.cli import (
     _fit_snippet,
     _get_claude_sessions,
     _launch_claude_args,
+    _new_worktree_target,
+    _split_claude_args,
+    _stdout_to_stderr,
     _highlight,
     _match_spans,
     _relative_time,
@@ -60,6 +64,7 @@ from fujimoto import launch_options, session_state
 from fujimoto.session_state import StopKind
 from fujimoto.config import (
     ConfigError,
+    read_session_meta,
     read_claude_args,
     store_session_meta,
     write_claude_args,
@@ -106,7 +111,7 @@ def _patch_git_info(
             patch("fujimoto.cli.is_tmux_installed", return_value=True),
             patch("fujimoto.cli.get_project_name", return_value=project),
             patch(
-                "fujimoto.cli.get_repo_root",
+                "fujimoto.cli.get_project_root",
                 return_value=Path("/fake/repo"),
             ),
             patch("fujimoto.cli.get_current_branch", return_value=current),
@@ -182,6 +187,324 @@ def _isolate_session_state(tmp_path: Path):
         ),
     ):
         yield
+
+
+def _git(cwd: Path, *args: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        # No hooks: a global hook shim (e.g. prek) would reject these commits.
+        ["git", "-c", "core.hooksPath=/dev/null", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A real repo on `main` with one commit, as the cwd, worktrees under it."""
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "config", "commit.gpgsign", "false")
+    (repo / "f").write_text("x")
+    _git(repo, "add", "f")
+    _git(repo, "commit", "-q", "-m", "init")
+    _git(repo, "branch", "develop")
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("FUJIMOTO_WORKTREE_ROOT", raising=False)
+    return repo
+
+
+class TestSplitClaudeArgs:
+    def test_no_separator(self) -> None:
+        assert _split_claude_args(["new", "x"]) == (["new", "x"], None)
+
+    def test_args_after_separator(self) -> None:
+        assert _split_claude_args(["new", "x", "--", "--model", "opus"]) == (
+            ["new", "x"],
+            ("--model", "opus"),
+        )
+
+    def test_empty_after_separator_is_explicit_none(self) -> None:
+        assert _split_claude_args(["new", "x", "--"]) == (["new", "x"], ())
+
+    def test_only_first_separator_splits(self) -> None:
+        assert _split_claude_args(["new", "x", "--", "a", "--", "b"]) == (
+            ["new", "x"],
+            ("a", "--", "b"),
+        )
+
+
+class TestNewWorktreeTarget:
+    def test_creates_worktree_from_default_branch(self, git_repo: Path) -> None:
+        target, created = _new_worktree_target("Fix Tests")
+        assert created is True
+        path = target.working_dir
+        assert path.name.endswith("-fix-tests")
+        assert path.parent == git_repo / ".fujimoto" / "worktrees"
+        assert _git(path, "branch", "--show-current") == f"worktree/{path.name}"
+        meta = read_session_meta(path)
+        assert meta["base_branch"] == "main"
+        assert Path(meta["source_root"]).resolve() == git_repo.resolve()
+        assert target.project == "proj"
+        assert target.session_type == "worktree"
+        assert target.tmux_name is None
+        assert target.claude_args is None
+
+    def test_default_branch_prefers_fetched_origin(self, git_repo: Path) -> None:
+        with (
+            patch("fujimoto.cli.fetch_branch") as fetch,
+            patch("fujimoto.cli.create_worktree") as create,
+            patch("fujimoto.cli.store_session_meta"),
+        ):
+            _new_worktree_target("x")
+        fetch.assert_called_once()
+        assert create.call_args.args[1] == "origin/main"
+
+    def test_base_branch(self, git_repo: Path) -> None:
+        _git(git_repo, "checkout", "-q", "develop")
+        (git_repo / "g").write_text("y")
+        _git(git_repo, "add", "g")
+        _git(git_repo, "commit", "-q", "-m", "dev")
+        _git(git_repo, "checkout", "-q", "main")
+        target, _ = _new_worktree_target("x", base="develop")
+        assert (target.working_dir / "g").exists()
+        assert read_session_meta(target.working_dir)["base_branch"] == "develop"
+
+    def test_current_branch(self, git_repo: Path) -> None:
+        _git(git_repo, "checkout", "-q", "develop")
+        target, _ = _new_worktree_target("x", current=True)
+        assert read_session_meta(target.working_dir)["base_branch"] == "develop"
+
+    def test_existing_worktree_is_connected_not_recreated(self, git_repo: Path) -> None:
+        first, _ = _new_worktree_target("x")
+        with patch("fujimoto.cli.create_worktree") as create:
+            second, created = _new_worktree_target("x", claude_args=("--a",))
+        create.assert_not_called()
+        assert created is False
+        assert second.working_dir == first.working_dir
+        assert second.claude_args == ("--a",)
+
+    def test_from_inside_a_worktree_uses_the_main_clone(
+        self, git_repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        first, _ = _new_worktree_target("first")
+        monkeypatch.chdir(first.working_dir)
+        second, _ = _new_worktree_target("second")
+        assert second.project == "proj"
+        assert second.working_dir.parent == first.working_dir.parent
+        meta = read_session_meta(second.working_dir)
+        assert Path(meta["source_root"]).resolve() == git_repo.resolve()
+
+    def test_unknown_base_raises(self, git_repo: Path) -> None:
+        with pytest.raises(GitError):
+            _new_worktree_target("x", base="nope")
+
+    def test_passes_claude_args(self, git_repo: Path) -> None:
+        target, _ = _new_worktree_target("x", claude_args=("--model", "opus"))
+        assert target.claude_args == ("--model", "opus")
+
+
+class TestNewSubcommand:
+    def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        argv: list[str],
+        *,
+        running: bool = False,
+        created: bool = True,
+    ):
+        monkeypatch.setattr("sys.argv", ["fujimoto", *argv])
+        target = LaunchTarget("proj", Path("/tmp/wt"), None, "worktree")
+        app = SessionApp.__new__(SessionApp)
+        app._launch_target = None
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch(
+                "fujimoto.cli._new_worktree_target", return_value=(target, created)
+            ) as mock_new,
+            patch("fujimoto.cli.session_exists", return_value=running),
+            patch("fujimoto.cli.SessionApp", side_effect=[app]) as mock_app,
+            patch.object(app, "run"),
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
+            patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli.take_pending_action", return_value=None),
+            patch("fujimoto.cli._session_branch", return_value="worktree/wt"),
+            patch("fujimoto.cli._session_terminal_title", return_value="t"),
+            patch("fujimoto.cli._launch_claude_args", return_value=()),
+        ):
+            main()
+        return mock_new, mock_app, mock_launch
+
+    def test_launches_before_tui_then_returns_to_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_new, mock_app, mock_launch = self._run(monkeypatch, ["new", "fix"])
+        mock_new.assert_called_once_with(
+            "fix", base=None, current=False, claude_args=None
+        )
+        assert mock_launch.call_args.args[1] == Path("/tmp/wt")
+        assert mock_launch.call_args.kwargs["attach"] is True
+        # Detaching drops into the TUI, which then quits.
+        assert mock_app.call_count == 1
+
+    def test_new_session_gets_a_session_id_and_records_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, _, mock_launch = self._run(monkeypatch, ["new", "fix"])
+        session_id = mock_launch.call_args.kwargs["session_id"]
+        assert len(session_id) == 36
+        record = session_state.load_state()["proj/wt"]
+        assert record.claude_session_id == session_id
+
+    def test_prompt_is_passed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _, _, mock_launch = self._run(
+            monkeypatch, ["new", "fix", "--prompt", "run the tests"]
+        )
+        assert mock_launch.call_args.kwargs["prompt"] == "run the tests"
+
+    def test_running_session_gets_no_session_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, _, mock_launch = self._run(monkeypatch, ["new", "fix"], running=True)
+        assert mock_launch.call_args.kwargs["session_id"] is None
+
+    def test_prompt_for_running_session_is_an_error(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with pytest.raises(SystemExit) as exc:
+            self._run(monkeypatch, ["new", "fix", "--prompt", "hi"], running=True)
+        assert exc.value.code == 1
+        assert "already running" in capsys.readouterr().err
+
+    def test_detach_prints_json_and_skips_tui(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _, mock_app, mock_launch = self._run(
+            monkeypatch, ["new", "fix", "--detach", "--prompt", "go"]
+        )
+        mock_app.assert_not_called()
+        kwargs = mock_launch.call_args.kwargs
+        assert kwargs["attach"] is False
+        result = json.loads(capsys.readouterr().out)
+        assert result == {
+            "tmux_session": "proj/wt",
+            "working_dir": "/tmp/wt",
+            "branch": "worktree/wt",
+            "claude_session_id": kwargs["session_id"],
+            "worktree_created": True,
+            "session_started": True,
+            "attach_command": "tmux attach-session -t proj/wt",
+        }
+
+    def test_detach_on_running_session_reports_recorded_id(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        session_state.mark_open(
+            "proj/wt",
+            cwd=Path("/tmp/wt"),
+            project="proj",
+            session_type="worktree",
+            claude_session_id="known-id",
+        )
+        self._run(monkeypatch, ["new", "fix", "--detach"], running=True, created=False)
+        result = json.loads(capsys.readouterr().out)
+        assert result["claude_session_id"] == "known-id"
+        assert result["worktree_created"] is False
+        assert result["session_started"] is False
+
+    def test_detach_config_abort_exits_1(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", "new", "fix", "--detach"])
+        target = LaunchTarget("proj", Path("/tmp/wt"), None, "worktree")
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli._new_worktree_target", return_value=(target, True)),
+            patch("fujimoto.cli.session_exists", return_value=False),
+            patch("fujimoto.cli._apply_worktree_config", return_value=False) as cfg,
+            patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            pytest.raises(SystemExit) as exc,
+        ):
+            main()
+        assert exc.value.code == 1
+        assert cfg.call_args.kwargs["interactive"] is False
+        mock_launch.assert_not_called()
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "setup failed" in captured.err
+
+    def test_base_and_claude_args(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        mock_new, _, _ = self._run(
+            monkeypatch,
+            ["new", "fix", "--base", "develop", "--", "--model", "opus"],
+        )
+        mock_new.assert_called_once_with(
+            "fix", base="develop", current=False, claude_args=("--model", "opus")
+        )
+
+    def test_current(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        mock_new, _, _ = self._run(monkeypatch, ["new", "fix", "--current"])
+        assert mock_new.call_args.kwargs["current"] is True
+
+    def test_base_and_current_are_exclusive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "sys.argv", ["fujimoto", "new", "x", "--base", "a", "--current"]
+        )
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 2
+
+    def test_title_needs_a_slug(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", "new", "!!!"])
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 2
+
+    def test_separator_rejected_without_new(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", "--", "--model", "opus"])
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 2
+
+    def test_git_error_exits_1(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", "new", "x", "--base", "nope"])
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch(
+                "fujimoto.cli._new_worktree_target",
+                side_effect=GitError("bad ref"),
+            ),
+            pytest.raises(SystemExit) as exc,
+        ):
+            main()
+        assert exc.value.code == 1
+        assert "bad ref" in capsys.readouterr().err
+
+
+class TestStdoutToStderr:
+    def test_child_process_output_goes_to_stderr(
+        self, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        import subprocess
+
+        with _stdout_to_stderr():
+            subprocess.run(["echo", "from-child"], check=True)
+        print("after")
+        captured = capfd.readouterr()
+        assert "from-child" in captured.err
+        assert captured.out == "after\n"
 
 
 class TestPaneSubcommand:
@@ -967,7 +1290,7 @@ class TestMain:
         ):
             main()
             mock_sp.assert_called_once_with("worktree", "proj", Path("/tmp/test"))
-            mock_apply.assert_called_once_with(Path("/tmp/test"))
+            mock_apply.assert_called_once_with(Path("/tmp/test"), interactive=True)
             mock_launch.assert_called_once_with(
                 "proj",
                 Path("/tmp/test"),
@@ -976,6 +1299,9 @@ class TestMain:
                 resume_session_id=None,
                 fork_session=False,
                 extra_args=(),
+                session_id=None,
+                prompt=None,
+                attach=True,
             )
 
     def test_no_launch_when_target_not_set(self) -> None:
@@ -1022,6 +1348,9 @@ class TestMain:
                 resume_session_id=None,
                 fork_session=False,
                 extra_args=(),
+                session_id=None,
+                prompt=None,
+                attach=True,
             )
 
 
@@ -4061,7 +4390,7 @@ class TestSessionAppTmuxInstall:
             patch("fujimoto.cli.is_tmux_installed", side_effect=fake_is_installed),
             patch("fujimoto.cli.install_tmux") as mock_install,
             patch("fujimoto.cli.get_project_name", return_value="proj"),
-            patch("fujimoto.cli.get_repo_root", return_value=Path("/fake/repo")),
+            patch("fujimoto.cli.get_project_root", return_value=Path("/fake/repo")),
             patch("fujimoto.cli.get_current_branch", return_value="main"),
             patch("fujimoto.cli.get_default_branch", return_value="main"),
             patch("fujimoto.cli.list_project_sessions", return_value=[]),
@@ -4817,6 +5146,9 @@ class TestMainResume:
                 resume_session_id="resume-session-id",
                 fork_session=False,
                 extra_args=(),
+                session_id=None,
+                prompt=None,
+                attach=True,
             )
 
     def test_fork_resumes_parent_with_fork_flag(self, tmp_path: Path) -> None:

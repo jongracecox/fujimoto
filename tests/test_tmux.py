@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shlex
+
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -585,6 +587,26 @@ class TestAttachSession:
             )
 
 
+class TestBuildClaudeCommandSessionAndPrompt:
+    def test_session_id(self) -> None:
+        assert build_claude_command(session_id="abc") == "claude --session-id abc"
+
+    def test_prompt_is_quoted_and_precedes_launch_options(self) -> None:
+        cmd = build_claude_command(
+            prompt="fix the 'tests'",
+            extra_args=("--allowedTools", "Bash", "Read"),
+            session_id="abc",
+        )
+        assert cmd == (
+            "claude 'fix the '\"'\"'tests'\"'\"'' --allowedTools Bash Read "
+            "--session-id abc"
+        )
+        assert shlex.split(cmd)[1] == "fix the 'tests'"
+
+    def test_empty_prompt_is_omitted(self) -> None:
+        assert build_claude_command(prompt="") == "claude"
+
+
 class TestLaunchClaudeInTmux:
     def test_attaches_when_session_exists(self, tmp_path: Path) -> None:
         with (
@@ -609,8 +631,23 @@ class TestLaunchClaudeInTmux:
                 resume_session_id=None,
                 fork_session=False,
                 extra_args=(),
+                session_id=None,
+                prompt=None,
             )
             mock_attach.assert_called_once_with("proj/20260309-test")
+
+    def test_detached_launch_creates_without_attaching(self, tmp_path: Path) -> None:
+        with (
+            patch("fujimoto.tmux.session_exists", return_value=False),
+            patch("fujimoto.tmux.create_session") as mock_create,
+            patch("fujimoto.tmux.attach_session") as mock_attach,
+        ):
+            launch_claude_in_tmux(
+                "proj", tmp_path / "wt", session_id="sid", prompt="go", attach=False
+            )
+            assert mock_create.call_args.kwargs["session_id"] == "sid"
+            assert mock_create.call_args.kwargs["prompt"] == "go"
+            mock_attach.assert_not_called()
 
     def test_uses_explicit_tmux_name(self, tmp_path: Path) -> None:
         with (

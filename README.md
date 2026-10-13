@@ -266,6 +266,51 @@ Run from inside any git repository:
 fujimoto
 ```
 
+### Launching a worktree session from the command line
+
+`fujimoto new` skips the home screen for the first launch: it creates the
+worktree and starts Claude in it straight away. Detaching returns to the home
+screen as usual.
+
+```sh
+fujimoto new fix-unit-tests                    # from origin/<default branch> (fetched first)
+fujimoto new fix-unit-tests --base develop     # from another branch
+fujimoto new fix-unit-tests --current          # from the current branch
+fujimoto new fix-unit-tests -- --model opus    # with claude launch options
+fujimoto new fix-unit-tests --prompt "Fix the failing tests"   # first message
+fujimoto new fix-unit-tests --detach --prompt "…"             # start it in the background
+```
+
+Arguments after `--` are passed to `claude` and saved as the session's
+[launch options](#launch-options), exactly as if they had been entered in the
+launch options dialog. If a worktree for the title already exists (same day,
+same name), `fujimoto new` connects to it instead of creating another.
+
+`--prompt` is sent as the first message of the new Claude session. It is not
+saved, so relaunching the session later doesn't send it again. A `--prompt`
+for a session that is already running is an error, since it could only reach
+a new Claude process.
+
+`--detach` starts the session without attaching and prints its details as
+JSON, for scripts and other agents:
+
+```json
+{
+  "tmux_session": "myproject/20261013-fix-unit-tests",
+  "working_dir": "/Users/me/git/worktrees/myproject/20261013-fix-unit-tests",
+  "branch": "worktree/20261013-fix-unit-tests",
+  "claude_session_id": "8f0e…",
+  "worktree_created": true,
+  "session_started": true,
+  "attach_command": "tmux attach-session -t myproject/20261013-fix-unit-tests"
+}
+```
+
+Each new Claude process started by `fujimoto new` gets its id from fujimoto
+(`claude --session-id`), so `claude_session_id` is known immediately, before
+any transcript exists. Output from `.fujimoto.yaml` init commands goes to
+stderr in this mode, so stdout is only the JSON.
+
 ### Home Screen
 
 ```

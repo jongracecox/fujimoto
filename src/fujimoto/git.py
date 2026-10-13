@@ -42,8 +42,18 @@ def get_repo_root(cwd: Path | str | None = None) -> Path:
     return Path(_run(["rev-parse", "--show-toplevel"], cwd=cwd))
 
 
+def get_project_root(cwd: Path | str | None = None) -> Path:
+    """The directory a project is named after and its worktrees are keyed by.
+
+    This is the main clone even when `cwd` is inside a linked worktree, so
+    running fujimoto from a worktree session sees the same project — and puts
+    new worktrees in the same place — as running it from the main clone.
+    """
+    return get_main_worktree_root(cwd)
+
+
 def get_project_name(cwd: Path | str | None = None) -> str:
-    return get_repo_root(cwd).name
+    return get_project_root(cwd).name
 
 
 def get_main_worktree_root(cwd: Path | str | None = None) -> Path:
@@ -51,9 +61,16 @@ def get_main_worktree_root(cwd: Path | str | None = None) -> Path:
 
     The common git dir (`--git-common-dir`) lives at `<main-worktree>/.git`, so
     its parent is the main working copy even when `cwd` is a linked worktree.
+    Anywhere else — a submodule (`<super>/.git/modules/<name>`) or a bare
+    repo's worktree (`repo.git`) — the parent is not a working copy, so this
+    falls back to the toplevel of `cwd`.
     """
-    common = _run(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=cwd)
-    return Path(common).parent
+    common = Path(
+        _run(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=cwd)
+    )
+    if common.name != ".git":
+        return get_repo_root(cwd)
+    return common.parent
 
 
 def get_current_branch(cwd: Path | str | None = None) -> str:
