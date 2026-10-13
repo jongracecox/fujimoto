@@ -19,6 +19,7 @@ from fujimoto.git import (
     get_main_worktree_root,
     get_merge_base,
     get_project_name,
+    get_project_root,
     get_repo_root,
     get_unpushed_commits,
     has_remote_branch,
@@ -115,6 +116,40 @@ class TestGetDefaultBranch:
             assert result == "main"
 
 
+class TestGetProjectRootFromLinkedWorktree:
+    def test_linked_worktree_resolves_to_main_clone(self, tmp_path: Path) -> None:
+        def git(cwd: Path, *args: str) -> None:
+            subprocess.run(
+                ["git", "-c", "core.hooksPath=/dev/null", *args],
+                cwd=cwd,
+                check=True,
+                capture_output=True,
+            )
+
+        main = tmp_path / "myproj"
+        main.mkdir()
+        git(main, "init", "-q", "-b", "main")
+        git(
+            main,
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "i",
+        )
+        linked = tmp_path / "elsewhere" / "20261013-task"
+        git(main, "worktree", "add", "-q", "-b", "wt", str(linked))
+
+        assert get_project_root(linked).resolve() == main.resolve()
+        assert get_project_name(linked) == "myproj"
+
+
 class TestGetMainWorktreeRoot:
     def test_returns_parent_of_common_git_dir(self) -> None:
         def mock_run(args: list[str], **kwargs) -> str:  # type: ignore[no-untyped-def]
@@ -127,6 +162,15 @@ class TestGetMainWorktreeRoot:
 
         with patch("fujimoto.git._run", side_effect=mock_run):
             assert get_main_worktree_root() == Path("/home/user/repo")
+
+    def test_submodule_falls_back_to_toplevel(self) -> None:
+        def mock_run(args: list[str], **kwargs) -> str:  # type: ignore[no-untyped-def]
+            if "--git-common-dir" in args:
+                return "/home/user/super/.git/modules/sub"
+            return "/home/user/super/sub"
+
+        with patch("fujimoto.git._run", side_effect=mock_run):
+            assert get_main_worktree_root() == Path("/home/user/super/sub")
 
     def test_resolves_against_real_repo(self) -> None:
         # The main worktree root is a real directory holding the shared git dir.

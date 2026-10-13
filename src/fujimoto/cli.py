@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
 import textwrap
 import threading
+import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -76,6 +81,7 @@ from fujimoto.git import (
     get_default_branch,
     get_main_worktree_root,
     get_project_name,
+    get_project_root,
     get_repo_root,
     get_unpushed_commits,
     has_remote_branch,
@@ -1381,6 +1387,10 @@ class LaunchTarget(NamedTuple):
     # also saves as the session's options. None means "not asked" — use
     # whatever is saved, inherited or configured (`launch_options.resolve`).
     claude_args: tuple[str, ...] | None = None
+    # `fujimoto new` only: the id to give a *new* claude conversation
+    # (`--session-id`) and its first message. Neither is saved or replayed.
+    session_id: str | None = None
+    prompt: str | None = None
 
 
 class SessionApp(App):
@@ -1611,7 +1621,7 @@ class SessionApp(App):
     def _init_git_info(self) -> None:
         cwd = self._project_cwd
         self._project_name = get_project_name(cwd)
-        self._project_root = get_repo_root(cwd)
+        self._project_root = get_project_root(cwd)
         self._current_branch = get_current_branch(cwd)
         self._default_branch = get_default_branch(cwd)
         self._active_sessions = set(list_project_sessions(self._project_name))
@@ -5231,7 +5241,7 @@ def _resolve_worktree_source(working_dir: Path) -> Path | None:
     return Path(recorded) if recorded else main_root
 
 
-def _apply_worktree_config(working_dir: Path) -> bool:
+def _apply_worktree_config(working_dir: Path, *, interactive: bool = True) -> bool:
     """Apply project config before launching a worktree session.
 
     Runs `once` actions only on first creation (tracked by a marker), and
@@ -5274,7 +5284,8 @@ def _apply_worktree_config(working_dir: Path) -> bool:
         print(f"fujimoto: {result.init_error}", file=sys.stderr)
         abort = config.on_error is OnError.ABORT
         verb = "aborting launch" if abort else "continuing"
-        _pause_for_key(f"An error was encountered ({verb}). Press any key...")
+        if interactive:
+            _pause_for_key(f"An error was encountered ({verb}). Press any key...")
         if abort:
             return False
         if first_time:
@@ -5314,6 +5325,77 @@ def _launch_claude_args(target: LaunchTarget, tmux_name: str) -> tuple[str, ...]
     return resolved.args
 
 
+def _start_launch(target: LaunchTarget, *, attach: bool = True) -> str | None:
+    """Launch a target in tmux: project config, session record, claude, attach.
+
+    Returns the tmux session name, or None when project config aborted the
+    launch. With `attach=True` (the TUI loop) it returns once the user
+    detaches; with `attach=False` (`fujimoto new --detach`) it returns as soon
+    as the session exists, and project-config errors don't wait for a key.
+    """
+    project_name = target.project
+    working_dir = target.working_dir
+    tmux_name = target.tmux_name
+    session_type = target.session_type
+    fork_id = target.forked_from_session_id
+    resume_id = fork_id or target.resume_session_id
+    debug.log(
+        "launch.target",
+        project=debug.rv(project_name),
+        working_dir=debug.rp(working_dir),
+        tmux=debug.rv(tmux_name),
+        session_type=session_type,
+        resume=resume_id or "none",
+    )
+    if fork_id:
+        # A fork resumes the parent's conversation but in a new
+        # worktree, so it needs the prompt explaining the move.
+        meta = read_session_meta(working_dir)
+        system_prompt = _build_fork_system_prompt(
+            project_name,
+            working_dir,
+            target.forked_from_worktree,
+            meta.get("base_branch", "unknown"),
+        )
+    elif resume_id:
+        system_prompt = None
+    else:
+        system_prompt = _build_system_prompt(session_type, project_name, working_dir)
+    if attach:
+        set_terminal_title(
+            _session_terminal_title(project_name, tmux_name, working_dir, session_type)
+        )
+    if not _apply_worktree_config(working_dir, interactive=attach):
+        debug.log("launch.aborted", reason="project-config")
+        return None
+    resolved_name = tmux_name or session_name(project_name, working_dir.name)
+    # Record the session as open *before* attaching: if the host
+    # goes down while it is attached, the record is what brings the
+    # session back.
+    session_state.mark_open(
+        resolved_name,
+        cwd=working_dir,
+        project=project_name,
+        session_type=session_type,
+        branch=_session_branch(working_dir),
+        claude_session_id=resume_id or target.session_id,
+    )
+    claude_args = _launch_claude_args(target, resolved_name)
+    launch_claude_in_tmux(
+        project_name,
+        working_dir,
+        tmux_name,
+        system_prompt=system_prompt,
+        resume_session_id=resume_id,
+        fork_session=bool(fork_id),
+        extra_args=claude_args,
+        session_id=target.session_id,
+        prompt=target.prompt,
+        attach=attach,
+    )
+    return resolved_name
+
+
 def _create_config() -> None:
     """Scaffold a `.fujimoto.yaml` at the repo root (used by --create-config)."""
     try:
@@ -5323,6 +5405,160 @@ def _create_config() -> None:
         print(f"fujimoto: {e}", file=sys.stderr)
         sys.exit(1)
     print(f"Created {dest}")
+
+
+def _new_worktree_target(
+    title: str,
+    *,
+    base: str | None = None,
+    current: bool = False,
+    claude_args: tuple[str, ...] | None = None,
+) -> tuple[LaunchTarget, bool]:
+    """Create a worktree for `fujimoto new <title>` and describe its launch.
+
+    The CLI counterpart of the TUI's title → base branch → create flow. With
+    neither `base` nor `current` it takes the TUI's default option: fetch the
+    default branch and start from `origin/<default>`, falling back to the local
+    branch when offline. A worktree that already exists for the title (same
+    day, same slug) is connected to rather than duplicated, so re-running the
+    command is idempotent. The flag returned with the target says whether the
+    worktree was created by this call.
+    """
+    cwd = Path.cwd()
+    project = get_project_name(cwd)
+    root = get_project_root(cwd)
+    path = build_worktree_path(project, title, root)
+    if path.exists():
+        debug.log("cli.new", outcome="connect", path=debug.rp(path))
+        target = LaunchTarget(project, path, None, "worktree", claude_args=claude_args)
+        return target, False
+
+    start_point = ""
+    if current:
+        base_branch = get_current_branch(cwd)
+    elif base:
+        base_branch = base
+    else:
+        base_branch = get_default_branch(cwd)
+        try:
+            fetch_branch(base_branch, cwd=cwd)
+            start_point = f"origin/{base_branch}"
+        except GitError:
+            pass  # Offline or no remote — proceed with local state
+    create_worktree(path, start_point or base_branch, f"worktree/{path.name}", cwd=cwd)
+    store_session_meta(path, base_branch, source_root=root)
+    debug.log(
+        "cli.new",
+        outcome="created",
+        path=debug.rp(path),
+        base=debug.rref(base_branch),
+        start_point=debug.rref(start_point or base_branch),
+    )
+    target = LaunchTarget(project, path, None, "worktree", claude_args=claude_args)
+    return target, True
+
+
+def _new_session_result(
+    target: LaunchTarget, tmux_name: str, *, created: bool, started: bool
+) -> dict[str, object]:
+    """The JSON `fujimoto new --detach` prints, for scripts and agents.
+
+    `claude_session_id` is the id fujimoto chose (`--session-id`) for a new
+    claude process; for a session that was already running it is whatever the
+    session record holds, which may be null.
+    """
+    session_id = target.session_id
+    if session_id is None:
+        record = session_state.load_state().get(tmux_name)
+        session_id = record.claude_session_id if record else None
+    return {
+        "tmux_session": tmux_name,
+        "working_dir": str(target.working_dir),
+        "branch": _session_branch(target.working_dir),
+        "claude_session_id": session_id,
+        "worktree_created": created,
+        "session_started": started,
+        "attach_command": f"tmux attach-session -t {shlex.quote(tmux_name)}",
+    }
+
+
+@contextlib.contextmanager
+def _stdout_to_stderr() -> Iterator[None]:
+    """Point file descriptor 1 at stderr for the duration.
+
+    Project-config init commands inherit fujimoto's stdout, which in
+    `fujimoto new --detach` is reserved for the JSON result. Redirecting at the
+    descriptor level (not `sys.stdout`) is what reaches a child process.
+    """
+    sys.stdout.flush()
+    saved = os.dup(1)
+    try:
+        os.dup2(2, 1)
+        yield
+    finally:
+        sys.stdout.flush()
+        os.dup2(saved, 1)
+        os.close(saved)
+
+
+def _prepare_new_session(
+    args: argparse.Namespace, claude_args: tuple[str, ...] | None
+) -> LaunchTarget | None:
+    """Run `fujimoto new`: create the worktree, then hand back or launch it.
+
+    A new claude process gets a fresh `--session-id`, so its id is known
+    before any transcript exists, plus the `--prompt`. Returns the target for
+    the TUI loop to launch and attach to; with `--detach` it launches here,
+    prints the JSON result and returns None. A `--prompt` for a session that is
+    already running is an error: it could only reach a new claude process.
+    """
+    target, created = _new_worktree_target(
+        args.title, base=args.base, current=args.current, claude_args=claude_args
+    )
+    name = session_name(target.project, target.working_dir.name)
+    running = session_exists(name)
+    debug.log(
+        "cli.new_session",
+        session=debug.rv(name),
+        running=running,
+        detach=args.detach,
+        prompt_chars=len(args.prompt or ""),
+    )
+    if running and args.prompt:
+        _finish_debug_log()
+        print(
+            f"fujimoto: {name} is already running; --prompt only applies to a "
+            "new claude session",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not running:
+        target = target._replace(session_id=str(uuid.uuid4()), prompt=args.prompt)
+    if not args.detach:
+        return target
+
+    with _stdout_to_stderr():
+        resolved = _start_launch(target, attach=False)
+    if resolved is None:
+        _finish_debug_log()
+        print("fujimoto: project config setup failed; not launched", file=sys.stderr)
+        sys.exit(1)
+    result = _new_session_result(target, resolved, created=created, started=not running)
+    print(json.dumps(result, indent=2))
+    return None
+
+
+def _split_claude_args(argv: list[str]) -> tuple[list[str], tuple[str, ...] | None]:
+    """Split argv at the first `--` into fujimoto's args and claude's.
+
+    Done by hand rather than with `nargs=REMAINDER`, whose handling of `--`
+    has changed between Python versions. `None` means no `--` was given (use
+    the saved or configured options); `()` is an explicit "no options".
+    """
+    if "--" not in argv:
+        return argv, None
+    i = argv.index("--")
+    return argv[:i], tuple(argv[i + 1 :])
 
 
 def _run_pane_command(action: str, session: str) -> None:
@@ -5352,9 +5588,9 @@ def _start_debug_log(*, redact: bool) -> None:
     except OSError as exc:
         print(f"fujimoto: could not open debug log: {exc}", file=sys.stderr)
         return
-    print(f"fujimoto: debug log → {logger.path}")
+    print(f"fujimoto: debug log → {logger.path}", file=sys.stderr)
     if redact:
-        print("fujimoto: sensitive values are redacted in this log")
+        print("fujimoto: sensitive values are redacted in this log", file=sys.stderr)
     debug.log_environment()
     debug.log_section("run")
 
@@ -5366,7 +5602,7 @@ def _finish_debug_log() -> None:
         return
     debug.log("shutdown")
     debug.disable()
-    print(f"fujimoto: debug log written to {path}")
+    print(f"fujimoto: debug log written to {path}", file=sys.stderr)
 
 
 def main() -> None:
@@ -5402,8 +5638,50 @@ def main() -> None:
     pane = sub.add_parser("pane", help="Per-session pane actions")
     pane.add_argument("action", choices=["vscode", "terminal"])
     pane.add_argument("--session", required=True)
+    new = sub.add_parser(
+        "new",
+        help="Create a worktree and launch Claude in it",
+        description=(
+            "Create a worktree session and launch Claude in it. Arguments "
+            "after -- are passed to claude and saved as the session's "
+            "launch options."
+        ),
+        usage=(
+            "fujimoto new TITLE [--base BRANCH | --current] [--prompt TEXT] "
+            "[--detach] [-- CLAUDE_ARGS...]"
+        ),
+    )
+    new.add_argument("title", help="Session title, e.g. fix-unit-tests")
+    base_group = new.add_mutually_exclusive_group()
+    base_group.add_argument(
+        "--base",
+        metavar="BRANCH",
+        help="Branch to start from (default: fetch & use origin/<default branch>)",
+    )
+    base_group.add_argument(
+        "--current",
+        action="store_true",
+        help="Start from the current branch",
+    )
+    new.add_argument(
+        "--prompt",
+        metavar="TEXT",
+        help="First message to send to the new claude session",
+    )
+    new.add_argument(
+        "--detach",
+        action="store_true",
+        help=(
+            "Start the session without attaching; print its details as JSON and exit"
+        ),
+    )
 
-    args = parser.parse_args()
+    argv, claude_args = _split_claude_args(sys.argv[1:])
+    args = parser.parse_args(argv)
+    if claude_args is not None and args.command != "new":
+        parser.error("arguments after -- are only accepted by 'fujimoto new'")
+    if args.command == "new" and not slugify(args.title):
+        parser.error("title must contain at least one letter or digit")
     if args.debug or args.debug_redacted:
         _start_debug_log(redact=args.debug_redacted)
     if args.command == "pane":
@@ -5425,79 +5703,34 @@ def main() -> None:
                 print(f"  {issue}\n", file=sys.stderr)
             sys.exit(1)
 
+        # `fujimoto new` skips the TUI for its first launch only; detaching
+        # then lands on the home screen like any other session.
+        initial_target: LaunchTarget | None = None
+        if args.command == "new":
+            initial_target = _prepare_new_session(args, claude_args)
+            if initial_target is None:  # --detach: launched, nothing to attach
+                _finish_debug_log()
+                return
         pending_fork: Path | None = None
         pending_close: LaunchTarget | None = None
         while True:
-            set_terminal_title(f"{ICON_WIZARD} fujimoto")
-            app = SessionApp(pending_fork=pending_fork, pending_close=pending_close)
-            pending_fork = None
-            pending_close = None
-            app.run()
-
-            if app._launch_target:
+            if initial_target is not None:
+                target, initial_target = initial_target, None
+            else:
+                set_terminal_title(f"{ICON_WIZARD} fujimoto")
+                app = SessionApp(pending_fork=pending_fork, pending_close=pending_close)
+                pending_fork = None
+                pending_close = None
+                app.run()
                 target = app._launch_target
+
+            if target:
+                resolved_name = _start_launch(target)
+                if resolved_name is None:
+                    continue  # setup failed and on_error=abort -> reopen the TUI
                 project_name = target.project
                 working_dir = target.working_dir
-                tmux_name = target.tmux_name
                 session_type = target.session_type
-                fork_id = target.forked_from_session_id
-                resume_id = fork_id or target.resume_session_id
-                debug.log(
-                    "launch.target",
-                    project=debug.rv(project_name),
-                    working_dir=debug.rp(working_dir),
-                    tmux=debug.rv(tmux_name),
-                    session_type=session_type,
-                    resume=resume_id or "none",
-                )
-                if fork_id:
-                    # A fork resumes the parent's conversation but in a new
-                    # worktree, so it needs the prompt explaining the move.
-                    meta = read_session_meta(working_dir)
-                    system_prompt = _build_fork_system_prompt(
-                        project_name,
-                        working_dir,
-                        target.forked_from_worktree,
-                        meta.get("base_branch", "unknown"),
-                    )
-                elif resume_id:
-                    system_prompt = None
-                else:
-                    system_prompt = _build_system_prompt(
-                        session_type, project_name, working_dir
-                    )
-                set_terminal_title(
-                    _session_terminal_title(
-                        project_name, tmux_name, working_dir, session_type
-                    )
-                )
-                if not _apply_worktree_config(working_dir):
-                    debug.log("launch.aborted", reason="project-config")
-                    continue  # setup failed and on_error=abort -> reopen the TUI
-                resolved_name = tmux_name or session_name(
-                    project_name, working_dir.name
-                )
-                # Record the session as open *before* attaching: if the host
-                # goes down while it is attached, the record is what brings the
-                # session back.
-                session_state.mark_open(
-                    resolved_name,
-                    cwd=working_dir,
-                    project=project_name,
-                    session_type=session_type,
-                    branch=_session_branch(working_dir),
-                    claude_session_id=resume_id,
-                )
-                claude_args = _launch_claude_args(target, resolved_name)
-                launch_claude_in_tmux(
-                    project_name,
-                    working_dir,
-                    tmux_name,
-                    system_prompt=system_prompt,
-                    resume_session_id=resume_id,
-                    fork_session=bool(fork_id),
-                    extra_args=claude_args,
-                )
                 # `Ctrl-A f` / `s` / `x` inside the session flag it and detach,
                 # handing the work to the TUI (which can show pickers/prompts).
                 action = take_pending_action(resolved_name)

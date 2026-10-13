@@ -462,6 +462,8 @@ def build_claude_command(
     resume_session_id: str | None = None,
     fork_session: bool = False,
     extra_args: Sequence[str] = (),
+    session_id: str | None = None,
+    prompt: str | None = None,
 ) -> str:
     """Compose the `claude` invocation for a new tmux session.
 
@@ -471,8 +473,19 @@ def build_claude_command(
     original worktree lives). `extra_args` are the user's launch options;
     they come first and are shell-quoted, since tmux runs the result through
     a shell.
+
+    `session_id` fixes the new conversation's id up front (`--session-id`),
+    so the caller knows it without waiting for a transcript. `prompt` is the
+    first message, passed as claude's positional argument. It goes straight
+    after `claude`, ahead of the launch options, because a variadic option
+    there (`--allowedTools a b`) would otherwise swallow it.
     """
-    parts = ["claude", *(shlex.quote(a) for a in extra_args)]
+    parts = ["claude"]
+    if prompt:
+        parts.append(shlex.quote(prompt))
+    parts.extend(shlex.quote(a) for a in extra_args)
+    if session_id:
+        parts.append(f"--session-id {shlex.quote(session_id)}")
     if resume_session_id:
         parts.append(f"--resume {resume_session_id}")
         if fork_session:
@@ -490,18 +503,24 @@ def create_session(
     resume_session_id: str | None = None,
     fork_session: bool = False,
     extra_args: Sequence[str] = (),
+    session_id: str | None = None,
+    prompt: str | None = None,
 ) -> None:
     claude_cmd = build_claude_command(
         system_prompt=system_prompt,
         resume_session_id=resume_session_id,
         fork_session=fork_session,
         extra_args=extra_args,
+        session_id=session_id,
+        prompt=prompt,
     )
     debug.log(
         "tmux.create_session",
         session=debug.rv(name),
         cwd=debug.rp(working_dir),
         resume=resume_session_id or "none",
+        session_id=session_id or "none",
+        prompt_chars=len(prompt or ""),
         system_prompt_chars=len(system_prompt or ""),
         command=debug.rv(claude_cmd),
     )
@@ -593,7 +612,15 @@ def launch_claude_in_tmux(
     resume_session_id: str | None = None,
     fork_session: bool = False,
     extra_args: Sequence[str] = (),
+    session_id: str | None = None,
+    prompt: str | None = None,
+    attach: bool = True,
 ) -> None:
+    """Create the session if it isn't running, then attach unless `attach=False`.
+
+    `session_id` and `prompt` only reach a newly created claude process; an
+    already-running session is attached to as it is.
+    """
     name = tmux_name or session_name(project_name, working_dir.name)
     debug.log(
         "tmux.launch",
@@ -601,10 +628,9 @@ def launch_claude_in_tmux(
         session=debug.rv(name),
         cwd=debug.rp(working_dir),
         resume=resume_session_id or "none",
+        attach=attach,
     )
-    if session_exists(name):
-        attach_session(name)
-    else:
+    if not session_exists(name):
         create_session(
             name,
             working_dir,
@@ -612,5 +638,8 @@ def launch_claude_in_tmux(
             resume_session_id=resume_session_id,
             fork_session=fork_session,
             extra_args=extra_args,
+            session_id=session_id,
+            prompt=prompt,
         )
+    if attach:
         attach_session(name)
