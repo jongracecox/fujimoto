@@ -598,6 +598,8 @@ These options are set per-session and don't affect your global tmux config.
 | `Escape` | Back (or quit from home; clears an active filter first) |
 | `q` | Quit |
 | Arrow keys | Navigate |
+| `PgUp` / `PgDn` | Move the highlight a page at a time |
+| `Home` / `End` | Jump to the first / last row |
 
 The footer only lists the keys that do something in the view you are in — `s`
 and `r` disappear once you leave the home screen, the `Ctrl+R`/`Ctrl+T`/`Ctrl+I` mode
