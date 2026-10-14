@@ -221,6 +221,34 @@ def kill_session(name: str) -> None:
         raise TmuxError(f"Failed to kill session: {name}")
 
 
+def _ensure_focus_events() -> None:
+    """Turn on the tmux server's ``focus-events`` option.
+
+    Off by default, so panes never see focus in/out events and Claude Code
+    shows a "tmux focus-events off" hint in every session. Claude Code reads
+    the option once at startup (``tmux show -gv focus-events``) and caches
+    it, so this has to run straight after ``new-session``, before claude
+    has finished loading.
+
+    The option is server-wide. tmux only sends the focus-reporting enable
+    sequence to a client's terminal when it attaches, so changing it does
+    not reach clients already attached — which is fine here, because
+    fujimoto attaches after creating the session.
+    """
+    result = subprocess.run(
+        ["tmux", "show-options", "-sv", "focus-events"],
+        capture_output=True,
+        text=True,
+    )
+    previous = result.stdout.strip() if result.returncode == 0 else None
+    if previous != "on":
+        subprocess.run(
+            ["tmux", "set-option", "-s", "focus-events", "on"],
+            check=True,
+        )
+    debug.log("tmux.focus_events", previous=previous, changed=previous != "on")
+
+
 def _ensure_extended_keys() -> None:
     """Ensure tmux server forwards extended key sequences (like Shift+Enter).
 
@@ -537,6 +565,7 @@ def create_session(
         ],
         check=True,
     )
+    _ensure_focus_events()
     _configure_session(name)
     _ensure_extended_keys()
     _apply_quick_terminal_setting()
@@ -563,6 +592,7 @@ def create_session_with_command(name: str, working_dir: Path, command: str) -> N
         ],
         check=True,
     )
+    _ensure_focus_events()
     _configure_session(name)
     _ensure_extended_keys()
     _apply_quick_terminal_setting()
