@@ -12,6 +12,7 @@ from fujimoto.tmux import (
     TmuxError,
     _configure_session,
     _ensure_extended_keys,
+    _ensure_focus_events,
     _meta_key_label,
     attach_session,
     build_claude_command,
@@ -711,6 +712,82 @@ class TestEnsureExtendedKeys:
             for c in mock_run.call_args_list:
                 if c[0][0][:4] == ["tmux", "set-option", "-s", "-a"]:
                     pytest.fail("Should not append extkeys when already present")
+
+
+class TestEnsureFocusEvents:
+    @staticmethod
+    def _run(current: str, returncode: int = 0):
+        def side_effect(args: list[str], **kwargs: object) -> MagicMock:
+            if args[:2] == ["tmux", "show-options"]:
+                return MagicMock(returncode=returncode, stdout=current)
+            return MagicMock(returncode=0)
+
+        return side_effect
+
+    def test_turns_on_server_focus_events_when_off(self) -> None:
+        with patch(
+            "fujimoto.tmux.subprocess.run", side_effect=self._run("off\n")
+        ) as mock_run:
+            _ensure_focus_events()
+
+        assert (
+            call(["tmux", "set-option", "-s", "focus-events", "on"], check=True)
+            in mock_run.call_args_list
+        )
+
+    def test_skips_set_when_already_on(self) -> None:
+        with patch(
+            "fujimoto.tmux.subprocess.run", side_effect=self._run("on\n")
+        ) as mock_run:
+            _ensure_focus_events()
+
+        assert all(c[0][0][1] != "set-option" for c in mock_run.call_args_list)
+
+    def test_sets_when_option_cannot_be_read(self) -> None:
+        with patch(
+            "fujimoto.tmux.subprocess.run", side_effect=self._run("", returncode=1)
+        ) as mock_run:
+            _ensure_focus_events()
+
+        assert (
+            call(["tmux", "set-option", "-s", "focus-events", "on"], check=True)
+            in mock_run.call_args_list
+        )
+
+    def test_logs_previous_value(self, tmp_path: Path) -> None:
+        from fujimoto import debug
+
+        debug.enable(redact=False, log_dir=tmp_path)
+        try:
+            with patch("fujimoto.tmux.subprocess.run", side_effect=self._run("off")):
+                _ensure_focus_events()
+        finally:
+            debug.disable()
+
+        log = next(tmp_path.glob("*.log")).read_text()
+        assert "tmux.focus_events" in log
+        assert "previous=off" in log
+        assert "changed=True" in log
+
+    @pytest.mark.parametrize("command", [None, "echo hi"])
+    def test_create_session_sets_it_before_anything_else(
+        self, tmp_path: Path, command: str | None
+    ) -> None:
+        # Claude Code probes focus-events once at startup, so the option has to
+        # be set straight after new-session rather than after the slower
+        # per-session configuration.
+        with patch(
+            "fujimoto.tmux.subprocess.run", side_effect=self._run("off")
+        ) as mock_run:
+            if command is None:
+                create_session("proj/test", tmp_path)
+            else:
+                create_session_with_command("proj/test", tmp_path, command)
+
+        calls = [c[0][0] for c in mock_run.call_args_list]
+        assert calls[0][1] == "new-session"
+        assert calls[1] == ["tmux", "show-options", "-sv", "focus-events"]
+        assert calls[2] == ["tmux", "set-option", "-s", "focus-events", "on"]
 
 
 class TestSetTerminalTitle:
