@@ -731,7 +731,11 @@ class TestEnsureFocusEvents:
             _ensure_focus_events()
 
         assert (
-            call(["tmux", "set-option", "-s", "focus-events", "on"], check=True)
+            call(
+                ["tmux", "set-option", "-s", "focus-events", "on"],
+                capture_output=True,
+                text=True,
+            )
             in mock_run.call_args_list
         )
 
@@ -750,7 +754,11 @@ class TestEnsureFocusEvents:
             _ensure_focus_events()
 
         assert (
-            call(["tmux", "set-option", "-s", "focus-events", "on"], check=True)
+            call(
+                ["tmux", "set-option", "-s", "focus-events", "on"],
+                capture_output=True,
+                text=True,
+            )
             in mock_run.call_args_list
         )
 
@@ -768,6 +776,54 @@ class TestEnsureFocusEvents:
         assert "tmux.focus_events" in log
         assert "previous=off" in log
         assert "changed=True" in log
+
+    def test_failed_set_is_logged_not_raised(self, tmp_path: Path) -> None:
+        from fujimoto import debug
+
+        def side_effect(args: list[str], **kwargs: object) -> MagicMock:
+            if args[:2] == ["tmux", "show-options"]:
+                return MagicMock(returncode=0, stdout="off")
+            if args[:2] == ["tmux", "set-option"]:
+                return MagicMock(returncode=1, stderr="invalid option")
+            return MagicMock(returncode=0)
+
+        debug.enable(redact=False, log_dir=tmp_path)
+        try:
+            with patch("fujimoto.tmux.subprocess.run", side_effect=side_effect):
+                _ensure_focus_events()
+        finally:
+            debug.disable()
+
+        log = next(tmp_path.glob("*.log")).read_text()
+        assert "changed=False" in log
+        assert "error=1" in log
+        assert "invalid option" in log
+
+    @pytest.mark.parametrize("command", [None, "echo hi"])
+    def test_create_session_survives_failed_set(
+        self, tmp_path: Path, command: str | None
+    ) -> None:
+        def side_effect(args: list[str], **kwargs: object) -> MagicMock:
+            if args[:3] == ["tmux", "set-option", "-s"] and "focus-events" in args:
+                return MagicMock(returncode=1, stderr="invalid option")
+            if args[:2] == ["tmux", "show-options"]:
+                return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0)
+
+        with (
+            patch("fujimoto.tmux.subprocess.run", side_effect=side_effect),
+            patch("fujimoto.tmux._configure_session") as mock_configure,
+            patch("fujimoto.tmux._ensure_extended_keys") as mock_extkeys,
+            patch("fujimoto.tmux._apply_quick_terminal_setting") as mock_quick,
+        ):
+            if command is None:
+                create_session("proj/test", tmp_path)
+            else:
+                create_session_with_command("proj/test", tmp_path, command)
+
+        mock_configure.assert_called_once_with("proj/test")
+        mock_extkeys.assert_called_once()
+        mock_quick.assert_called_once()
 
     @pytest.mark.parametrize("command", [None, "echo hi"])
     def test_create_session_sets_it_before_anything_else(
