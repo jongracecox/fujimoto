@@ -216,6 +216,48 @@ def _cwd_index() -> dict[str, list[Path]]:
     return index
 
 
+def recorded_cwds_under(base: Path) -> list[Path]:
+    """Working directories at or below `base` that Claude has transcripts for.
+
+    Unlike `session_dirs_for_path`, this needs no directory to exist, which is
+    the point: it is how a project search finds the sessions of a worktree
+    that has since been deleted. Candidates are the session directories whose
+    encoded name has `base`'s encoding as a prefix, and each is confirmed
+    against the `cwd` its transcripts record — the encoding is lossy (`/` and
+    `.` both become `-`), so `/wt/proj` is also a prefix of `/wt/proj-other`.
+    """
+    projects_dir = get_claude_projects_dir()
+    prefix = encode_project_path(base)
+    root = _normalize(base)
+    try:
+        candidates = [
+            d
+            for d in projects_dir.iterdir()
+            if d.is_dir() and (d.name == prefix or d.name.startswith(prefix + "-"))
+        ]
+    except OSError:
+        candidates = []
+    found: set[str] = set()
+    rejected = 0
+    for session_dir in candidates:
+        cwd = next(
+            (c for log in session_dir.glob("*.jsonl") if (c := _first_cwd(log))),
+            None,
+        )
+        if cwd is not None and (cwd == root or cwd.startswith(root + "/")):
+            found.add(cwd)
+        else:
+            rejected += 1
+    debug.log(
+        "claude.recorded_cwds",
+        base=debug.rp(base),
+        candidates=len(candidates),
+        found=len(found),
+        rejected=rejected,
+    )
+    return [Path(c) for c in sorted(found)]
+
+
 def session_dirs_for_path(project_path: Path) -> list[Path]:
     """Claude session directories holding transcripts for `project_path`.
 

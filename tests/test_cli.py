@@ -60,7 +60,7 @@ from fujimoto.cli import (
     _tool_summary,
     main,
 )
-from fujimoto import launch_options, session_state
+from fujimoto import launch_options, session_query, session_state
 from fujimoto.session_state import StopKind
 from fujimoto.config import (
     ConfigError,
@@ -9982,3 +9982,572 @@ class TestLaunchOptionsMenu:
         label = app._launch_options_label(session).plain
         assert "…" in label
         assert len(label) < 110
+
+
+class TestQueryCommands:
+    """`fujimoto search` / `fujimoto log`: read-only, no TUI, no tmux needed."""
+
+    @pytest.fixture(autouse=True)
+    def _claude_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        log = tmp_path / "claude" / "projects" / "-w" / "sess-1.jsonl"
+        log.parent.mkdir(parents=True)
+        entry = {
+            "type": "user",
+            "cwd": str(tmp_path / "w"),
+            "timestamp": "2026-10-20T10:00:00Z",
+            "message": {"content": "find the needle"},
+        }
+        log.write_text(json.dumps(entry) + "\n")
+        with (
+            patch("fujimoto.session_query.list_session_paths", return_value={}),
+            patch("fujimoto.session_query.live.list_live_sessions", return_value=[]),
+        ):
+            yield log
+
+    def _main(
+        self, monkeypatch: pytest.MonkeyPatch, *argv: str
+    ) -> tuple[int, str, str]:
+        import contextlib
+        import io
+
+        monkeypatch.setattr("sys.argv", ["fujimoto", *argv])
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        with (
+            patch("fujimoto.cli._check_prerequisites") as prereqs,
+            patch("fujimoto.cli.SessionApp") as app,
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            try:
+                main()
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 1
+        prereqs.assert_not_called()
+        app.assert_not_called()
+        return code, out.getvalue(), err.getvalue()
+
+    def test_search_text(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        code, out, _ = self._main(monkeypatch, "search", "needle", "--all-projects")
+        assert code == 0
+        assert "session:  sess-1" in out
+        assert "\033[" not in out  # not a terminal: no colour
+
+    def test_search_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        code, out, _ = self._main(
+            monkeypatch, "search", "NEE+DLE", "--all-projects", "-e", "--json"
+        )
+        assert code == 0
+        data = json.loads(out)
+        assert data["regex"] is True
+        assert [h["session_id"] for h in data["hits"]] == ["sess-1"]
+
+    def test_search_flags_reach_the_query(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        code, out, _ = self._main(
+            monkeypatch,
+            "search",
+            "Needle",
+            "--all-projects",
+            "-s",
+            "--raw",
+            "-n",
+            "0",
+            "--json",
+        )
+        data = json.loads(out)
+        assert (data["case_sensitive"], data["mode"], data["hits"]) == (True, "raw", [])
+
+    def test_search_scope_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        code, _, err = self._main(monkeypatch, "search", "needle")
+        assert code == 1
+        assert "pass --project or --all-projects" in err
+
+    def test_project_and_all_projects_are_exclusive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        code, _, _ = self._main(
+            monkeypatch, "search", "x", "--project", "p", "--all-projects"
+        )
+        assert code == 2
+
+    def test_negative_limit_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        code, _, err = self._main(monkeypatch, "search", "x", "-n", "-1")
+        assert code == 2
+        assert "must be 0 or more" in err
+
+    def test_log_text(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        code, out, _ = self._main(monkeypatch, "log", "sess")
+        assert code == 0
+        assert out.startswith("# session sess-1 · parsed · 1 message")
+        assert "find the needle" in out
+
+    def test_log_json_with_filters(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        code, out, _ = self._main(
+            monkeypatch, "log", "sess-1", "--json", "--tail", "1", "--roles", "user"
+        )
+        assert code == 0
+        assert [m["text"] for m in json.loads(out)["messages"]] == ["find the needle"]
+
+    def test_log_unknown_role(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        code, _, err = self._main(monkeypatch, "log", "sess-1", "--roles", "user,bot")
+        assert code == 1
+        assert "unknown role(s) bot" in err
+
+    def test_log_unknown_session(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        code, _, err = self._main(monkeypatch, "log", "nope")
+        assert code == 1
+        assert "no session log found for 'nope'" in err
+
+    def test_search_skips_the_calling_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-1")
+        code, out, _ = self._main(monkeypatch, "search", "needle", "--all-projects")
+        assert code == 0
+        assert "skipped the calling session" in out
+        code, out, _ = self._main(
+            monkeypatch, "search", "needle", "--all-projects", "--include-self"
+        )
+        assert "session:  sess-1" in out
+
+    def test_search_sort(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        code, out, _ = self._main(
+            monkeypatch,
+            "search",
+            "needle",
+            "--all-projects",
+            "--sort",
+            "relevance",
+            "--json",
+        )
+        assert code == 0
+        assert json.loads(out)["sort"] == "relevance"
+        code, _, _ = self._main(monkeypatch, "search", "x", "--sort", "best")
+        assert code == 2
+
+    def test_log_grep_and_summary(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        code, out, _ = self._main(
+            monkeypatch, "log", "sess-1", "--grep", "NEE+DLE", "-e", "-C", "1"
+        )
+        assert code == 0
+        assert "1 match for --grep" in out
+        code, out, _ = self._main(monkeypatch, "log", "sess-1", "--summary")
+        assert code == 0
+        assert "## first prompt · #0 · " in out
+        code, out, _ = self._main(monkeypatch, "log", "sess-1", "--head", "1", "-s")
+        assert code == 0
+
+    def test_log_exclusive_views(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        code, _, _ = self._main(monkeypatch, "log", "s", "--summary", "--grep", "x")
+        assert code == 2
+        code, _, _ = self._main(monkeypatch, "log", "s", "--head", "1", "--tail", "1")
+        assert code == 2
+
+    def test_search_with_debug_log(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from fujimoto import debug
+
+        monkeypatch.setenv(debug.LOG_DIR_ENV, str(tmp_path / "logs"))
+        try:
+            code, _, err = self._main(
+                monkeypatch, "--debug", "search", "needle", "--all-projects"
+            )
+        finally:
+            debug.disable()
+        assert code == 0
+        assert "debug log written to" in err
+
+
+class TestResumeCommand:
+    """`fujimoto resume` / `fujimoto stop`."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        from fujimoto.claude.live import LiveSession
+
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+        self.cwd = tmp_path / "wt" / "20261020-x"
+        self.cwd.mkdir(parents=True)
+        log = tmp_path / "claude" / "projects" / "-wt" / "sess-1234abcd.jsonl"
+        log.parent.mkdir(parents=True)
+        entry = {
+            "type": "user",
+            "cwd": str(self.cwd),
+            "gitBranch": "worktree/20261020-x",
+            "timestamp": "2026-10-20T10:00:00Z",
+            "message": {"content": "hello"},
+        }
+        log.write_text(json.dumps(entry) + "\n")
+        self.live: list[LiveSession] = []
+        self.registered: LiveSession | None = None
+        self.location = session_query.Location("proj", tmp_path / "proj", self.cwd)
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.list_all_sessions", return_value=[]),
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
+            patch("fujimoto.cli._session_branch", return_value="worktree/20261020-x"),
+            patch("fujimoto.cli.launch_claude_in_tmux") as self.launch,
+            patch("fujimoto.session_query.list_session_paths", return_value={}),
+            patch(
+                "fujimoto.session_query.live.list_live_sessions",
+                side_effect=lambda: self.live,
+            ),
+            patch(
+                "fujimoto.cli.session_query.wait_for_registration",
+                side_effect=lambda name, timeout: self.registered,
+            ) as self.wait,
+            patch.object(
+                session_query.Locator, "locate", side_effect=lambda cwd: self.location
+            ),
+        ):
+            yield
+
+    def _main(self, monkeypatch, capsys, *argv: str) -> tuple[int, str, str]:
+        monkeypatch.setattr("sys.argv", ["fujimoto", *argv])
+        code = 0
+        try:
+            main()
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 1
+        out, err = capsys.readouterr()
+        return code, out, err
+
+    def _live(self, session_id: str = "sess-1234abcd", **extra):
+        from fujimoto.claude.live import LiveSession
+
+        fields: dict = {
+            "pid": 77,
+            "cwd": self.cwd,
+            "peer_name": "peer-x",
+            "status": "idle",
+            "tmux_session": "proj/20261020-x",
+            **extra,
+        }
+        return LiveSession(session_id=session_id, **fields)
+
+    def test_detach_starts_with_auto_name(self, monkeypatch, capsys) -> None:
+        self.registered = self._live(peer_name="20261020-x-sess-123")
+        code, out, _ = self._main(
+            monkeypatch, capsys, "resume", "sess-1234", "--detach", "--wait", "2"
+        )
+        assert code == 0
+        kwargs = self.launch.call_args.kwargs
+        assert kwargs["resume_session_id"] == "sess-1234abcd"
+        assert kwargs["fork_session"] is False
+        assert kwargs["attach"] is False
+        assert kwargs["extra_args"][-2:] == ("--name", "20261020-x-sess-123")
+        assert self.launch.call_args.args[2] == "proj/20261020-x"
+        self.wait.assert_called_once_with("proj/20261020-x", timeout=2.0)
+        result = json.loads(out)
+        assert result["session_started"] is True
+        assert result["registered"] is True
+        assert result["peer_name"] == "20261020-x-sess-123"
+        assert result["claude_session_id"] == "sess-1234abcd"
+        assert result["stop_command"] == "fujimoto stop proj/20261020-x"
+        assert (
+            launch_options.saved_args(self.cwd, "proj/20261020-x", "sess-1234abcd")
+            is None
+        )  # the auto name is not saved
+
+    def test_explicit_name_and_args_are_saved(self, monkeypatch, capsys) -> None:
+        code, out, _ = self._main(
+            monkeypatch,
+            capsys,
+            "resume",
+            "sess-1234",
+            "--detach",
+            "--",
+            "--name",
+            "mine",
+        )
+        assert code == 0
+        kwargs = self.launch.call_args.kwargs
+        assert kwargs["extra_args"] == ("--name", "mine")
+        result = json.loads(out)
+        assert result["peer_name"] == "mine"
+        assert result["registered"] is False
+
+    def test_fork_records_the_new_id(self, monkeypatch, capsys) -> None:
+        self.registered = self._live("new-id", tmux_session="proj/20261020-x")
+        code, out, _ = self._main(
+            monkeypatch, capsys, "resume", "sess-1234", "--detach", "--fork"
+        )
+        assert code == 0
+        assert self.launch.call_args.kwargs["fork_session"] is True
+        result = json.loads(out)
+        assert result["forked"] is True
+        assert result["claude_session_id"] == "new-id"
+        assert result["resumed_session_id"] == "sess-1234abcd"
+        record = session_state.load_state()["proj/20261020-x"]
+        assert record.claude_session_id == "new-id"
+
+    def test_fork_peer_name_is_unique(self, monkeypatch, capsys) -> None:
+        self._main(monkeypatch, capsys, "resume", "sess-1234", "--detach", "--fork")
+        name = self.launch.call_args.kwargs["extra_args"][-1]
+        assert name.startswith("20261020-x-fork-")
+
+    def test_occupied_worktree_name_falls_back_to_direct(
+        self, monkeypatch, capsys
+    ) -> None:
+        with patch("fujimoto.cli.list_all_sessions", return_value=["proj/20261020-x"]):
+            self._main(monkeypatch, capsys, "resume", "sess-1234", "--detach", "--fork")
+        assert self.launch.call_args.args[2] == "proj/direct-1"
+
+    def test_root_session_is_direct(self, monkeypatch, capsys) -> None:
+        self.location = session_query.Location("proj", self.cwd, None)
+        self._main(monkeypatch, capsys, "resume", "sess-1234", "--detach")
+        assert self.launch.call_args.args[2] == "proj/direct-1"
+        assert self.launch.call_args.kwargs["extra_args"][-1] == "proj-sess-123"
+
+    def test_outside_a_repo_is_adhoc(self, monkeypatch, capsys) -> None:
+        self.location = session_query.Location(None, None, None)
+        self._main(monkeypatch, capsys, "resume", "sess-1234", "--detach")
+        assert self.launch.call_args.args[2] == "adhoc-1"
+
+    def test_parent_is_passed_to_the_system_prompt(self, monkeypatch, capsys) -> None:
+        self._main(
+            monkeypatch, capsys, "resume", "sess-1234", "--detach", "--parent", "boss"
+        )
+        assert "boss" in self.launch.call_args.kwargs["system_prompt"]
+
+    def test_prompt_is_sent(self, monkeypatch, capsys) -> None:
+        self._main(
+            monkeypatch, capsys, "resume", "sess-1234", "--detach", "--prompt", "hi"
+        )
+        assert self.launch.call_args.kwargs["prompt"] == "hi"
+
+    def test_running_session_is_reported_not_restarted(
+        self, monkeypatch, capsys
+    ) -> None:
+        self.live = [self._live()]
+        self.registered = self._live()
+        code, out, _ = self._main(
+            monkeypatch, capsys, "resume", "sess-1234", "--detach"
+        )
+        assert code == 0
+        self.launch.assert_not_called()
+        result = json.loads(out)
+        assert result["session_started"] is False
+        assert result["peer_name"] == "peer-x"
+
+    def test_running_session_with_prompt_is_an_error(self, monkeypatch, capsys) -> None:
+        self.live = [self._live()]
+        code, _, err = self._main(
+            monkeypatch, capsys, "resume", "sess-1234", "--prompt", "hi"
+        )
+        assert code == 1
+        assert "send it a message instead (peer peer-x)" in err
+
+    def test_running_outside_tmux_is_an_error(self, monkeypatch, capsys) -> None:
+        self.live = [self._live(tmux_session=None)]
+        code, _, err = self._main(monkeypatch, capsys, "resume", "sess-1234")
+        assert code == 1
+        assert "outside tmux (pid 77" in err
+
+    def test_running_session_attaches(self, monkeypatch, capsys) -> None:
+        self.live = [self._live()]
+        session_state.mark_open(
+            "proj/20261020-x", cwd=self.cwd, project="proj", session_type="worktree"
+        )
+        app = SessionApp.__new__(SessionApp)
+        app._launch_target = None
+        with (
+            patch("fujimoto.cli.SessionApp", side_effect=[app]),
+            patch.object(app, "run"),
+            patch("fujimoto.cli.take_pending_action", return_value=None),
+        ):
+            code, _, _ = self._main(monkeypatch, capsys, "resume", "sess-1234")
+        assert code == 0
+        assert self.launch.call_args.args[2] == "proj/20261020-x"
+        assert self.launch.call_args.kwargs["attach"] is True
+        assert session_state.load_state()["proj/20261020-x"].session_type == "worktree"
+
+    def test_running_without_a_record_infers_the_type(
+        self, monkeypatch, capsys
+    ) -> None:
+        self.live = [self._live()]
+        self.location = session_query.Location("proj", self.cwd, None)
+        app = SessionApp.__new__(SessionApp)
+        app._launch_target = None
+        with (
+            patch("fujimoto.cli.SessionApp", side_effect=[app]),
+            patch.object(app, "run"),
+            patch("fujimoto.cli.take_pending_action", return_value=None),
+        ):
+            self._main(monkeypatch, capsys, "resume", "sess-1234")
+        assert session_state.load_state()["proj/20261020-x"].session_type == "direct"
+
+    def test_attached_resume_runs_the_launch_loop(self, monkeypatch, capsys) -> None:
+        app = SessionApp.__new__(SessionApp)
+        app._launch_target = None
+        with (
+            patch("fujimoto.cli.SessionApp", side_effect=[app]),
+            patch.object(app, "run"),
+            patch("fujimoto.cli.take_pending_action", return_value=None),
+        ):
+            code, _, _ = self._main(monkeypatch, capsys, "resume", "sess-1234")
+        assert code == 0
+        assert self.launch.call_args.kwargs["attach"] is True
+        self.wait.assert_not_called()
+
+    def test_deleted_directory_is_refused(self, monkeypatch, capsys) -> None:
+        self.cwd.rmdir()
+        code, _, err = self._main(monkeypatch, capsys, "resume", "sess-1234")
+        assert code == 1
+        assert "no longer exists (branch worktree/20261020-x)" in err
+        self.launch.assert_not_called()
+
+    def test_unknown_session(self, monkeypatch, capsys) -> None:
+        code, _, err = self._main(monkeypatch, capsys, "resume", "nope")
+        assert code == 1
+        assert "no session log found" in err
+
+    def test_config_abort(self, monkeypatch, capsys) -> None:
+        with patch("fujimoto.cli._apply_worktree_config", return_value=False):
+            code, _, err = self._main(
+                monkeypatch, capsys, "resume", "sess-1234", "--detach"
+            )
+        assert code == 1
+        assert "setup failed" in err
+
+    def test_claude_args_rejected_elsewhere(self, monkeypatch, capsys) -> None:
+        code, _, err = self._main(monkeypatch, capsys, "log", "x", "--", "--model")
+        assert code == 2
+        assert "only accepted by 'new' and 'resume'" in err
+
+    # -- stop --
+
+    def test_stop_by_tmux_name(self, monkeypatch, capsys) -> None:
+        session_state.mark_open(
+            "proj/20261020-x",
+            cwd=self.cwd,
+            project="proj",
+            session_type="worktree",
+            claude_session_id="sess-1234abcd",
+        )
+        with (
+            patch(
+                "fujimoto.session_query.list_session_paths",
+                return_value={"proj/20261020-x": self.cwd},
+            ),
+            patch("fujimoto.cli.kill_session") as kill,
+        ):
+            code, out, _ = self._main(
+                monkeypatch, capsys, "stop", "proj/20261020-x", "--json"
+            )
+        assert code == 0
+        kill.assert_called_once_with("proj/20261020-x")
+        assert json.loads(out) == {
+            "tmux_session": "proj/20261020-x",
+            "claude_session_id": "sess-1234abcd",
+            "stopped": True,
+        }
+        record = session_state.load_state()["proj/20261020-x"]
+        assert record.stop_kind is StopKind.STOPPED
+
+    def test_stop_by_session_id(self, monkeypatch, capsys) -> None:
+        self.live = [self._live()]
+        with patch("fujimoto.cli.kill_session") as kill:
+            code, out, _ = self._main(monkeypatch, capsys, "stop", "sess-1234")
+        assert code == 0
+        kill.assert_called_once_with("proj/20261020-x")
+        assert out.strip() == "Stopped proj/20261020-x (sess-1234abcd)"
+
+    def test_stop_without_a_session_id(self, monkeypatch, capsys) -> None:
+        with (
+            patch(
+                "fujimoto.session_query.list_session_paths",
+                return_value={"adhoc-1": self.cwd},
+            ),
+            patch("fujimoto.cli.kill_session"),
+        ):
+            _, out, _ = self._main(monkeypatch, capsys, "stop", "adhoc-1")
+        assert out.strip() == "Stopped adhoc-1"
+
+    def test_stop_not_running(self, monkeypatch, capsys) -> None:
+        code, _, err = self._main(monkeypatch, capsys, "stop", "sess-1234")
+        assert code == 1
+        assert "is not running" in err
+
+    def test_stop_outside_tmux(self, monkeypatch, capsys) -> None:
+        self.live = [self._live(tmux_session=None)]
+        code, _, err = self._main(monkeypatch, capsys, "stop", "sess-1234")
+        assert code == 1
+        assert "running outside tmux" in err
+
+    def test_stop_already_gone_is_fine(self, monkeypatch, capsys) -> None:
+        self.live = [self._live()]
+        with (
+            patch("fujimoto.cli.kill_session", side_effect=TmuxError("gone")),
+            patch("fujimoto.cli.session_exists", return_value=False),
+        ):
+            code, _, _ = self._main(monkeypatch, capsys, "stop", "sess-1234")
+        assert code == 0
+
+    def test_stop_failure(self, monkeypatch, capsys) -> None:
+        self.live = [self._live()]
+        with (
+            patch("fujimoto.cli.kill_session", side_effect=TmuxError("boom")),
+            patch("fujimoto.cli.session_exists", return_value=True),
+        ):
+            code, _, err = self._main(monkeypatch, capsys, "stop", "sess-1234")
+        assert code == 1
+        assert "could not stop proj/20261020-x: boom" in err
+
+
+class TestAgentInstructions:
+    def test_prints_the_bundled_guide(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", "agent-instructions"])
+        with patch("fujimoto.cli._check_prerequisites") as prereqs:
+            main()
+        prereqs.assert_not_called()
+        out = capsys.readouterr().out
+        assert out == session_query.agent_instructions()
+        assert out.startswith("# fujimoto: session tools for agents")
+
+    def test_every_example_parses(self) -> None:
+        """The guide's commands must stay valid as the CLI changes."""
+        import shlex
+
+        from fujimoto.cli import _build_parser, _split_claude_args
+
+        text = session_query.agent_instructions().replace("\\\n", " ")
+        commands = [
+            line.split("#")[0].strip()
+            for line in text.splitlines()
+            if line.startswith("fujimoto ")
+        ]
+        assert len(commands) >= 12
+        parser = _build_parser()
+        for command in commands:
+            argv = shlex.split(
+                command.replace("<your peer name>", "me")
+                .replace("<tmux session or session id>", "proj/x")
+                .replace("...", "")
+            )[1:]
+            argv, _ = _split_claude_args(argv)
+            parser.parse_args(argv)  # SystemExit on an invalid example
+
+    def test_names_every_command(self) -> None:
+        text = session_query.agent_instructions()
+        for command in ("search", "log", "resume", "stop", "new"):
+            assert f"fujimoto {command} " in text
+
+    def test_stays_generic(self) -> None:
+        """Ticket keys in the shipped guide are the synthetic placeholder only."""
+        import re
+
+        keys = set(
+            re.findall(r"\b[A-Z][A-Z0-9]+-\d+\b", session_query.agent_instructions())
+        )
+        assert keys == {"ABC-123"}

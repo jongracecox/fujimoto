@@ -173,6 +173,34 @@ def get_session_path(name: str) -> Path | None:
     return Path(out) if out else None
 
 
+def list_session_paths() -> dict[str, Path]:
+    """Every tmux session's start directory, keyed by session name.
+
+    One `list-sessions` call rather than a `display-message` per session.
+    Empty when no server is running — or when tmux is not installed at all,
+    since the read-only CLI commands that use this must not require it.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}\t#{session_path}"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        debug.log("tmux.session_paths", error=type(exc).__name__)
+        return {}
+    if result.returncode != 0:
+        debug.log("tmux.session_paths", rc=result.returncode)
+        return {}
+    paths: dict[str, Path] = {}
+    for line in result.stdout.splitlines():
+        name, sep, path = line.partition("\t")
+        if sep and name and path:
+            paths[name] = Path(path)
+    debug.log("tmux.session_paths", count=len(paths))
+    return paths
+
+
 def display_message(name: str, message: str) -> None:
     """Show a transient message in the named tmux session's status line."""
     subprocess.run(
