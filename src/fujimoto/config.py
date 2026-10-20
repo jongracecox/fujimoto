@@ -50,17 +50,21 @@ def list_projects() -> list[Path]:
     return projects
 
 
-def get_worktree_root(project_root: Path | None = None) -> Path:
+def get_worktree_root(project_root: Path | None = None, *, create: bool = True) -> Path:
     """Resolve the directory where worktrees should be created.
 
     If FUJIMOTO_WORKTREE_ROOT is set, use it. Otherwise fall back to
     `<project_root>/.fujimoto/worktrees/`, ensuring the `.fujimoto` directory
     is gitignored. Raises ConfigError only if neither is available.
+
+    `create=False` only computes the path — for read-only callers (`fujimoto
+    search`) that must not plant a `.fujimoto/` in a repo they merely looked at.
     """
     raw = os.environ.get("FUJIMOTO_WORKTREE_ROOT")
     if raw:
         root = Path(raw).expanduser().resolve()
-        root.mkdir(parents=True, exist_ok=True)
+        if create:
+            root.mkdir(parents=True, exist_ok=True)
         debug.log_once(
             "config-worktree-root",
             "config.worktree_root",
@@ -72,9 +76,10 @@ def get_worktree_root(project_root: Path | None = None) -> Path:
         raise ConfigError(
             "FUJIMOTO_WORKTREE_ROOT is not set and no project root was provided."
         )
-    _ensure_meta_dir(project_root)
     root = project_root / META_DIR / "worktrees"
-    root.mkdir(parents=True, exist_ok=True)
+    if create:
+        _ensure_meta_dir(project_root)
+        root.mkdir(parents=True, exist_ok=True)
     debug.log_once(
         "config-worktree-root",
         "config.worktree_root",
@@ -116,7 +121,7 @@ def build_worktree_path(
 
 
 def get_project_worktrees_dir(
-    project_name: str, project_root: Path | None = None
+    project_name: str, project_root: Path | None = None, *, create: bool = True
 ) -> Path:
     """Directory holding all worktrees for `project_name`.
 
@@ -125,8 +130,8 @@ def get_project_worktrees_dir(
     (no extra project layer — the directory already lives inside the project).
     """
     if os.environ.get("FUJIMOTO_WORKTREE_ROOT"):
-        return get_worktree_root() / project_name
-    return get_worktree_root(project_root)
+        return get_worktree_root(create=create) / project_name
+    return get_worktree_root(project_root, create=create)
 
 
 META_DIR = ".fujimoto"

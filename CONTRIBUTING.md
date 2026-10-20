@@ -166,7 +166,8 @@ The transcript search (`s`) is the pattern for a filter whose data does *not*
 fit in memory. Reading every conversation log takes seconds, so it cannot go in
 a `_build_*_items()` helper at all. The shape:
 
-- The scan lives in a module (`claude/search.py`), UI-free, and is exposed as a
+- The scan lives in a module (`claude/search.py`), UI-free — which is also what
+  lets `fujimoto search` reuse it with no TUI at all (`session_query.py`). It is exposed as a
   **batched generator** (`iter_hits` yields `(scanned, hits)` every ten logs)
   taking an `is_cancelled` callable. That is what makes it testable
   synchronously and interruptible from a worker.

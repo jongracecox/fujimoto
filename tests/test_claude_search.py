@@ -14,6 +14,7 @@ from fujimoto.claude.search import (
     _snippet,
     compile_matcher,
     iter_hits,
+    list_all_session_logs,
     list_session_logs,
     search_log,
 )
@@ -193,7 +194,7 @@ def test_raw_mode_counts_every_occurrence(tmp_path):
 
 
 def test_snippets_are_capped(tmp_path):
-    log = _simple_log(tmp_path / "a.jsonl", *(["needle"] * 10))
+    log = _simple_log(tmp_path / "a.jsonl", *(f"needle {i}" for i in range(10)))
     hit = search_log(log, compile_matcher("needle"))
     assert hit is not None
     assert hit.match_count == 10
@@ -534,3 +535,89 @@ class TestIterHitsResilience:
         scanned, hits = batches[-1]
         assert scanned == 2
         assert [h.session.jsonl_path for h in hits] == [second]
+
+
+# -- list_all_session_logs --
+
+
+def test_list_all_session_logs_is_newest_first(tmp_path: Path):
+    import os
+
+    old = _simple_log(tmp_path / "-a" / "old.jsonl", "x")
+    new = _simple_log(tmp_path / "-b" / "new.jsonl", "x")
+    _simple_log(tmp_path / "-b" / "sub" / "agent.jsonl", "x")  # not a session
+    (tmp_path / "stray.jsonl").write_text("{}")  # not in a session dir
+    os.utime(old, (1_000, 1_000))
+    os.utime(new, (2_000, 2_000))
+    assert list_all_session_logs(tmp_path) == [new, old]
+
+
+def test_list_all_session_logs_missing_dir(tmp_path: Path):
+    assert list_all_session_logs(tmp_path / "absent") == []
+
+
+def test_list_all_session_logs_defaults_to_claude_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    log = _simple_log(tmp_path / "projects" / "-a" / "s.jsonl", "x")
+    assert list_all_session_logs() == [log]
+
+
+def test_identical_snippets_are_not_repeated(tmp_path: Path):
+    log = _simple_log(
+        tmp_path / "s.jsonl", "find the needle", "find the needle", "a needle"
+    )
+    hit = search_log(log, compile_matcher("needle", mode=ContentMode.TEXT))
+    assert hit is not None
+    assert hit.match_count == 3
+    assert [s.text for s in hit.snippets] == ["find the needle", "a needle"]
+
+
+# -- Raw-mode breakdown and readable snippets --
+
+
+def test_raw_breakdown_and_snippet_sources(tmp_path: Path):
+    from fujimoto.claude.search import MatchBreakdown
+
+    log = _write_log(
+        tmp_path / "s.jsonl",
+        [
+            _entry("user", "a needle"),
+            _entry(
+                "assistant",
+                [
+                    "not a block",
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "input": {"cmd": "grep needle"},
+                    },
+                ],
+            ),
+            _entry(
+                "user",
+                [{"type": "tool_result", "content": {"weird": "shape"}}],
+                toolUseResult="needle in a string result",
+            ),
+            {"type": "system", "slug": "needle"},
+        ],
+    )
+    (tmp_path / "s.jsonl").write_text(
+        (tmp_path / "s.jsonl").read_text() + "not json needle\n"
+    )
+    hit = search_log(log, compile_matcher("needle", mode=ContentMode.RAW))
+    assert hit is not None
+    assert hit.breakdown == MatchBreakdown(message=1, tool=2, other=2)
+    assert [s.text for s in hit.snippets] == [
+        "a needle",
+        "cmd: grep needle",
+        "needle in a string result",
+    ]
+
+
+def test_tool_text_ignores_null_input():
+    from fujimoto.claude.search import _tool_text
+
+    entry = {"message": {"content": [{"type": "tool_use", "input": None}]}}
+    assert _tool_text(entry) == ""

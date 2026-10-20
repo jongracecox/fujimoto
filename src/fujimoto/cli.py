@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -14,7 +15,7 @@ import threading
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
 
@@ -50,6 +51,7 @@ from fujimoto.claude import (
     read_raw_transcript,
     read_transcript,
 )
+from fujimoto.claude import live
 from fujimoto.claude import search as claude_search
 from fujimoto.claude.search import (
     ContentMode,
@@ -104,7 +106,8 @@ from fujimoto.version import get_version
 from fujimoto.version_check import check_for_update, dismiss as dismiss_update_version
 from fujimoto.vscode import open_vscode
 from fujimoto.settings import Settings, load_settings, save_settings
-from fujimoto import session_state
+from fujimoto import session_query, session_state
+from fujimoto.session_query import relative_time as _relative_time
 from fujimoto.session_state import StopKind
 from fujimoto.tmux import (
     TmuxError,
@@ -205,23 +208,6 @@ def _parse_created(stamp: str) -> float:
         return datetime.fromisoformat(stamp).timestamp()
     except ValueError:
         return 0.0
-
-
-def _relative_time(dt: datetime) -> str:
-    now = datetime.now(tz=timezone.utc)
-    delta = now - dt
-    if delta.days > 30:
-        months = delta.days // 30
-        return f"{months}mo ago"
-    if delta.days > 0:
-        return f"{delta.days}d ago"
-    hours = delta.seconds // 3600
-    if hours > 0:
-        return f"{hours}h ago"
-    minutes = delta.seconds // 60
-    if minutes > 0:
-        return f"{minutes}m ago"
-    return "just now"
 
 
 def _format_prompt_lines(text: str, max_width: int) -> list[str]:
@@ -1393,6 +1379,15 @@ class LaunchTarget(NamedTuple):
     # (`--session-id`) and its first message. Neither is saved or replayed.
     session_id: str | None = None
     prompt: str | None = None
+    # `fujimoto resume` only. `extra_args` are added after the launch options
+    # for this launch and never saved (the automatic `--name`), so they cannot
+    # replace a session's chosen options. `fork_in_place` resumes
+    # `resume_session_id` with `--fork-session` in its own directory, unlike a
+    # worktree fork. `parent_session` is a peer address for the system prompt,
+    # for sessions with no `meta.json` to remember it in.
+    extra_args: tuple[str, ...] = ()
+    fork_in_place: bool = False
+    parent_session: str | None = None
 
 
 class SessionApp(App):
@@ -5379,7 +5374,7 @@ def _start_launch(target: LaunchTarget, *, attach: bool = True) -> str | None:
         # A resumed conversation already carries its original context; only
         # the parent link needs re-stating, since the appended system prompt
         # does not survive into a new claude process.
-        parent = read_parent_session(working_dir)
+        parent = target.parent_session or read_parent_session(working_dir)
         system_prompt = _parent_system_prompt(parent) if parent else None
     else:
         system_prompt = _build_system_prompt(session_type, project_name, working_dir)
@@ -5400,16 +5395,20 @@ def _start_launch(target: LaunchTarget, *, attach: bool = True) -> str | None:
         project=project_name,
         session_type=session_type,
         branch=_session_branch(working_dir),
-        claude_session_id=resume_id or target.session_id,
+        # An in-place fork gets its id from claude; the caller records it once
+        # the process has registered.
+        claude_session_id=None
+        if target.fork_in_place
+        else resume_id or target.session_id,
     )
-    claude_args = _launch_claude_args(target, resolved_name)
+    claude_args = _launch_claude_args(target, resolved_name) + target.extra_args
     launch_claude_in_tmux(
         project_name,
         working_dir,
         tmux_name,
         system_prompt=system_prompt,
         resume_session_id=resume_id,
-        fork_session=bool(fork_id),
+        fork_session=bool(fork_id) or target.fork_in_place,
         extra_args=claude_args,
         session_id=target.session_id,
         prompt=target.prompt,
@@ -5582,6 +5581,288 @@ def _prepare_new_session(
     return None
 
 
+_NAME_FLAGS = ("--name", "-n")
+
+
+def _peer_name_in(args: tuple[str, ...]) -> str | None:
+    """The `--name` a claude argument list sets, if any.
+
+    >>> _peer_name_in(("--model", "opus", "--name", "x"))
+    'x'
+    >>> _peer_name_in(("--name=y",))
+    'y'
+    >>> _peer_name_in(("--model", "opus")) is None
+    True
+    """
+    for i, arg in enumerate(args):
+        if arg in _NAME_FLAGS and i + 1 < len(args):
+            return args[i + 1]
+        if arg.startswith("--name="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _resume_cli_target(
+    session: ClaudeSession,
+    location: session_query.Location,
+    *,
+    fork: bool,
+    claude_args: tuple[str, ...] | None,
+    parent: str | None,
+) -> tuple[LaunchTarget, str]:
+    """The launch for `fujimoto resume`, and the peer name it will run under.
+
+    Naming follows the directory, as `_resume_target` does in the TUI: a
+    worktree's own tmux name when it is free, else `direct-N`, and `adhoc-N`
+    outside any repo. The peer name is the launch options' `--name` if they
+    set one, else `<worktree or project>-<id prefix>` (a fork adds `-fork-`
+    and a random suffix, since its id isn't known until it starts), passed as
+    a one-off argument so it is never saved over the session's options.
+    """
+    active = set(list_all_sessions())
+    cwd = session.cwd
+    if location.project is None:
+        project, session_type = "adhoc", "adhoc"
+        tmux_name = get_next_adhoc_session_name(active)
+    else:
+        project = location.project
+        worktree_name = (
+            session_name(project, location.worktree.name) if location.worktree else None
+        )
+        if worktree_name and worktree_name not in active:
+            tmux_name, session_type = worktree_name, "worktree"
+        else:
+            tmux_name = get_next_direct_session_name(project, active)
+            session_type = "direct"
+
+    if claude_args is not None:
+        configured: tuple[str, ...] = claude_args
+    else:
+        configured = launch_options.resolve(
+            cwd, tmux_name, session.session_id, parent_dir=None, parent_session_id=None
+        ).args
+    peer = _peer_name_in(configured)
+    extra: tuple[str, ...] = ()
+    if peer is None:
+        base = location.worktree.name if location.worktree else project
+        suffix = f"fork-{secrets.token_hex(2)}" if fork else session.session_id[:8]
+        peer = f"{base}-{suffix}"
+        extra = ("--name", peer)
+    if parent:
+        write_parent_session(cwd, parent)
+    target = LaunchTarget(
+        project,
+        cwd,
+        tmux_name,
+        session_type,
+        resume_session_id=session.session_id,
+        claude_args=claude_args,
+        extra_args=extra,
+        fork_in_place=fork,
+        parent_session=parent,
+    )
+    debug.log(
+        "cli.resume_target",
+        tmux=debug.rv(tmux_name),
+        session_type=session_type,
+        fork=fork,
+        peer_source="args" if not extra else "auto",
+    )
+    return target, peer
+
+
+def _resume_result(
+    session: ClaudeSession,
+    tmux_name: str,
+    *,
+    peer: str | None,
+    started: bool,
+    forked: bool,
+    entry: live.LiveSession | None,
+    parent: str | None,
+) -> dict[str, object]:
+    """The JSON `fujimoto resume --detach` prints."""
+    return {
+        "tmux_session": tmux_name,
+        "working_dir": str(session.cwd),
+        "branch": _session_branch(session.cwd),
+        "resumed_session_id": session.session_id,
+        "claude_session_id": entry.session_id if entry else None,
+        "forked": forked,
+        "peer_name": (entry.peer_name if entry and entry.peer_name else peer),
+        "parent_session": parent or read_parent_session(session.cwd),
+        "pid": entry.pid if entry else None,
+        "status": entry.status if entry else None,
+        "registered": entry is not None,
+        "session_started": started,
+        "attach_command": f"tmux attach-session -t {shlex.quote(tmux_name)}",
+        "stop_command": f"fujimoto stop {shlex.quote(tmux_name)}",
+    }
+
+
+def _prepare_resume(
+    args: argparse.Namespace, claude_args: tuple[str, ...] | None
+) -> LaunchTarget | None:
+    """Run `fujimoto resume`: attach (returning the target) or start detached.
+
+    A session that is already running is never started twice — that would put
+    two claude processes on one transcript. Without `--fork` it is connected
+    to (or, detached, just reported); with `--fork` a new conversation starts
+    beside it. A session whose directory is gone cannot be resumed in place.
+    """
+    try:
+        session = session_query.resolve_session(args.session)
+    except session_query.QueryError as e:
+        _finish_debug_log()
+        print(f"fujimoto: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not session.cwd.is_dir():
+        _finish_debug_log()
+        branch = f" (branch {session.git_branch})" if session.git_branch else ""
+        print(
+            f"fujimoto: {session.session_id} ran in {session.cwd}, which no longer "
+            f"exists{branch}; recreate that directory to resume it",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    activity = session_query.ActivityIndex.gather().for_session(
+        session.session_id, session.cwd
+    )
+    location = session_query.Locator(session_query.Scope(all_projects=True)).locate(
+        session.cwd
+    )
+    debug.log(
+        "cli.resume",
+        session=debug.rv(session.session_id),
+        running=activity.running,
+        fork=args.fork,
+        detach=args.detach,
+    )
+    if activity.running and not args.fork:
+        if args.prompt:
+            _finish_debug_log()
+            print(
+                f"fujimoto: {session.session_id} is already running; send it a "
+                f"message instead (peer {activity.peer_name or 'unknown'})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if activity.tmux_session is None:
+            _finish_debug_log()
+            print(
+                f"fujimoto: {session.session_id} is already running outside tmux "
+                f"(pid {activity.pid}, peer {activity.peer_name or 'unknown'})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.detach:
+            entry = session_query.wait_for_registration(
+                activity.tmux_session, timeout=0
+            )
+            print(
+                json.dumps(
+                    _resume_result(
+                        session,
+                        activity.tmux_session,
+                        peer=activity.peer_name,
+                        started=False,
+                        forked=False,
+                        entry=entry,
+                        parent=args.parent,
+                    ),
+                    indent=2,
+                )
+            )
+            return None
+        record = session_state.load_state().get(activity.tmux_session)
+        if record and record.session_type:
+            session_type = record.session_type
+        else:
+            session_type = "worktree" if location.worktree else "direct"
+        return LaunchTarget(
+            location.project or "adhoc",
+            session.cwd,
+            activity.tmux_session,
+            session_type,
+            resume_session_id=session.session_id,
+        )
+
+    target, peer = _resume_cli_target(
+        session, location, fork=args.fork, claude_args=claude_args, parent=args.parent
+    )
+    target = target._replace(prompt=args.prompt)
+    if not args.detach:
+        return target
+
+    with _stdout_to_stderr():
+        resolved = _start_launch(target, attach=False)
+    if resolved is None:
+        _finish_debug_log()
+        print("fujimoto: project config setup failed; not launched", file=sys.stderr)
+        sys.exit(1)
+    entry = session_query.wait_for_registration(resolved, timeout=args.wait)
+    if args.fork and entry is not None:
+        # The fork's id only exists once claude has started; record it so the
+        # session's row (and a later stop) knows which conversation it holds.
+        session_state.mark_open(
+            resolved,
+            cwd=session.cwd,
+            project=target.project,
+            session_type=target.session_type,
+            branch=_session_branch(session.cwd),
+            claude_session_id=entry.session_id,
+        )
+    result = _resume_result(
+        session,
+        resolved,
+        peer=peer,
+        started=True,
+        forked=args.fork,
+        entry=entry,
+        parent=args.parent,
+    )
+    print(json.dumps(result, indent=2))
+    return None
+
+
+def _run_stop_command(args: argparse.Namespace) -> None:
+    """`fujimoto stop`: end a session's claude process, keeping it resumable.
+
+    The same stop as the TUI's and `Ctrl-A s`: the record stays open with
+    `StopKind.STOPPED`, so the session shows as stopped and resumes with Enter.
+    """
+    try:
+        tmux_name, session_id = session_query.tmux_for_session(args.session)
+    except session_query.QueryError as e:
+        _finish_debug_log()
+        print(f"fujimoto: {e}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        kill_session(tmux_name)
+    except TmuxError as e:
+        if session_exists(tmux_name):
+            _finish_debug_log()
+            print(f"fujimoto: could not stop {tmux_name}: {e}", file=sys.stderr)
+            sys.exit(1)
+    session_state.mark_stopped(tmux_name, session_id)
+    debug.log("cli.stop", tmux=debug.rv(tmux_name))
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "tmux_session": tmux_name,
+                    "claude_session_id": session_id,
+                    "stopped": True,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(f"Stopped {tmux_name}" + (f" ({session_id})" if session_id else ""))
+    _finish_debug_log()
+
+
 def _split_claude_args(argv: list[str]) -> tuple[list[str], tuple[str, ...] | None]:
     """Split argv at the first `--` into fujimoto's args and claude's.
 
@@ -5615,6 +5896,286 @@ def _run_pane_command(action: str, session: str) -> None:
     _finish_debug_log()
 
 
+def _run_search_command(args: argparse.Namespace) -> None:
+    """`fujimoto search`: transcript search for scripts, agents and people."""
+    try:
+        scope = session_query.resolve_scope(
+            project=args.project, all_projects=args.all_projects
+        )
+        report = session_query.run_search(
+            args.query,
+            scope,
+            regex=args.regex,
+            case_sensitive=args.case_sensitive,
+            mode=ContentMode.RAW if args.raw else ContentMode.TEXT,
+            limit=args.limit,
+            exclude_session=None
+            if args.include_self
+            else session_query.calling_session_id(),
+            sort=session_query.SortOrder(args.sort),
+        )
+    except session_query.QueryError as e:
+        _finish_debug_log()
+        print(f"fujimoto: {e}", file=sys.stderr)
+        sys.exit(1)
+    if args.json:
+        print(session_query.dump_json(session_query.search_json(report)))
+    else:
+        color = session_query.use_color(sys.stdout)
+        print(session_query.format_search(report, color=color))
+    _finish_debug_log()
+
+
+def _run_log_command(args: argparse.Namespace) -> None:
+    """`fujimoto log`: one session's transcript, parsed or raw."""
+    roles = (
+        [r.strip() for r in args.roles.split(",") if r.strip()] if args.roles else None
+    )
+    unknown = sorted(set(roles or ()) - set(session_query.TRANSCRIPT_ROLES))
+    if unknown:
+        _finish_debug_log()
+        valid = ",".join(session_query.TRANSCRIPT_ROLES)
+        print(
+            f"fujimoto: unknown role(s) {','.join(unknown)} (valid: {valid})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    try:
+        report = session_query.load_log(
+            args.session,
+            roles=roles,
+            grep=args.grep,
+            regex=args.regex,
+            case_sensitive=args.case_sensitive,
+            context=args.context,
+            head=args.head,
+            tail=args.tail,
+            summary=args.summary,
+        )
+    except session_query.QueryError as e:
+        _finish_debug_log()
+        print(f"fujimoto: {e}", file=sys.stderr)
+        sys.exit(1)
+    if args.json:
+        print(session_query.dump_json(session_query.log_json(report)))
+    else:
+        print(session_query.format_log(report))
+    _finish_debug_log()
+
+
+def _non_negative(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return number
+
+
+def _add_resume_commands(sub: argparse._SubParsersAction) -> None:
+    """`resume` (start or reconnect a session by id) and `stop`."""
+    resume = sub.add_parser(
+        "resume",
+        help="Resume a Claude session by id",
+        description=(
+            "Resume a Claude session in the directory it ran in. With --detach "
+            "it starts in the background and prints JSON, including the peer "
+            "name to SendMessage it at. A session that is already running is "
+            "connected to, never started twice. Arguments after -- are passed "
+            "to claude and saved as the session's launch options."
+        ),
+        usage=(
+            "fujimoto resume SESSION [--fork] [--detach [--wait SECS]] "
+            "[--prompt TEXT] [--parent NAME] [-- CLAUDE_ARGS...]"
+        ),
+    )
+    resume.add_argument(
+        "session", help="Claude session id, a unique prefix of one, or a .jsonl path"
+    )
+    resume.add_argument(
+        "--fork",
+        action="store_true",
+        help="Continue in a new conversation (--fork-session), leaving this one as it is",
+    )
+    resume.add_argument(
+        "--detach",
+        action="store_true",
+        help="Start in the background; print the session's details as JSON and exit",
+    )
+    resume.add_argument(
+        "--wait",
+        type=float,
+        default=15.0,
+        metavar="SECS",
+        help=(
+            "With --detach, how long to wait for claude to register before "
+            "reporting (default 15)"
+        ),
+    )
+    resume.add_argument(
+        "--prompt", metavar="TEXT", help="First message to send once it starts"
+    )
+    resume.add_argument(
+        "--parent",
+        metavar="NAME",
+        help="Peer address of the calling session; the resumed one is told to reply there",
+    )
+
+    stop = sub.add_parser(
+        "stop",
+        help="Stop a running session, keeping it resumable",
+        description=(
+            "Stop a session's claude process. The session stays on the home "
+            "screen as stopped and can be resumed; its transcript is untouched."
+        ),
+    )
+    stop.add_argument(
+        "session", help="tmux session name, or a Claude session id or prefix"
+    )
+    stop.add_argument("--json", action="store_true", help="Print JSON")
+
+
+def _add_query_commands(sub: argparse._SubParsersAction) -> None:
+    """The read-only `search`, `log` and `agent-instructions` subcommands."""
+    sub.add_parser(
+        "agent-instructions",
+        help="Print a guide to the session tools, written for AI agents",
+        description=(
+            "Print a short guide to fujimoto's command-line session tools "
+            "(search, log, resume, stop, new) and when an agent would use "
+            "them. Point an agent at it from its instructions file."
+        ),
+    )
+    search = sub.add_parser(
+        "search",
+        help="Search session transcripts",
+        description=(
+            "Search Claude session transcripts for the current project (the "
+            "repo containing the current directory, plus its worktrees), "
+            "newest first. Each hit names the session, its worktree, whether "
+            "it is running, and snippets of the matching text."
+        ),
+    )
+    search.add_argument("query", help="Text to find (a regex with --regex)")
+    where = search.add_mutually_exclusive_group()
+    where.add_argument(
+        "--project",
+        metavar="NAME|PATH",
+        help="Search this project: a path inside it, or a name under $FUJIMOTO_GIT_ROOT",
+    )
+    where.add_argument(
+        "--all-projects",
+        action="store_true",
+        help="Search every transcript on this machine",
+    )
+    search.add_argument(
+        "-e", "--regex", action="store_true", help="Treat the query as a regex"
+    )
+    search.add_argument(
+        "-s", "--case-sensitive", action="store_true", help="Match case exactly"
+    )
+    search.add_argument(
+        "--raw",
+        action="store_true",
+        help=(
+            "Match the raw transcript (tool calls, tool output, file contents) "
+            "instead of only what the user and Claude said"
+        ),
+    )
+    search.add_argument(
+        "-n",
+        "--limit",
+        type=_non_negative,
+        default=session_query.DEFAULT_LIMIT,
+        metavar="N",
+        help=f"Stop after N matching sessions (default {session_query.DEFAULT_LIMIT}; 0 = no limit)",
+    )
+    search.add_argument(
+        "--sort",
+        choices=[order.value for order in session_query.SortOrder],
+        default=session_query.SortOrder.RECENT.value,
+        help=(
+            "recent (default): newest first, stopping at --limit. relevance: "
+            "most message-text matches first (then tool matches), which scans "
+            "every transcript before taking the top --limit"
+        ),
+    )
+    search.add_argument(
+        "--include-self",
+        action="store_true",
+        help=(
+            "Keep the calling Claude session's own transcript "
+            f"(${session_query.CALLING_SESSION_ENV}), which is skipped by default"
+        ),
+    )
+    search.add_argument("--json", action="store_true", help="Print JSON")
+
+    log = sub.add_parser(
+        "log",
+        help="Print a session transcript",
+        description=(
+            "Print one session's transcript, parsed into messages. If the "
+            "parser cannot structure it, the raw JSONL lines are printed "
+            "instead, with a warning."
+        ),
+    )
+    log.add_argument(
+        "session",
+        help="Claude session id, a unique prefix of one, or a .jsonl path",
+    )
+    view = log.add_mutually_exclusive_group()
+    view.add_argument(
+        "--summary",
+        action="store_true",
+        help=(
+            "Only the first prompt, the final exchange, and the PR, Jira and "
+            "Slack links the session mentions"
+        ),
+    )
+    view.add_argument(
+        "--grep",
+        metavar="PATTERN",
+        help="Only messages (raw: lines) containing PATTERN",
+    )
+    log.add_argument(
+        "-e", "--regex", action="store_true", help="Treat --grep as a regex"
+    )
+    log.add_argument(
+        "-s",
+        "--case-sensitive",
+        action="store_true",
+        help="--grep matches case exactly",
+    )
+    log.add_argument(
+        "-C",
+        "--context",
+        type=_non_negative,
+        default=0,
+        metavar="N",
+        help="With --grep, also show N messages either side of each match",
+    )
+    ends = log.add_mutually_exclusive_group()
+    ends.add_argument(
+        "--head",
+        type=_non_negative,
+        metavar="N",
+        help="Only the first N messages (raw: lines)",
+    )
+    ends.add_argument(
+        "--tail",
+        type=_non_negative,
+        metavar="N",
+        help="Only the last N messages (raw: lines)",
+    )
+    log.add_argument(
+        "--roles",
+        metavar="LIST",
+        help=(
+            "Comma-separated roles to keep (default: all but injected): "
+            + ",".join(session_query.TRANSCRIPT_ROLES)
+        ),
+    )
+    log.add_argument("--json", action="store_true", help="Print JSON")
+
+
 def _start_debug_log(*, redact: bool) -> None:
     """Open the diagnostic log and record the environment snapshot."""
     try:
@@ -5639,7 +6200,8 @@ def _finish_debug_log() -> None:
     print(f"fujimoto: debug log written to {path}", file=sys.stderr)
 
 
-def main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
+    """fujimoto's argument parser (also used to check the agent guide's examples)."""
     parser = argparse.ArgumentParser(prog="fujimoto", add_help=True)
     parser.add_argument(
         "-V",
@@ -5672,6 +6234,8 @@ def main() -> None:
     pane = sub.add_parser("pane", help="Per-session pane actions")
     pane.add_argument("action", choices=["vscode", "terminal"])
     pane.add_argument("--session", required=True)
+    _add_query_commands(sub)
+    _add_resume_commands(sub)
     new = sub.add_parser(
         "new",
         help="Create a worktree and launch Claude in it",
@@ -5718,16 +6282,34 @@ def main() -> None:
         ),
     )
 
+    return parser
+
+
+def main() -> None:
+    parser = _build_parser()
     argv, claude_args = _split_claude_args(sys.argv[1:])
     args = parser.parse_args(argv)
-    if claude_args is not None and args.command != "new":
-        parser.error("arguments after -- are only accepted by 'fujimoto new'")
+    if claude_args is not None and args.command not in ("new", "resume"):
+        parser.error("arguments after -- are only accepted by 'new' and 'resume'")
     if args.command == "new" and not slugify(args.title):
         parser.error("title must contain at least one letter or digit")
     if args.debug or args.debug_redacted:
         _start_debug_log(redact=args.debug_redacted)
     if args.command == "pane":
         _run_pane_command(args.action, args.session)
+        return
+    if args.command == "search":
+        _run_search_command(args)
+        return
+    if args.command == "log":
+        _run_log_command(args)
+        return
+    if args.command == "stop":
+        _run_stop_command(args)
+        return
+    if args.command == "agent-instructions":
+        print(session_query.agent_instructions(), end="")
+        _finish_debug_log()
         return
     if args.create_config:
         _create_config()
@@ -5748,8 +6330,9 @@ def main() -> None:
         # `fujimoto new` skips the TUI for its first launch only; detaching
         # then lands on the home screen like any other session.
         initial_target: LaunchTarget | None = None
-        if args.command == "new":
-            initial_target = _prepare_new_session(args, claude_args)
+        if args.command in ("new", "resume"):
+            prepare = _prepare_new_session if args.command == "new" else _prepare_resume
+            initial_target = prepare(args, claude_args)
             if initial_target is None:  # --detach: launched, nothing to attach
                 _finish_debug_log()
                 return

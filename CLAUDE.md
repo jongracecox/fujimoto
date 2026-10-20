@@ -116,13 +116,16 @@ src/fujimoto/
 ├── debug.py      # --debug / --debug-redacted diagnostic logging + redaction
 ├── project_config.py  # optional per-project .fujimoto.yaml (copy/link/init worktree setup, claude_args)
 ├── launch_options.py  # extra claude CLI args per session (resolve / save / replay)
+├── session_query.py   # `fujimoto search` / `fujimoto log`: scope, location, liveness, output
 ├── templates/
 │   ├── __init__.py
-│   └── fujimoto.yaml.template  # commented scaffold written by `fujimoto --create-config`
+│   ├── fujimoto.yaml.template  # commented scaffold written by `fujimoto --create-config`
+│   └── agent_instructions.md   # the guide `fujimoto agent-instructions` prints
 └── claude/
     ├── __init__.py      # Re-exports public API
     ├── log_parser.py    # Parse Claude JSONL session logs (state, metadata, session lookup)
-    └── search.py        # Full-text search across JSONL transcripts (batched, cancellable)
+    ├── search.py        # Full-text search across JSONL transcripts (batched, cancellable)
+    └── live.py          # Claude Code's running-process registry (~/.claude/sessions/)
 ```
 
 ## Architecture
@@ -136,6 +139,10 @@ src/fujimoto/
 - `fujimoto new <title> [--base B | --current] [-- claude args…]` creates a worktree via `_new_worktree_target` (the CLI twin of the TUI's create flow: no flag → fetch and start from `origin/<default>`, offline → local default; an existing worktree for the title is connected to, not duplicated) and hands its `LaunchTarget` to the launch loop as `initial_target`, so the **first** iteration skips `SessionApp` and every later one is the normal TUI — detaching lands on the home screen and `Ctrl-A f/s/x` hand-offs work unchanged. Arguments after `--` become `LaunchTarget.claude_args` and are saved like a dialog choice. `_split_claude_args` splits `sys.argv` at the first `--` by hand before `parse_args`, because argparse's `--` handling with `nargs=REMAINDER` has changed between Python versions; `--` with any other command is a usage error.
   `_prepare_new_session` adds the rest: a session that isn't already running gets a fresh `uuid4` as `LaunchTarget.session_id` (→ `claude --session-id`, and recorded on the `SessionRecord` by `mark_open`, so the id is known before any transcript exists) and `--prompt` as `LaunchTarget.prompt` (claude's positional first message). Neither is saved or replayed, which is why the prompt is not a launch option. `--prompt` against an already-running session exits 1. `--detach` calls `_start_launch(target, attach=False)` — the launch-loop body, factored out so both paths share it — then prints `_new_session_result` as JSON and exits without the TUI. In that mode stdout is reserved for the JSON: `_stdout_to_stderr` redirects **fd 1** (not `sys.stdout`, which a child process never sees) around the launch so `.fujimoto.yaml` init output goes to stderr, `_apply_worktree_config(interactive=False)` skips the keypress pause, `set_terminal_title` is skipped, and the `--debug` "log written to" notices print to stderr (always, now).
   `--parent NAME` records the starting session's peer address in the worktree's meta (on create *and* on connect) via `write_parent_session`. `_build_system_prompt` appends `_parent_system_prompt(name)` for a worktree that has one, and `_start_launch` passes that sentence alone as the system prompt on a **resume** — the appended system prompt does not carry over into a new claude process, so without it a resumed child would lose its parent. `_new_session_result` reports it as `parent_session`. A child's own address is set with claude's `--name` after `--`, which is saved as a launch option and so is stable across relaunches; Claude Code's derived names (`<cwd basename>-<2 hex>`) are not predictable, and a session id does not work as a `SendMessage` address.
+- `fujimoto search QUERY [--project NAME|PATH | --all-projects] [-e] [-s] [--raw] [-n N] [--sort recent|relevance] [--include-self] [--json]` and `fujimoto log SESSION [--summary | --grep P [-e] [-s] [-C N]] [--head N | --tail N] [--roles LIST] [--json]` are the read-only query commands, dispatched to `_run_search_command` / `_run_log_command` **before** `_check_prerequisites` — they must work without tmux, and never open the TUI. All logic lives in `session_query.py`; `cli.py` only parses arguments, maps `QueryError` to exit 1 and prints. Text is the default output (for people *and* agents), `--json` the structured form. No match is exit 0.
+- `fujimoto resume SESSION [--fork] [--detach [--wait SECS]] [--prompt T] [--parent NAME] [-- claude args…]` is `new`'s twin for an existing conversation, and shares its plumbing: `_prepare_resume` returns a `LaunchTarget` for the launch loop's `initial_target`, or with `--detach` calls `_start_launch(attach=False)` under `_stdout_to_stderr` and prints `_resume_result` JSON. Rules, in order: an unknown id or unreadable log → exit 1; a missing `cwd` → exit 1 naming the branch (no recreation); already running (by `ActivityIndex`) and no `--fork` → connect (attached) or report (detached), **never a second process on one transcript**, and `--prompt` is an error since only a new process could take it; otherwise `_resume_cli_target` names the tmux session as the TUI's `_resume_target` does (the worktree's own name if free, else `direct-N`; `adhoc-N` outside a repo). `LaunchTarget` gained three `resume`-only fields: `extra_args` (appended after the launch options and **never saved**, which is how the automatic `--name <worktree>-<id8>` / `<worktree>-fork-<hex4>` avoids overwriting a session's chosen options; skipped when the options already set `--name`), `fork_in_place` (`--resume <id> --fork-session` in the same directory, recorded with no id until `wait_for_registration` finds the new one in Claude Code's registry and `mark_open` stores it) and `parent_session` (the `--parent` prompt for sessions with no `meta.json`). claude does not document `--session-id` with `--fork-session`, which is why a fork's id comes from the registry rather than being chosen up front.
+- `fujimoto stop SESSION [--json]` (`_run_stop_command`) resolves a tmux name directly, or a Claude session id via `session_query.tmux_for_session` (registry/tmux, refusing one running outside tmux), then `kill_session` + `mark_stopped`, the same as `Ctrl-A s`. It runs before the prerequisite check.
+- `fujimoto agent-instructions` prints `templates/agent_instructions.md` (`session_query.agent_instructions()`, via `importlib.resources`) — a slim guide for agents to the session commands and when to use them. **Keep it in step with the CLI**: `TestAgentInstructions.test_every_example_parses` runs every `fujimoto …` line in it through `_build_parser()` (the parser, extracted from `main()` for exactly this), and `test_stays_generic` checks the only ticket key in this shipped file is the `ABC-123` placeholder. Examples must stay synthetic (`ABC-123`, `8f0e2c1a`).
 - `fujimoto pane <vscode|terminal> --session <name>` dispatches to `_run_pane_command`, used by the in-session tmux key table (`Ctrl-A v` / `Ctrl-A w`). Resolves the session's working directory via `tmux display-message -p '#{session_path}'` and calls the existing `open_vscode` / `open_terminal` helpers; errors are surfaced via `tmux display-message` so they appear in the session's status bar.
 
 Otherwise it:
@@ -212,12 +219,12 @@ row on the home screen without buying the user anything.
 ### Module Responsibilities
 
 **`config.py`** — Pure functions, no side effects except directory creation:
-- `get_worktree_root(project_root=None)` — returns `FUJIMOTO_WORKTREE_ROOT` if set, else falls back to `<project_root>/.fujimoto/worktrees/` (ensures `.fujimoto/.gitignore` exists). Raises `ConfigError` only if both are missing.
+- `get_worktree_root(project_root=None, *, create=True)` — returns `FUJIMOTO_WORKTREE_ROOT` if set, else falls back to `<project_root>/.fujimoto/worktrees/` (ensures `.fujimoto/.gitignore` exists). Raises `ConfigError` only if both are missing.
 - `get_git_projects_root()` — reads `FUJIMOTO_GIT_ROOT`, returns `None` if unset
 - `list_projects()` — scans git root for directories containing `.git`
 - `slugify(title)` — lowercase, replace non-alphanumeric with hyphens, strip/collapse
 - `build_worktree_path(project, title, project_root=None)` — with env var: `{root}/{project}/{YYYYMMDD}-{slug}`; with fallback: `<project_root>/.fujimoto/worktrees/{YYYYMMDD}-{slug}`
-- `get_project_worktrees_dir(project, project_root=None)` — with env var: `{root}/{project}`; with fallback: `<project_root>/.fujimoto/worktrees/`
+- `get_project_worktrees_dir(project, project_root=None, *, create=True)` — with env var: `{root}/{project}`; with fallback: `<project_root>/.fujimoto/worktrees/`
 - `store_session_meta(path, base_branch, source_root=None, forked_from_session_id=None, forked_from_worktree=None)` / `read_session_meta(path)` — JSON metadata. `source_root` records the main repo the worktree was created from, so `project_config` can resolve copy/link sources on later launches (older worktrees without it fall back to deriving the root via `git.get_main_worktree_root`). The two `forked_from_*` keys record that the worktree was created by forking another session and where that session was running; keeping both in the worktree means a fork stays identifiable even if the source Claude transcript is deleted. All optional keys are omitted when `None`.
 - `read_parent_session(path)` / `write_parent_session(path, name)` — the peer address (Claude Code `SendMessage` name, *not* a session id) of the session that ran `fujimoto new --parent`, stored as `parent_session` in `meta.json`. Same rules as `write_claude_args`: it only updates an existing `meta.json`, and the latest writer wins.
 - `has_session_meta(path)` / `read_claude_args(path)` / `write_claude_args(path, args)` — a worktree's saved launch options, stored as a `claude_args` list in `meta.json`. `read_claude_args` returns `None` for "no override" (distinct from `[]`, an explicit "no options"); `write_claude_args(None)` removes the key, and the writer only ever updates an existing `meta.json`, so it cannot plant one in a directory fujimoto did not create as a worktree.
@@ -330,6 +337,100 @@ pydantic):
   `templates/fujimoto.yaml.template` (via `importlib.resources`) and scaffold it
   into a repo (refusing to overwrite an existing file).
 
+**`session_query.py`** — The read-only `search` / `log` commands, UI-free:
+- `resolve_scope(project=, all_projects=, cwd=)` → `Scope`. No flag: the main
+  clone of the cwd's repo (`get_main_worktree_root`, so a worktree searches its
+  siblings). `--project`: a directory (any path in the repo), else a name under
+  `$FUJIMOTO_GIT_ROOT`. Worktrees are the home screen's set — the children of
+  `get_project_worktrees_dir(..., create=False)` **plus deleted ones**:
+  `log_parser.recorded_cwds_under(worktrees_dir)` finds every recorded `cwd`
+  below that directory, and each immediate child with transcripts but no
+  directory joins `Scope.worktrees`, so its hits read `cwd_exists: false` /
+  `(deleted)` but still name the worktree. Candidates are session dirs whose
+  encoded name has the worktrees dir's encoding as a prefix, *confirmed by the
+  transcript's own `cwd`* — the encoding is lossy, so `/wt/proj` is a prefix of
+  `/wt/proj-other`. Only the current worktrees root is searched; the TUI's `s`
+  deliberately does not include deleted worktrees, since its actions menu
+  (Resume, terminal, VS Code) would all fail on a missing directory.
+  **`create=False` matters**:
+  the default creates `<root>/.fujimoto/`, and a search must not plant that in
+  a repo it only looked at. `--all-projects` uses `search.list_all_session_logs`
+  (every top-level `*.jsonl` under the projects dir), with no path mapping.
+- `--sort relevance` (`SortOrder.RELEVANCE`) disables the early stop, sorts
+  every hit by `relevance_key` — `(message matches, tool matches,
+  last_activity)` — and *then* applies `limit`, so `truncated` means "more
+  hits than shown". It deliberately ignores the raw match count: a single Jira
+  search listing in tool output can out-count a session that worked on the
+  ticket all day, and message text is what tells them apart. In `TEXT` mode
+  every match is a message match, so the key reduces to message count.
+- `run_search(...)` drives `iter_hits` and, in the default `recent` order,
+  **stops at the first batch that reaches `limit`** — logs are mtime-descending, so the first N hits are the
+  newest N, and the rest need not be read. `truncated` means hits were cut *or*
+  logs were left unscanned ("more may match"); `limit=0` scans everything.
+  Location and activity are computed only for the hits that are returned.
+- `Locator` maps a transcript `cwd` to `Location(project, project_root,
+  worktree)`, memoized per cwd. In a project scope it uses the scope (so a
+  deleted worktree is still named); across all projects it asks git, which
+  needs the directory to exist.
+- `ActivityIndex` is gathered once per command (`live.list_live_sessions()`,
+  one `tmux.list_session_paths()` call, `session_state.load_state()`) and
+  matched per transcript: (1) the registry has a process writing this session
+  id → running, source `claude-registry`, with pid/peer name/status/tmux
+  session; (2) the registry has a process in this cwd writing a *different*
+  conversation → not running, whatever tmux says; (3) a tmux session in this
+  cwd whose record's `claude_session_id` is this id — or, with no recorded id,
+  this is the cwd's newest transcript by mtime → running, source `tmux`.
+- `find_session_log(ref)` — a `.jsonl` path, an exact id, or a unique id
+  prefix (glob-escaped); ambiguity is a `QueryError` listing candidates.
+- **The calling session is excluded from `search`.** `calling_session_id()`
+  reads `$CLAUDE_CODE_SESSION_ID` (`CALLING_SESSION_ENV`), and `run_search`
+  drops that hit *before* the limit, reporting `excluded_session` only when it
+  actually matched. `--include-self` turns it off. Without this an agent
+  searching for "the thing I was just asked about" always finds itself first.
+- **`log` views.** Every message is carried as `(index, message)`, `index`
+  being its position in the whole transcript, so a passage keeps its number
+  across views (`### role · #N · time`, `"index"` in JSON). `_classify`
+  re-roles harness-injected "user" entries (`_INJECTED_PREFIXES`:
+  task notifications, system reminders, slash-command output) as `injected`,
+  hidden unless `--roles` names it (`DEFAULT_ROLES`). `_select` then applies
+  `--grep` (the same `compile_matcher`, TEXT mode) with `-C` context
+  *in the role-filtered list*, recording `breaks` (indices printed after a
+  gap, drawn as `⋯`), then `--head`/`--tail`. `total` is the role-filtered
+  count; `matched` the grep count.
+- **`log --summary`** (`summarize`) is the first user prompt, the final
+  exchange (`replied_to`: the assistant reply before the last user message,
+  since that is often just "yes, do it"; `last_user`; `last_assistant`), role
+  counts, and links. `extract_links` recognises GitHub PRs, Jira issues and
+  Slack messages, deduplicated by canonical URL (Jira drops
+  `?focusedCommentId`, Slack the query) and counted, with tool-ready ids
+  (`repo`/`number`, `key`, `channel`/`ts` with the `p…` id turned back into
+  a Slack `ts`). `_message_links` takes them from messages and tool calls,
+  and from tool *output* only for PRs: a Jira search result is a listing of
+  issues the session never touched (a session that only ran a ticket search is a false lead).
+  On a raw fallback, `summarized` is set and only the links are recovered.
+- `load_log(...)` uses `read_transcript`, and on any non-`ClaudeLogError`
+  exception falls back to `read_raw_transcript` with `parse_error` set — the
+  same contract as the TUI viewer. `parse_session` failing only costs the
+  metadata header.
+- `relative_time` lives here (re-exported into `cli.py` as `_relative_time`)
+  so the query module does not import the TUI.
+- Instrumented as `query.scope` (`via=cwd|path|git-root|all`), `query.worktrees` (`existing`/`deleted`), `query.search`,
+  `query.activity` (capped, with the matching rule as `reason=`),
+  `query.locate`, `query.log_resolve` (`via=path|exact|prefix`) and
+  `query.log`; `claude.live_sessions` reports `live`/`stale`/`unreadable`
+  counts — `unreadable` climbing is what a registry format change looks like.
+
+- `wait_for_registration(tmux_session, timeout=)` polls `live.list_live_sessions()` for the entry whose `tmux` pane is in that session (injectable `sleep`/`clock` for tests; `timeout=0` checks once); `resolve_session(ref)` and `tmux_for_session(ref)` back `resume` and `stop`.
+
+**`claude/live.py`** — Claude Code's registry of running processes,
+`$CLAUDE_CONFIG_DIR/sessions/<pid>.json` (`get_claude_sessions_dir`). Each file
+holds `pid`, `sessionId`, `cwd`, `name` (the peer address), `status`
+(`busy`/`idle`) and `tmux` (`<session>:@<window>.%<pane>`, parsed by
+`tmux_session_from_pane`). It is undocumented, so `list_live_sessions` reads
+every field defensively, skips files without an int `pid` and a `sessionId`,
+and drops entries whose pid is gone (`pid_alive`; `PermissionError` counts as
+alive) — a crashed process leaves its file behind.
+
 **`launch_options.py`** — Extra `claude` CLI arguments ("launch options") per
 session:
 - `resolve(working_dir, tmux_name, claude_session_id, *, parent_dir,
@@ -425,6 +526,7 @@ session:
 **`tmux.py`** — tmux session management:
 - `is_tmux_installed()` / `install_tmux()` — detection and install. macOS: brew install. Linux: raises `TmuxError` with a distro-appropriate install command (apt-get/dnf/pacman/zypper/apk) — does not invoke sudo automatically.
 - `list_all_sessions()` — lists all active tmux session names
+- `list_session_paths()` — `{name: start directory}` for every session in one `list-sessions` call; `{}` when no server runs or tmux is not installed (it catches `OSError`, since the query commands must not require tmux)
 - `list_project_sessions(project)` — lists active tmux sessions for a project
 - `session_name(project, dir)` — naming convention: `{project}/{dir}`
 - `build_claude_command(system_prompt, resume_session_id, fork_session, extra_args, session_id, prompt)` — composes the `claude` invocation. `prompt` (quoted) comes straight after `claude`, *before* the launch options, because a variadic option such as `--allowedTools a b` would otherwise swallow it; then `extra_args` (the launch options), each `shlex.quote`d since tmux runs the string through a shell; then `--session-id`. The flags **compose** rather than exclude each other (they used to be mutually exclusive): a fork needs `--resume <id> --fork-session` *and* `--append-system-prompt` together.
@@ -452,6 +554,7 @@ session:
 - `ClaudeSession` — frozen dataclass: session_id, state, cwd, git_branch, last_activity, etc.
 - `encode_project_path(path)` — replaces `/` **and `.`** with `-`, matching Claude's directory encoding (see the gotcha below)
 - `get_claude_projects_dir()` — `$CLAUDE_CONFIG_DIR/projects` if that env var is set, else `~/.claude/projects`
+- `recorded_cwds_under(base)` — every working directory at or below `base` with transcripts, whether or not it still exists (encoded-prefix candidates, confirmed by `_first_cwd`). Used by `fujimoto search` to find deleted worktrees; logs `claude.recorded_cwds` with `candidates`/`found`/`rejected`.
 - `session_dirs_for_path(project_path)` — the transcript directories for a working directory, and the single place that mapping lives (`get_sessions_for_path` and `search.list_session_logs` both go through it). Tries the encoded name for the path as given and as `resolve()`d (Claude records the *physical* cwd, so a symlinked worktree root would never match otherwise), then falls back to `_cwd_index()` — a `cwd → dirs` map built from the `cwd` each transcript records. The encoding is a guess at what another program does with a path, so the fallback is what stops a future encoding change from silently reporting "no previous sessions". The index is built only when the encoded lookup misses and memoized per `(projects dir, mtime_ns)`, so it rebuilds when a session directory appears.
 - `parse_session(jsonl_path)` — reads JSONL, tracks last meaningful (non-sidechain) entry, derives state. Skips lines that parse to a non-dict (a bare list or string is valid JSON but has no entry type), which previously raised `AttributeError` out of `get_sessions_for_path` and into the home screen.
 - `get_sessions_for_path(project_path)` — encodes path, globs `*.jsonl`, returns sorted sessions
@@ -467,10 +570,12 @@ responsible for running it off the event loop.
 - `compile_matcher(query, *, regex, mode)` → `Matcher`; raises `SearchError` on a regex that won't compile. `Matcher.present_in(text)` is the whole-file predicate.
 - `list_session_logs(project_root, worktrees)` — `session_dirs_for_path` for the root and each worktree, globbed and returned **mtime-descending**, deduplicated. The ordering is the feature: a caller rendering results as they arrive shows recently used sessions first.
 - `search_log(path, matcher)` → `SearchHit | None`. **Reads the file and rejects it with a single `re.search` before any JSON parsing** — that fast path is what makes scanning hundreds of logs viable, since almost none contain the query. Returns `None` for an unreadable log, for a `ClaudeLogError` from `parse_session`, and (in `TEXT` mode) when the whole-file hit turned out to be in JSON scaffolding rather than in anything anyone said.
+- `list_all_session_logs(projects_dir=None)` — every top-level `*.jsonl` under each child of the projects directory, mtime-descending; used by `fujimoto search --all-projects`. Sub-agent logs in nested directories are not sessions and are skipped.
+- `MatchBreakdown(message, tool, other)` on each `SearchHit` (`breakdown`). In `RAW` mode `_scan_raw` parses each *matching* line and attributes its matches to message text (`_message_text`), tool content (`_tool_text`: `tool_use` input as `key: value` lines, `tool_result` text, and the entry's `toolUseResult`) or scaffolding, and **sources snippets from the readable text** — message, then tool, then the raw line only for scaffolding matches — so a tool-output hit no longer shows `\"key\":\"…` escapes. The raw count is unchanged, and categories are clamped to it, since unescaping can add or lose a match. In `TEXT` mode `tool`/`other` are `None` (not scanned, so unknown rather than zero). The TUI's raw-mode snippets get the readable sourcing for free.
 - `iter_hits(logs, matcher, *, batch_size=10, is_cancelled=None)` — generator yielding `(scanned_so_far, hits_in_batch)` every `batch_size` logs plus once at the end. `is_cancelled` is polled before each log; a cancelled scan yields nothing further. An empty log list yields exactly one `(0, ())` batch so the caller can report "no transcripts".
 - `SearchHit(session, match_count, snippets)` where each snippet is a `Snippet(text, spans)`. Snippets are capped at `MAX_SNIPPETS` (3) per session, each a whitespace-collapsed, single-line window of `SNIPPET_RADIUS` (60) chars either side of the match with `…` elision markers.
 - **`Snippet.spans` are the match offsets *within* `text`**, so the UI can highlight them without re-running the pattern — which it could not do reliably anyway, since `text` has had its whitespace collapsed and may no longer match a query that spanned a line break. `_collapse(window)` returns the collapsed text plus a `len(window) + 1` offset map, and `_snippet` maps every match in the window through it: a half-open window span `(a, b)` becomes `(offsets[a], offsets[b])`. Reporting *all* matches in the window (not just the anchor one) is what lets a dense passage highlight each hit.
-- `_collect(source, matcher, count, snippets)` counts every match but skips snippetting one that falls inside a window already emitted — so `MAX_SNIPPETS` buys three *different* places rather than three near-identical views of one dense paragraph. Counts are unaffected.
+- `_collect(source, matcher, count, snippets)` counts every match but skips snippetting one that falls inside a window already emitted — so `MAX_SNIPPETS` buys three *different* places rather than three near-identical views of one dense paragraph. A snippet whose text equals one already collected is dropped too: Claude Code records some text (a prompt, a queued message) in two entries, which otherwise filled two of the three slots with one sentence. Counts are unaffected.
 
 **`cli.py`** — Textual TUI with async view management:
 - `PagingListView` — `ListView` subclass used for **every** list in the TUI. Textual's `ListView` binds only up/down/enter, so PgUp/PgDn/Home/End fell through to the scroll container: the view moved, the highlight didn't, and the next arrow key snapped back to the old row. Here `action_page_cursor` moves the highlight by as many rows as fit in the viewport (summing each row's `outer_size.height`, since search results are multi-line) and `action_edge_cursor` jumps to the first/last row; both land on the nearest enabled row so separators are skipped. Build new lists with it, not `ListView` — queries by `ListView` type still match it

@@ -335,6 +335,193 @@ fujimoto new fix-flaky-test --prompt "…" \
   child is running. Since arguments after `--` are saved as launch options,
   the name stays the same across relaunches.
 
+### Session tools for agents
+
+`fujimoto agent-instructions` prints a short guide to the command-line tools
+below (`search`, `log`, `resume`, `stop`, `new`), written for an AI agent:
+what each does, and when it helps — tracing work on a ticket or error,
+avoiding duplicate work, recovering context, checking that something is really
+done, delegating. Point an agent at it from its instructions file, e.g. a line
+in `CLAUDE.md`:
+
+```markdown
+To search, read or talk to other Claude sessions, run `fujimoto agent-instructions`.
+```
+
+### Searching transcripts from the command line
+
+`fujimoto search` is the home screen's transcript search (`s`) without the
+TUI, for scripts, agents and people at a prompt. It needs neither tmux nor a
+running fujimoto, and changes nothing on disk.
+
+```sh
+fujimoto search "flaky test"                     # current project + its worktrees
+fujimoto search "flaky test" --project myproject # a project under $FUJIMOTO_GIT_ROOT (or a path)
+fujimoto search "flaky test" --all-projects      # every transcript on the machine
+fujimoto search 'retry(ing)? \d+' --regex        # regex; -s for case-sensitive
+fujimoto search "pytest -x" --raw                # also match tool calls and output
+fujimoto search "flaky test" --limit 5 --json    # JSON, at most 5 sessions
+fujimoto search ABC-123 --sort relevance -n 5     # the 5 sessions that discuss it most
+```
+
+A project search includes sessions from worktrees that have since been
+deleted (their transcripts outlive them); those show `(deleted)` next to the
+directory, and `"cwd_exists": false` in JSON. The TUI's `s` search does not
+list them, since a deleted worktree can't be resumed in place.
+
+By default only what the user and Claude *said* is matched; `--raw` also
+matches tool calls, tool output and file contents. Results are newest first,
+and the scan stops once `--limit` sessions (default 20, `0` for no limit) have
+matched, so a search over a large history stays fast:
+
+```
+● myproject/20261013-fix-flaky-test  (3 matches; 2h ago)
+  session:  8f0e2c1a-…
+  cwd:      /Users/me/git/worktrees/myproject/20261013-fix-flaky-test
+  branch:   worktree/20261013-fix-flaky-test
+  title:    Fix the flaky test in test_api.py
+  active:   busy · peer 20261013-fix-flaky-test · tmux myproject/20261013-fix-flaky-test · pid 4242
+    …the flaky test fails about one run in five because…
+
+○ myproject  (1 match; 3d ago)
+  session:  1c9d77b0-…
+  cwd:      /Users/me/git/myproject
+  branch:   main
+  title:    Investigate CI timeouts
+  active:   no
+    …could be the same flaky test, it only fails on…
+
+2 matching sessions · scanned 41/41 transcripts · project myproject · message text
+Next: fujimoto log <session> --summary, or --grep PATTERN to find the passage
+```
+
+`●` marks a session that is running right now. That comes from Claude Code's
+own registry of running processes (`~/.claude/sessions/`), which names the
+exact conversation each process is writing, its peer name (the address
+`SendMessage` takes) and whether it is busy. For a Claude Code too old to keep
+that registry, fujimoto falls back to its own tmux sessions. `--json` carries
+the same fields, plus the transcript path and match offsets inside each
+snippet.
+
+With `--raw`, each hit says where its matches were. `74 matches: 9 message,
+46 tool, 19 other` means the session *talked about* the query nine times, and
+the rest were in tool calls, tool output and JSON metadata. `0 message` usually
+means the session only saw the query in a listing (a Jira search, a log) and
+never worked on it. Snippets come from the readable text, message text first,
+not from the escaped JSON the transcript stores.
+
+**Which mode for a ticket key?** The default (message text) is usually the
+right one. A key such as `ABC-123` turns up in tool output for every session
+that ran a Jira search, while a session that actually *worked* on the ticket
+names it again and again in what was said. The default never sees tool
+output, so listing-only sessions don't match at all. Use `--raw` when you also
+want those; the breakdown then shows which hits are which.
+
+`--sort relevance` puts the sessions with the most message-text matches first
+(then tool matches, then the most recent), so the top result is the likeliest
+candidate. It never ranks on the raw count, which one long listing can
+inflate. It has to scan every transcript before choosing the top `--limit`,
+so it is slower than the default newest-first order, which stops as soon as
+`--limit` sessions have matched.
+
+When run from inside a Claude session, `search` leaves that session's own
+transcript out (it reads `$CLAUDE_CODE_SESSION_ID`). Otherwise an agent
+searching for what it was just asked about always finds itself first. Pass
+`--include-self` to keep it.
+
+`fujimoto log` prints one session's transcript. It accepts a session id, any
+unique prefix of one, or a `.jsonl` path:
+
+```sh
+fujimoto log 8f0e2c1a --summary               # how it started, how it ended, its links
+fujimoto log 8f0e2c1a --grep ABC-123 -C 1      # messages mentioning ABC-123, ±1 message
+fujimoto log 8f0e2c1a --head 10               # first 10 messages (or --tail 10)
+fujimoto log 8f0e2c1a --roles user,assistant  # just the conversation, no tool calls
+fujimoto log 8f0e2c1a                         # whole transcript
+fujimoto log 8f0e2c1a --json
+```
+
+`--summary` prints a session's first prompt and its final exchange: the
+reply you last answered, your answer, and Claude's last message. It also lists
+the GitHub PRs, Jira issues and Slack messages the session mentioned, with the
+ids another tool needs (repo and number, issue key, Slack channel and message
+timestamp). Links count when they appear in a message or a tool call. Links in
+tool *output* count only for PRs, where a session's own `gh pr create` reports
+its PR. Any other link in tool output is usually a listing.
+
+`--grep` takes `-e` (regex), `-s` (case-sensitive) and `-C N` (context
+messages either side). `⋯` marks where messages were skipped. Every message
+heading carries its index in the transcript (`### assistant · #148 · …`), so a
+passage found with `--grep` can be found again in another view.
+
+Roles are `user`, `assistant`, `thinking`, `tool_use`, `tool_result` and
+`injected`. Injected messages are what the harness records as a "user"
+message but nobody typed: background-task notifications, system reminders,
+slash-command output. They are hidden unless asked for with `--roles`. Long
+tool inputs and outputs are clipped, as in the TUI's log viewer. If fujimoto
+can't parse a transcript (Claude Code's log format changes over time), it
+prints the raw JSONL lines with a warning instead of failing. Both commands
+exit 0 when nothing matches and 1 on an error.
+
+### Resuming a session from the command line
+
+`fujimoto resume` picks a session up by id (any unique prefix, as for `log`),
+in the directory it ran in. It is how another agent can ask a finished session
+about its own work, in a real back-and-forth rather than a single question:
+
+```sh
+fujimoto resume 8f0e2c1a                      # resume and attach, like the TUI
+fujimoto resume 8f0e2c1a --detach \
+  --parent 20261020-my-session-b5 \
+  --prompt "Was this merged? Reply with SendMessage."
+fujimoto resume 8f0e2c1a --fork --detach      # ask in a copy, leave the original as it was
+fujimoto stop myproject/20261013-fix-flaky-test
+```
+
+`--detach` starts it in the background, waits up to `--wait` seconds (default
+15) for Claude Code to register the process, and prints JSON:
+
+```json
+{
+  "tmux_session": "myproject/20261013-fix-flaky-test",
+  "working_dir": "/Users/me/git/worktrees/myproject/20261013-fix-flaky-test",
+  "branch": "worktree/20261013-fix-flaky-test",
+  "resumed_session_id": "8f0e2c1a-…",
+  "claude_session_id": "8f0e2c1a-…",
+  "forked": false,
+  "peer_name": "20261013-fix-flaky-test-8f0e2c1a",
+  "parent_session": "20261020-my-session-b5",
+  "pid": 4242,
+  "status": "busy",
+  "registered": true,
+  "session_started": true,
+  "attach_command": "tmux attach-session -t myproject/20261013-fix-flaky-test",
+  "stop_command": "fujimoto stop myproject/20261013-fix-flaky-test"
+}
+```
+
+- **Peer name.** fujimoto names the process `<worktree>-<id prefix>` (a fork:
+  `<worktree>-fork-<random>`) so the caller knows where to `SendMessage`
+  before it has even registered. A `--name` in the session's launch options,
+  or after `--`, wins. The automatic name is not saved as a launch option.
+- **`--parent`** tells the resumed session which session to reply to, as with
+  `fujimoto new`.
+- **Resume or fork.** By default the questions and answers join the session's
+  own history. `--fork` continues in a new conversation (`--fork-session`) in
+  the same directory, so the original transcript is untouched, and
+  `claude_session_id` is the fork's new id.
+- **Never twice.** A session that is already running is connected to (or,
+  with `--detach`, just reported with its peer name). `--prompt` is an error
+  then: message it instead. `--fork` still starts a separate fork.
+- **Deleted directory.** A session whose worktree is gone is refused, with
+  the branch it ran on.
+- **`fujimoto stop`** takes a tmux session name or a Claude session id. It
+  stops the process the way `Ctrl-A s` does: the session stays on the home
+  screen as stopped, ready to resume.
+
+A resumed session runs with its usual launch options and nobody watching. If
+it stops for a permission prompt, it waits until someone attaches.
+
 ### Home Screen
 
 ```

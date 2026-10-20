@@ -426,3 +426,21 @@ class TestParentSessionMeta:
         store_session_meta(tmp_path, "main")
         (tmp_path / ".fujimoto" / "meta.json").write_text(raw)
         assert read_parent_session(tmp_path) is None
+
+
+class TestWorktreeRootWithoutCreate:
+    def test_in_project_fallback_is_not_created(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("FUJIMOTO_WORKTREE_ROOT", raising=False)
+        path = get_project_worktrees_dir("proj", tmp_path, create=False)
+        assert path == tmp_path / ".fujimoto" / "worktrees"
+        assert not (tmp_path / ".fujimoto").exists()
+
+    def test_env_root_is_not_created(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FUJIMOTO_WORKTREE_ROOT", str(tmp_path / "wt"))
+        path = get_project_worktrees_dir("proj", create=False)
+        assert path == (tmp_path / "wt").resolve() / "proj"
+        assert not (tmp_path / "wt").exists()

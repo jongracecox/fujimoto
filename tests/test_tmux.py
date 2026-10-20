@@ -1018,3 +1018,24 @@ class TestStopAndTerminateBindings:
     ) -> None:
         monkeypatch.setenv("FUJIMOTO_META_KEY", "C-g")
         assert tmux.meta_key() == "C-g"
+
+
+class TestListSessionPaths:
+    def test_parses_names_and_paths(self) -> None:
+        result = MagicMock(
+            returncode=0, stdout="proj/a\t/repo/a\nadhoc-1\t/tmp/x\nbroken\n"
+        )
+        with patch("fujimoto.tmux.subprocess.run", return_value=result):
+            assert tmux.list_session_paths() == {
+                "proj/a": Path("/repo/a"),
+                "adhoc-1": Path("/tmp/x"),
+            }
+
+    def test_no_server(self) -> None:
+        result = MagicMock(returncode=1, stdout="")
+        with patch("fujimoto.tmux.subprocess.run", return_value=result):
+            assert tmux.list_session_paths() == {}
+
+    def test_tmux_not_installed(self) -> None:
+        with patch("fujimoto.tmux.subprocess.run", side_effect=FileNotFoundError):
+            assert tmux.list_session_paths() == {}

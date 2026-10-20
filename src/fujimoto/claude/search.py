@@ -33,6 +33,7 @@ from fujimoto import debug
 from fujimoto.claude.log_parser import (
     ClaudeLogError,
     ClaudeSession,
+    get_claude_projects_dir,
     parse_session,
     session_dirs_for_path,
 )
@@ -112,12 +113,29 @@ class Snippet:
 
 
 @dataclass(frozen=True)
+class MatchBreakdown:
+    """Where in a transcript the matches were.
+
+    `message` is what the user and Claude said; `tool` is tool-call input and
+    tool output; `other` is everything else in the JSON (keys, ids, paths,
+    metadata). It is what tells "discussed X" apart from "saw X in a listing".
+    A `TEXT`-mode scan only looks at messages, so `tool` and `other` are None
+    there — unknown, not zero.
+    """
+
+    message: int
+    tool: int | None = None
+    other: int | None = None
+
+
+@dataclass(frozen=True)
 class SearchHit:
     """One transcript that matched, with enough context to render a row."""
 
     session: ClaudeSession
     match_count: int
     snippets: tuple[Snippet, ...]
+    breakdown: MatchBreakdown | None = None
 
 
 def compile_matcher(
@@ -218,6 +236,37 @@ def list_session_logs(
     return logs
 
 
+def list_all_session_logs(projects_dir: Path | None = None) -> list[Path]:
+    """Every transcript Claude Code has written on this machine, newest first.
+
+    No path-to-directory mapping is involved: each child of the projects
+    directory is one encoded working directory, and its top-level `*.jsonl`
+    files are its sessions (sub-agent logs live in nested directories and are
+    not sessions of their own).
+    """
+    root = projects_dir or get_claude_projects_dir()
+    mtimes: dict[Path, float] = {}
+    try:
+        session_dirs = [d for d in root.iterdir() if d.is_dir()]
+    except OSError:
+        session_dirs = []
+    for session_dir in session_dirs:
+        for log in session_dir.glob("*.jsonl"):
+            try:
+                mtimes[log] = log.stat().st_mtime
+            except OSError:  # pragma: no cover - vanished glob->stat
+                continue
+    logs = sorted(mtimes, key=lambda p: mtimes[p], reverse=True)
+    debug.log(
+        "search.logs",
+        scope="all",
+        projects_dir=debug.rp(root),
+        dirs=len(session_dirs),
+        logs=len(logs),
+    )
+    return logs
+
+
 def search_log(log_path: Path, matcher: Matcher) -> SearchHit | None:
     """Search a single transcript, returning None when it does not match.
 
@@ -239,9 +288,10 @@ def search_log(log_path: Path, matcher: Matcher) -> SearchHit | None:
         return None
 
     if matcher.mode is ContentMode.RAW:
-        count, snippets = _scan_raw(text, matcher)
+        count, snippets, breakdown = _scan_raw(text, matcher)
     else:
         count, snippets = _scan_message_text(text, matcher)
+        breakdown = MatchBreakdown(message=count)
 
     # In TEXT mode the whole-file hit may have been in the JSON scaffolding
     # (a key name, a uuid, a cwd) rather than in anything anyone said.
@@ -261,7 +311,12 @@ def search_log(log_path: Path, matcher: Matcher) -> SearchHit | None:
         )
         return None
 
-    return SearchHit(session=session, match_count=count, snippets=tuple(snippets))
+    return SearchHit(
+        session=session,
+        match_count=count,
+        snippets=tuple(snippets),
+        breakdown=breakdown,
+    )
 
 
 def iter_hits(
@@ -329,13 +384,59 @@ def iter_hits(
     )
 
 
-def _scan_raw(text: str, matcher: Matcher) -> tuple[int, list[Snippet]]:
-    """Count matches and collect snippets over the raw transcript lines."""
-    count = 0
-    snippets: list[Snippet] = []
+def _scan_raw(text: str, matcher: Matcher) -> tuple[int, list[Snippet], MatchBreakdown]:
+    """Count matches over the raw lines, and say where in each entry they sit.
+
+    The count is of the raw bytes, as before. Each matching line is also parsed
+    so its matches can be attributed to message text, tool content or JSON
+    scaffolding — and so snippets come from the *readable* text wherever they
+    can: a match in a tool result is snippetted from the result's text, not
+    from the JSON-escaped line (`\\"key\\":\\"…`) that carries it. Message
+    snippets are preferred over tool snippets, and the raw line is only the
+    last resort, for matches in the scaffolding itself.
+    """
+    count = in_message = in_tool = 0
+    message_snips: list[Snippet] = []
+    tool_snips: list[Snippet] = []
+    raw_snips: list[Snippet] = []
     for line in text.splitlines():
-        count, snippets = _collect(line, matcher, count, snippets)
-    return count, snippets
+        if not matcher.present_in(line):
+            continue
+        line_count = sum(1 for _ in matcher.pattern.finditer(line))
+        count += line_count
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            entry = None
+        found = 0
+        if isinstance(entry, dict):
+            message = _message_text(entry)
+            if message:
+                n, message_snips = _collect(message, matcher, 0, message_snips)
+                in_message += n
+                found += n
+            tool = _tool_text(entry)
+            if tool:
+                n, tool_snips = _collect(tool, matcher, 0, tool_snips)
+                in_tool += n
+                found += n
+        if found < line_count:
+            _, raw_snips = _collect(line, matcher, 0, raw_snips)
+
+    snippets: list[Snippet] = []
+    for snippet in (*message_snips, *tool_snips, *raw_snips):
+        if len(snippets) == MAX_SNIPPETS:
+            break
+        if all(s.text != snippet.text for s in snippets):
+            snippets.append(snippet)
+    # Unescaping can make the readable text hold a match the raw bytes do
+    # not (and vice versa), so the categories are clamped to the raw count.
+    in_message = min(in_message, count)
+    in_tool = min(in_tool, count - in_message)
+    breakdown = MatchBreakdown(
+        message=in_message, tool=in_tool, other=count - in_message - in_tool
+    )
+    return count, snippets, breakdown
 
 
 def _scan_message_text(text: str, matcher: Matcher) -> tuple[int, list[Snippet]]:
@@ -370,14 +471,19 @@ def _collect(
     Matches falling inside a window already emitted are skipped for snippet
     purposes (they are already visible in it, and highlighted by its `spans`),
     so `MAX_SNIPPETS` buys three *different* places rather than three
-    near-identical views of one dense paragraph. They are still counted.
+    near-identical views of one dense paragraph. They are still counted. For
+    the same reason a snippet identical to one already collected is dropped:
+    Claude Code records some text twice (a prompt, a queued message), which
+    otherwise spent two of the three slots on one sentence.
     """
     covered = -1
     for match in matcher.pattern.finditer(source):
         count += 1
         if len(snippets) < MAX_SNIPPETS and match.start() > covered:
-            snippets.append(_snippet(source, match.start(), match.end(), matcher))
+            snippet = _snippet(source, match.start(), match.end(), matcher)
             covered = min(len(source), match.end() + SNIPPET_RADIUS)
+            if all(s.text != snippet.text for s in snippets):
+                snippets.append(snippet)
     return count, snippets
 
 
@@ -413,6 +519,62 @@ def _message_text(entry: dict) -> str:
         and isinstance(block.get("text"), str)
     ]
     return "\n".join(parts)
+
+
+def _tool_text(entry: dict) -> str:
+    """The readable content of an entry's tool calls and tool results.
+
+    A `tool_use` contributes its input as `key: value` lines, a `tool_result`
+    its text; `toolUseResult` (Claude Code's structured copy of a result) is
+    included too, since a match in it is tool output rather than scaffolding.
+
+    >>> _tool_text({"message": {"content": [
+    ...     {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]}})
+    'command: ls'
+    >>> _tool_text({"message": {"content": [
+    ...     {"type": "tool_result", "content": [{"type": "text", "text": "ok"}]}]}})
+    'ok'
+    >>> _tool_text({"toolUseResult": {"stdout": "hi"}, "message": {"content": "x"}})
+    'stdout: hi'
+    >>> _tool_text({"type": "progress"})
+    ''
+    """
+    parts: list[str] = []
+    message = entry.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                parts.append(_key_values(block.get("input")))
+            elif block.get("type") == "tool_result":
+                parts.append(_result_text(block))
+    if "toolUseResult" in entry:
+        parts.append(_key_values(entry["toolUseResult"]))
+    return "\n".join(p for p in parts if p)
+
+
+def _key_values(value: object) -> str:
+    if isinstance(value, dict):
+        return "\n".join(f"{k}: {v}" for k, v in value.items())
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _result_text(block: dict) -> str:
+    """A `tool_result` block's text: a string, or its `text` sub-blocks."""
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        b["text"]
+        for b in content
+        if isinstance(b, dict) and isinstance(b.get("text"), str)
+    )
 
 
 def _snippet(source: str, start: int, end: int, matcher: Matcher) -> Snippet:
