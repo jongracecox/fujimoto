@@ -230,6 +230,8 @@ def _ensure_focus_events() -> None:
     it, so this has to run straight after ``new-session``, before claude
     has finished loading.
 
+    A failure to set it is logged and ignored rather than raised.
+
     The option is server-wide. tmux only sends the focus-reporting enable
     sequence to a client's terminal when it attaches, so changing it does
     not reach clients already attached — which is fine here, because
@@ -241,12 +243,26 @@ def _ensure_focus_events() -> None:
         text=True,
     )
     previous = result.stdout.strip() if result.returncode == 0 else None
-    if previous != "on":
-        subprocess.run(
-            ["tmux", "set-option", "-s", "focus-events", "on"],
-            check=True,
+    if previous == "on":
+        debug.log("tmux.focus_events", previous=previous, changed=False)
+        return
+    # Never raise: focus events are cosmetic, and a tmux that rejects the
+    # option (too old, odd server state) must not abort the session launch.
+    result = subprocess.run(
+        ["tmux", "set-option", "-s", "focus-events", "on"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        debug.log(
+            "tmux.focus_events",
+            previous=previous,
+            changed=False,
+            error=result.returncode,
+            stderr=debug.rv(result.stderr.strip()),
         )
-    debug.log("tmux.focus_events", previous=previous, changed=previous != "on")
+        return
+    debug.log("tmux.focus_events", previous=previous, changed=True)
 
 
 def _ensure_extended_keys() -> None:
