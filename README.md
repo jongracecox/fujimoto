@@ -620,8 +620,10 @@ it stops for a permission prompt, it waits until someone attaches.
 🅿️ chat-1                       (💬 temp)
 🟠 20260307-parser-rewrite      (worktree)
 🟠 session-1                    (project-root ⎇ main)
-───── inactive worktrees ─────
+───── previous sessions ─────
+⚫ release-notes                (💬 project-root)
 ⚫ 20260308-old-experiment      (worktree)
+  3f9a1c2e  ⎇ main  2d ago
 ⚫ 20260309-cleanup-ui-alt 🍴   (worktree)
 ─────
   Switch project
@@ -641,7 +643,14 @@ what you had open instead:
 | 🔄 | **Recovered** — it was running, and something outside fujimoto took it away. Resume it and carry on. |
 | 🅿️ | **Parked** — set aside on purpose, and you mean to come back to it. |
 | 🟠 | **Stopped** — you ended it deliberately; it may not be needed again. Still resumable. |
-| ⚫ | An inactive worktree: terminated through fujimoto, or never launched from it. |
+| ⚫ | A **previous session**: a worktree with no session running (terminated, or never launched from fujimoto), or a terminated chat. |
+
+**Previous sessions** lists, most recently used first, inactive worktrees,
+terminated chats, and up to five project-root conversations that no other row
+claims (shown by id). Terminating a chat moves it here rather than forgetting
+it — unless it never received a message, since there is nothing to resume —
+and it stays until you choose **Remove from list** (its transcript is kept;
+a temp chat's sub-directory is deleted only if it is empty).
 
 The rule is simply that fujimoto is the only thing that changes a session's
 status, and it only changes it when *you* do. Terminating a session through
@@ -680,8 +689,8 @@ they were last seen — and pick up a real one the next time you launch them.
 
 Press `/` on the home screen to open a filter box, then type. Matching is live
 and case-insensitive, against session names and branch names, and covers the
-**recovered**, **sessions** (running, parked and stopped), **inactive
-worktrees** and **previous claude sessions** lists at once. While a filter is
+**recovered**, **sessions** (running, parked and stopped) and **previous
+sessions** lists at once — chats included. While a filter is
 active the action rows (`+ New …`, settings, switch project) are hidden so only
 matches remain.
 
@@ -769,6 +778,7 @@ Select any session to see contextual options:
 | Active worktree | Connect, Fork session, Resume previous session, View session log, Park, Stop, Terminate, Finish |
 | Stopped worktree | Resume previous session, Fork session, View session log, Launch, Terminate, Finish |
 | Inactive worktree | Resume previous session, Fork session, View session log, Launch, Finish |
+| Previous chat | Resume chat, New conversation, View session log, Remove from list |
 | Active project-root | Connect, Fork session, Resume previous session, View session log, Park, Stop, Terminate |
 | Active chat | Connect, View session log, Park, Stop, Terminate |
 | Stopped chat | Resume chat, New conversation, View session log, Terminate |

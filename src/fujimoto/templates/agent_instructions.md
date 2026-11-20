@@ -140,7 +140,9 @@ user choose where any real work should happen.
 The JSON gives `peer_name` (where to `SendMessage`; `<project>-<chat name>`
 unless `-- --name` sets one), `claude_session_id` and `stop_command`. It
 shows on the fujimoto home screen as `💬`. `stop` it when the conversation is
-over; there is no worktree to clean up.
+over; there is no worktree to clean up. A chat's transcript is covered by
+`search` (temp chats included), and `fujimoto resume <id>` brings a stopped or
+finished chat back as itself, at the same peer name.
 
 ## When to use them
 

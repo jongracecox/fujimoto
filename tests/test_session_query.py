@@ -52,6 +52,11 @@ def _isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             return_value=tmp_path / "state" / "sessions.json",
         ),
         patch("fujimoto.session_query.list_session_paths", return_value={}),
+        # Never the real ~/.fujimoto/chats scratch directory.
+        patch(
+            "fujimoto.session_query.get_chat_scratch_dir",
+            side_effect=lambda project, create=True: tmp_path / "chats" / project,
+        ),
     ):
         yield
     debug.disable()
@@ -353,6 +358,22 @@ class TestActivityRendering:
 
 
 class TestRunSearch:
+    def test_project_scope_covers_its_chat_scratch_dir(
+        self, tmp_path: Path, repo: Path
+    ) -> None:
+        scratch = tmp_path / "chats" / "proj"
+        scratch.mkdir(parents=True)
+        _transcript(tmp_path, scratch, "chat-1", "needle in a chat")
+        scope = resolve_scope(project=None, all_projects=False, cwd=repo)
+        assert scope.extra_dirs == (scratch,)
+        report = run_search("needle", scope, activity=_index())
+        assert [r.hit.session.session_id for r in report.results] == ["chat-1"]
+        assert report.results[0].location.project == "proj"
+
+    def test_no_scratch_dir_no_extra(self, repo: Path) -> None:
+        scope = resolve_scope(project=None, all_projects=False, cwd=repo)
+        assert scope.extra_dirs == ()
+
     def test_finds_hits_in_root_and_worktrees(
         self, tmp_path: Path, repo: Path, worktree: Path
     ) -> None:

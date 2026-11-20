@@ -116,6 +116,7 @@ src/fujimoto/
 ├── config_command.py  # `fujimoto config` list/get/set/unset (UI-free) + key registry
 ├── yaml_edit.py       # change one top-level YAML key, keeping every other line
 ├── session_state.py   # which sessions the user still considers open
+├── chats.py           # one metadata file per chat, kept after Terminate (~/.cache/fujimoto/chats/)
 ├── debug.py      # --debug / --debug-redacted diagnostic logging + redaction
 ├── project_config.py  # optional per-project .fujimoto.yaml (copy/link/init worktree setup, claude_args)
 ├── launch_options.py  # extra claude CLI args per session (resolve / save / replay)
@@ -176,11 +177,14 @@ the session ended.
 | open | stopped | `RECOVERED` | 🔄 | **recovered** (above sessions) |
 | open | stopped | `PARKED` | 🅿️ | sessions |
 | open | stopped | `STOPPED` | 🟠 | sessions |
-| closed / no record | stopped | — | ⚫ | inactive worktrees |
+| closed / no record | stopped | — | ⚫ | **previous sessions** (worktrees, closed chats, unclaimed root conversations) |
 
 Within the *sessions* section rows are ordered running, parked, then stopped.
-Inside each of those groups — and inside *recovered* and *inactive worktrees* —
-rows are **newest-created first** (see "Every group reads newest-first" below).
+Inside each of those groups — and inside *recovered* — rows are
+**newest-created first** (see "Every group reads newest-first" below).
+*Previous sessions* is ordered by **last use** instead (newest transcript
+activity, else creation/close time), since it mixes three kinds of row and
+"what did I touch last" is the question it answers.
 
 **Every deliberate end writes a `stop_kind`, and that is the entire recovery
 mechanism.** Stop and Park both call `mark_stopped`, which stamps
@@ -259,6 +263,30 @@ row on the home screen without buying the user anything.
   enforced — that work which changes files needs the user to choose where it
   happens first. A resumed chat gets the whole prompt again (`_start_launch`),
   since an appended system prompt does not survive into a new process.
+- **A terminated chat is remembered by its own file, not by `sessions.json`.**
+  `chats.py` keeps one `~/.cache/fujimoto/chats/<project>/<slug>.json` per
+  chat (`ChatMeta`: name, project, cwd, conversation id, parent, created,
+  closed), written by `record_open` in `_start_launch` on every chat launch
+  and stamped by `mark_closed` on Terminate (`_close_chat`) — unless the chat
+  never got a message (no transcript for its id), in which case it is
+  forgotten. "Open" is still only "has a `sessions.json` record"; a previous
+  chat is a chat file with no record and no tmux session
+  (`_previous_chats`), exactly as an inactive worktree is a directory with
+  neither. One file per chat, written temp-then-`os.replace`, so two processes
+  acting on different chats never write the same file (the whole-file
+  read-modify-write of `sessions.json` can lose updates; a lock there is a
+  separate fix). `_init_git_info` loads them (`chats.prune` drops ones whose
+  cwd is gone) into `_chat_metas`. A previous chat's menu: Resume chat, New
+  conversation, View session log, **Remove from list** (`sa-remove-chat` →
+  `_forget_chat`: deletes the file, and the scratch sub-directory only if
+  empty, notifying where kept files are). No Rename (no tmux session). Its
+  name stays taken (`_taken_session_names`). A conversation a chat — or a
+  stopped session — owns resumes as that session from anywhere:
+  `_conversation_owner` in the TUI's `_resume_target` (search hits,
+  conversation rows, pickers) and `_record_owning` (+
+  `chats.find_by_conversation`) for `fujimoto resume`. The chats' scratch
+  directory is in the transcript search scope: `_chat_dirs()` for the TUI's
+  `s`, `Scope.extra_dirs` for `fujimoto search`.
 - **Temp chats share one scratch directory per project, not a fresh
   `mkdtemp`.** Claude Code asks to trust every new directory outside a trusted
   repo (worktrees inherit the main clone's trust; a temp dir has none), there
@@ -725,7 +753,7 @@ responsible for running it off the event loop.
   the rebuild (appending rows moves the highlight) and re-applied after; the
   `/` filter is preserved because `_refresh_home_list` re-applies
   `_search_query`. Guarded on `_on_home`, so `r` is inert in other views.
-- Home screen sections: actions ("New worktree session", "New project-root session (⎇ <root branch>)" — `_root_branch`, the main clone's branch, not the cwd's, "New chat"), recovered 🔄 (only when there are any — see Session Status), sessions — running 🟢, parked 🅿️ and stopped 🟠 together, since the icon carries the distinction (with Claude state indicators on the running ones), inactive worktrees, previous Claude sessions (resumable, capped at 5), switch project
+- Home screen sections: actions ("New worktree session", "New project-root session (⎇ <root branch>)" — `_root_branch`, the main clone's branch, not the cwd's, "New chat"), recovered 🔄 (only when there are any — see Session Status), sessions — running 🟢, parked 🅿️ and stopped 🟠 together, since the icon carries the distinction (with Claude state indicators on the running ones), previous sessions (⚫ inactive worktrees, closed chats and up to 5 project-root conversations no row claims — one section, most recently used first, built in one pass of `_build_home_items` with `_last_used`), switch project
 - Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
 - Session actions submenu (in order): for active sessions, Connect → Fork session → Resume previous session; for inactive worktrees, Resume previous session → Fork session → Launch (resume is the more common action when picking an idle worktree). Then: View session log (whenever the path has a previous Claude session), Open terminal, Open in VS Code, Rename, Park session and Stop session (active only), Terminate session (active or stopped), Finish (worktree only), Cancel. Park, Stop and Terminate are separate menu items rather than one item plus a prompt — a menu is already a choice — but all route into the single `_end_session(session, terminate=..., park=...)` handler, which is also what the `Ctrl-A x` prompt calls. Claude-session items show just "Resume" + View session log + Open terminal/VS Code + Launch options + Cancel. "Launch options" sits after Rename for every session that has somewhere to save them (see the launch-options design decision). "Fork session" is always inserted at index 1 (`items.insert(1, ...)`) so its position holds across both layouts.
 - "Resume previous session" auto-launches the sole candidate when only one previous Claude session exists for the path, skipping the picker. Two or more sessions still show the picker.
@@ -933,7 +961,7 @@ Three custom exception types, all caught in `main()`:
   pre-upgrade row to the bottom of its group. Both correct themselves the first
   time the session is relaunched, since `mark_open` stamps `created`.
   The groups themselves are untouched: recovered, then running, parked and
-  stopped, then inactive worktrees. Within the *running*
+  stopped, then previous sessions (ordered by last use — see Session Status). Within the *running*
   group, direct and worktree rows interleave by creation rather than being
   listed kind-by-kind — both are just running.
   **The stats live in `_init_git_info`, not in the render path** (see "Nothing

@@ -60,6 +60,7 @@ from fujimoto.claude.search import (
 )
 from fujimoto.config import (
     ConfigError,
+    get_chat_scratch_dir,
     get_git_projects_root,
     get_project_worktrees_dir,
 )
@@ -156,6 +157,9 @@ class Scope:
     project: str | None = None
     root: Path | None = None
     worktrees: tuple[Path, ...] = ()
+    # Other directories whose transcripts belong to the project: its chats'
+    # shared scratch directory. Searched, but not worktrees.
+    extra_dirs: tuple[Path, ...] = ()
 
     def describe(self) -> str:
         return "all projects" if self.all_projects else f"project {self.project}"
@@ -186,16 +190,20 @@ def _project_scope(root: Path) -> Scope:
         worktree = base / cwd.relative_to(base).parts[0]
         if not worktree.is_dir():
             deleted.add(directory / worktree.name)
+    scratch = get_chat_scratch_dir(root.name, create=False)
+    extra = (scratch,) if scratch.is_dir() else ()
     debug.log(
         "query.worktrees",
         existing=len(existing),
         deleted=len(deleted),
+        chat_scratch=bool(extra),
     )
     return Scope(
         all_projects=False,
         project=root.name,
         root=root,
         worktrees=tuple(sorted(existing | deleted)),
+        extra_dirs=extra,
     )
 
 
@@ -613,7 +621,9 @@ def run_search(
     if scope.all_projects:
         logs = claude_search.list_all_session_logs()
     else:
-        logs = claude_search.list_session_logs(scope.root, scope.worktrees)
+        logs = claude_search.list_session_logs(
+            scope.root, (*scope.worktrees, *scope.extra_dirs)
+        )
 
     hits: list[SearchHit] = []
     excluded = False
