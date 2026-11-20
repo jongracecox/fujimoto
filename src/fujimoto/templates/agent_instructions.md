@@ -126,14 +126,14 @@ fujimoto config set claude_args --project -- --verbose  # a value starting with 
 ```sh
 fujimoto chat --detach --parent <your peer name> --prompt "..."
 fujimoto chat auth-question --in fix-login --detach ...   # inside a worktree
-fujimoto chat --in-temp --detach ...                       # outside the repo
+fujimoto chat --in-scratch --detach ...                    # outside the repo
 fujimoto chat --project other-repo --detach ...            # about another repo
 ```
 
 Starts a session for talking, not working: no worktree, no branch. By default
 it runs in the project root (the main clone), so it can read the code and the
 project's CLAUDE.md. `--in` puts it in a worktree (a unique part of the name
-is enough), `--in-temp` in a scratch directory. The title is optional
+is enough), `--in-scratch` in the project's scratch directory outside the repo. The title is optional
 (`chat-1`, `chat-2`, … without one). It is told it is a chat, and to have the
 user choose where any real work should happen.
 
@@ -141,7 +141,7 @@ The JSON gives `peer_name` (where to `SendMessage`; `<project>-<chat name>`
 unless `-- --name` sets one), `claude_session_id` and `stop_command`. It
 shows on the fujimoto home screen as `💬`. `stop` it when the conversation is
 over; there is no worktree to clean up. A chat's transcript is covered by
-`search` (temp chats included), and `fujimoto resume <id>` brings a stopped or
+`search` (scratch chats included), and `fujimoto resume <id>` brings a stopped or
 finished chat back as itself, at the same peer name.
 
 ## When to use them

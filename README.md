@@ -204,7 +204,7 @@ Notes:
   to the main repo and worktree paths. On failure you're prompted to acknowledge
   the error before the screen is handed to the session.
 - **`claude_args`** applies to worktree, project-root and chat sessions alike
-  (a chat in a temp directory is outside the repo, so it doesn't see them). See [Launch options](#launch-options) for how it
+  (a chat in the scratch directory is outside the repo, so it doesn't see them). See [Launch options](#launch-options) for how it
   interacts with options saved per session.
 - fujimoto itself never creates a `.venv` — that's `uv` (or your tooling)
   running inside the worktree. Use an `init: [uv sync]` entry to set one up.
@@ -387,13 +387,13 @@ fujimoto new fix-flaky-test --prompt "…" \
 ### Starting a chat from the command line
 
 ```sh
-fujimoto chat [TITLE] [--in WORKTREE | --in-temp] [--project NAME|PATH] \
+fujimoto chat [TITLE] [--in WORKTREE | --in-scratch] [--project NAME|PATH] \
   [--prompt TEXT] [--parent NAME] [--detach] [-- claude args…]
 ```
 
 `fujimoto chat` starts a chat session — for questions and conversation rather
 than work — without creating a worktree. It runs in the project root unless
-`--in` names a worktree (any unique part of its name) or `--in-temp` asks for
+`--in` names a worktree (any unique part of its name) or `--in-scratch` asks for
 a scratch directory outside the repo (see below). Without a title it is named `chat-1`,
 `chat-2`, …. `--project` picks another repo (a path, or a name under
 `$FUJIMOTO_GIT_ROOT`); with `--detach` that works from anywhere, inside a repo
@@ -404,13 +404,15 @@ or not.
 unless `-- --name` sets one — so the session that started it can
 `SendMessage` it straight away. Stop it with `fujimoto stop <tmux session>`.
 
-**Temp chats and folder trust.** Temp chats run in one scratch directory per
+**Scratch chats and folder trust.** Scratch chats run in one directory per
 project, `~/.fujimoto/chats/<project>/`, and each keeps any files it writes in
 its own sub-directory (`…/<project>/<chat name>/`) — its system prompt says
 so. Claude Code asks you to trust a folder the first time it starts outside a
 trusted repository, and there is no command to pre-trust one, so the *first*
-temp chat for a project stops at that prompt. Accept it once and later temp
-chats start straight away. With `--detach` nobody is there to answer, so the
+scratch chat for a project stops at that prompt. Accept it once and later
+scratch chats start straight away. (`--in-scratch` was called `--in-temp`
+while this was a fresh temporary directory each time; the old name still
+works.) With `--detach` nobody is there to answer, so the
 JSON reports `"needs_trust": true` (read from Claude Code's `~/.claude.json`;
 fujimoto never writes it) and stderr says which session to attach to.
 
@@ -617,7 +619,7 @@ it stops for a permission prompt, it waits until someone attaches.
 🟢 fix-login                    (project-root ⎇ main)
 🟢 auth-question                (💬 project-root)
 🅿️ 20260305-spike-caching       (worktree)
-🅿️ chat-1                       (💬 temp)
+🅿️ chat-1                       (💬 scratch)
 🟠 20260307-parser-rewrite      (worktree)
 🟠 session-1                    (project-root ⎇ main)
 ───── previous sessions ─────
@@ -650,7 +652,7 @@ terminated chats, and up to five project-root conversations that no other row
 claims (shown by id). Terminating a chat moves it here rather than forgetting
 it — unless it never received a message, since there is nothing to resume —
 and it stays until you choose **Remove from list** (its transcript is kept;
-a temp chat's sub-directory is deleted only if it is empty).
+a scratch chat's sub-directory is deleted only if it is empty).
 
 The rule is simply that fujimoto is the only thing that changes a session's
 status, and it only changes it when *you* do. Terminating a session through
@@ -767,7 +769,7 @@ every time.
 
 **Project-root sessions** launch Claude in the project root (your main clone) on whatever branch it has checked out — the action shows that branch, e.g. `+ New project-root session (⎇ main)`. Quick and lightweight — no worktree overhead. Give it a title (optional, e.g. `fix-unit-tests`); left blank it is named `session-1`, `session-2`, …, and a title that is already in use gets `-2`. If you want a session on `main`, check out `main` in the clone first: fujimoto deliberately runs where your checkout is rather than switching branches for you. A row shows the directory it is actually running in, which is usually the project root but need not be — resuming an old conversation can leave one in a worktree. Sessions created by older versions as `direct-N` still appear and work as before.
 
-**Chat sessions** (`+ New chat`, or `fujimoto chat`) are for questions and conversation rather than work. Give it a title (optional; `chat-1`, `chat-2`, … without one), then choose where it runs: **project-root** first, then **temp** (the project's shared scratch directory outside the repo, `~/.fujimoto/chats/<project>/`, where each chat gets its own sub-directory for files — the first one asks you to trust the folder), then your worktrees, most recently used first. On that list `/` filters the worktrees by name and `s` by what their sessions said, so "the worktree where we talked about the flaky test" is a few keystrokes away. A chat row shows `💬` and where it runs — `(💬 project-root)`, `(💬 temp)` or `(💬 <worktree>)` — and belongs to the project you started it from, so it stays on the home screen and comes back after a restart like any other session. Its system prompt says it is a chat, and that if work comes up the user should decide where it happens (a new worktree, say) before anything changes. A chat in a worktree doesn't re-run the project's `.fujimoto.yaml` setup there, and keeps launch options of its own. Chats replace the old ad hoc sessions.
+**Chat sessions** (`+ New chat`, or `fujimoto chat`) are for questions and conversation rather than work. Give it a title (optional; `chat-1`, `chat-2`, … without one), then choose where it runs: **project-root** first, then **scratch** (the project's shared directory outside the repo, `~/.fujimoto/chats/<project>/`, where each chat gets its own sub-directory for files — the first one asks you to trust the folder), then your worktrees, most recently used first. On that list `/` filters the worktrees by name and `s` by what their sessions said, so "the worktree where we talked about the flaky test" is a few keystrokes away. A chat row shows `💬` and where it runs — `(💬 project-root)`, `(💬 scratch)` or `(💬 <worktree>)` — and belongs to the project you started it from, so it stays on the home screen and comes back after a restart like any other session. Its system prompt says it is a chat, and that if work comes up the user should decide where it happens (a new worktree, say) before anything changes. A chat in a worktree doesn't re-run the project's `.fujimoto.yaml` setup there, and keeps launch options of its own. Chats replace the old ad hoc sessions.
 
 ### Session Actions
 

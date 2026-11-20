@@ -320,9 +320,9 @@ DEFAULT_CHAT_TITLE = "chat"
 
 
 def get_chat_scratch_dir(project_name: str, *, create: bool = True) -> Path:
-    """Where a project's "temp" chats run: `~/.fujimoto/chats/<project>/`.
+    """Where a project's scratch chats run: `~/.fujimoto/chats/<project>/`.
 
-    One directory per project, shared by all its temp chats, rather than a
+    One directory per project, shared by all its scratch chats, rather than a
     fresh `mkdtemp` each time: Claude Code asks to trust every new directory
     outside a trusted repo, and a chat started with `--detach` would sit at
     that prompt with nobody to answer it. Trusted once, this never asks again.
@@ -336,7 +336,7 @@ def get_chat_scratch_dir(project_name: str, *, create: bool = True) -> Path:
 
 
 def chat_files_dir(scratch_dir: Path, tmux_name: str) -> Path:
-    """A temp chat's own sub-directory of the shared scratch directory.
+    """A scratch chat's own sub-directory of the shared scratch directory.
 
     >>> chat_files_dir(Path("/s"), "proj/auth-question")
     PosixPath('/s/auth-question')

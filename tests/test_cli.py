@@ -2744,7 +2744,7 @@ class TestNewChat:
             app = SessionApp()
             async with app.run_test() as pilot:
                 await self._open_locations(app, pilot)
-                assert self._location_ids(app)[:2] == ["cl-root", "cl-temp"]
+                assert self._location_ids(app)[:2] == ["cl-root", "cl-scratch"]
                 await pilot.press("enter")  # project-root is first
                 await pilot.pause()
                 target = app._launch_target
@@ -2755,7 +2755,7 @@ class TestNewChat:
                 assert target.session_id is not None
 
     @pytest.mark.asyncio
-    async def test_titled_chat_in_temp(self) -> None:
+    async def test_titled_chat_in_scratch(self) -> None:
         with _patch_git_info(sessions=["test-proj/chat-1"]):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -2817,7 +2817,7 @@ class TestNewChat:
                 shown = [app._chat_locations.get(i) for i in self._location_ids(app)]
                 assert a in shown and b not in shown
                 # root and temp are always offered
-                assert self._location_ids(app)[:2] == ["cl-root", "cl-temp"]
+                assert self._location_ids(app)[:2] == ["cl-root", "cl-scratch"]
                 await pilot.press("escape")
                 await pilot.pause()
                 assert app._chat_filter_query == ""
@@ -2996,11 +2996,11 @@ class TestChatRows:
             async with app.run_test() as pilot:
                 text = _list_text(app)
                 assert f"({ICON_CHAT} 20260101-x)" in text
-                assert f"({ICON_CHAT} temp)" in text
+                assert f"({ICON_CHAT} scratch)" in text
                 # The worktree itself is still an inactive worktree row.
                 assert "wt-20260101-x" in app._session_map
                 await pilot.press("slash")
-                await pilot.press(*"temp")
+                await pilot.press(*"scratch")
                 await pilot.pause()
                 assert list(app._session_map) == ["ch-test-proj--scratch"]
 
@@ -11334,14 +11334,14 @@ class TestChatCommand:
         assert code == 1
         assert "no worktree matches 'zzz'" in err
 
-    def test_in_temp(self, monkeypatch, capsys) -> None:
+    def test_in_scratch(self, monkeypatch, capsys) -> None:
         with patch("fujimoto.cli.trust.is_trusted", return_value=True):
             code, out, err = self._main(
-                monkeypatch, capsys, "chat", "ask", "--in-temp", "--detach"
+                monkeypatch, capsys, "chat", "ask", "--in-scratch", "--detach"
             )
         assert code == 0
         result = json.loads(out)
-        assert result["location"] == "temp"
+        assert result["location"] == "scratch"
         assert result["needs_trust"] is False
         scratch = Path(result["working_dir"])
         assert scratch.parts[-2:] == ("chats", "proj")
@@ -11354,7 +11354,7 @@ class TestChatCommand:
     def test_untrusted_scratch_dir_is_reported(self, monkeypatch, capsys) -> None:
         with patch("fujimoto.cli.trust.is_trusted", return_value=False):
             code, out, err = self._main(
-                monkeypatch, capsys, "chat", "--in-temp", "--detach"
+                monkeypatch, capsys, "chat", "--in-scratch", "--detach"
             )
         assert code == 0
         assert json.loads(out)["needs_trust"] is True
@@ -11364,7 +11364,7 @@ class TestChatCommand:
     def test_unknown_trust_is_not_reported(self, monkeypatch, capsys) -> None:
         with patch("fujimoto.cli.trust.is_trusted", return_value=None):
             code, out, _ = self._main(
-                monkeypatch, capsys, "chat", "--in-temp", "--detach"
+                monkeypatch, capsys, "chat", "--in-scratch", "--detach"
             )
         assert json.loads(out)["needs_trust"] is False
 
@@ -11373,11 +11373,26 @@ class TestChatCommand:
             self._main(monkeypatch, capsys, "chat", "--detach")
         is_trusted.assert_not_called()
 
-    def test_in_and_in_temp_are_exclusive(self, monkeypatch, capsys) -> None:
-        code, _, _ = self._main(
-            monkeypatch, capsys, "chat", "--in", "alpha", "--in-temp", "--detach"
-        )
-        assert code == 2
+    def test_in_and_in_scratch_are_exclusive(self, monkeypatch, capsys) -> None:
+        for flag in ("--in-scratch", "--in-temp"):
+            code, _, _ = self._main(
+                monkeypatch, capsys, "chat", "--in", "alpha", flag, "--detach"
+            )
+            assert code == 2
+
+    def test_in_temp_still_works_but_is_not_advertised(
+        self, monkeypatch, capsys
+    ) -> None:
+        """`--in-temp` was the flag's first name; agents may still use it."""
+        with patch("fujimoto.cli.trust.is_trusted", return_value=True):
+            code, out, _ = self._main(
+                monkeypatch, capsys, "chat", "--in-temp", "--detach"
+            )
+        assert code == 0
+        assert json.loads(out)["location"] == "scratch"
+        code, out, _ = self._main(monkeypatch, capsys, "chat", "--help")
+        assert "--in-scratch" in out
+        assert "--in-temp" not in out
 
     def test_name_from_launch_options_is_kept(self, monkeypatch, capsys) -> None:
         code, out, _ = self._main(
@@ -11432,7 +11447,7 @@ class TestChatCommand:
     def test_attached_chat_returns_a_target(self) -> None:
         args = SimpleNamespace(
             project=None,
-            in_temp=False,
+            in_scratch=False,
             in_worktree=None,
             title="q",
             prompt=None,
