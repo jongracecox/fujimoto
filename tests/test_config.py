@@ -12,11 +12,11 @@ from fujimoto.config import (
     config_once_applied,
     get_git_projects_root,
     get_next_adhoc_session_name,
-    get_next_direct_session_name,
     get_project_worktrees_dir,
     get_worktree_root,
     list_projects,
     mark_config_once_applied,
+    next_session_name,
     read_session_meta,
     slugify,
     store_session_meta,
@@ -122,8 +122,8 @@ class TestBuildWorktreePath:
             patch("fujimoto.config.date") as mock_date,
         ):
             mock_date.today.return_value.strftime.return_value = "20260101"
-            result = build_worktree_path("qsic-data", "test")
-            assert result.parent.name == "qsic-data"
+            result = build_worktree_path("my-app", "test")
+            assert result.parent.name == "my-app"
             assert result.name == "20260101-test"
 
 
@@ -333,20 +333,37 @@ class TestConfigOnceMarker:
         assert data["source_root"] == "/main/repo"
 
 
-class TestGetNextDirectSessionName:
-    def test_returns_direct_1_when_no_sessions(self) -> None:
-        result = get_next_direct_session_name("proj", set())
-        assert result == "proj/direct-1"
+class TestNextSessionName:
+    def test_titled(self) -> None:
+        assert next_session_name("proj", "My Task", set(), fallback="x") == (
+            "proj/my-task"
+        )
 
-    def test_increments_past_existing(self) -> None:
-        sessions = {"proj/direct-1", "proj/direct-2"}
-        result = get_next_direct_session_name("proj", sessions)
-        assert result == "proj/direct-3"
+    def test_titled_collision_is_numbered_from_2(self) -> None:
+        taken = {"proj/my-task", "proj/my-task-2"}
+        assert next_session_name("proj", "my task", taken, fallback="x") == (
+            "proj/my-task-3"
+        )
 
-    def test_fills_gaps(self) -> None:
-        sessions = {"proj/direct-2"}
-        result = get_next_direct_session_name("proj", sessions)
-        assert result == "proj/direct-1"
+    def test_blank_uses_fallback_from_1(self) -> None:
+        assert next_session_name("proj", "", set(), fallback="session") == (
+            "proj/session-1"
+        )
+
+    def test_blank_fills_gaps(self) -> None:
+        taken = {"proj/session-2"}
+        assert next_session_name("proj", "  ", taken, fallback="session") == (
+            "proj/session-1"
+        )
+
+    def test_unsluggable_title_counts_as_blank(self) -> None:
+        taken = {"proj/chat-1"}
+        assert next_session_name("proj", "?!", taken, fallback="chat") == (
+            "proj/chat-2"
+        )
+
+    def test_other_projects_do_not_collide(self) -> None:
+        assert next_session_name("a", "x", {"b/x"}, fallback="s") == "a/x"
 
 
 class TestGetNextAdhocSessionName:

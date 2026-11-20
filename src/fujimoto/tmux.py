@@ -145,8 +145,8 @@ def list_project_sessions(project_name: str) -> list[str]:
 def session_name(project_name: str, worktree_dir_name: str) -> str:
     """Build a tmux session name from project and worktree directory.
 
-    >>> session_name("qsic-data", "20260309-fix-tests")
-    'qsic-data/20260309-fix-tests'
+    >>> session_name("my-app", "20260309-fix-tests")
+    'my-app/20260309-fix-tests'
     """
     return f"{project_name}/{worktree_dir_name}"
 
