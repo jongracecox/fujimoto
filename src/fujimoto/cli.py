@@ -65,10 +65,11 @@ from fujimoto.config import (
     build_worktree_path,
     config_once_applied,
     get_next_adhoc_session_name,
-    get_next_direct_session_name,
+    DEFAULT_SESSION_TITLE,
     get_project_worktrees_dir,
     list_projects,
     mark_config_once_applied,
+    next_session_name,
     read_parent_session,
     read_session_meta,
     slugify,
@@ -148,6 +149,9 @@ ICON_BLACK_CIRCLE = "\u26ab"
 ICON_HLINE = "\u2500"
 ICON_WIZARD = "\U0001f9d9\U0001f3fd\u200d\u2642\ufe0f"
 ICON_FORK = "\U0001f374"
+# How a session running in the project root (the main clone) is labelled.
+# Deliberately not the branch: whatever the clone has checked out can change.
+ROOT_LOCATION = "project-root"
 
 
 _KEY_PREFIX_LABELS = {"C-": "Ctrl+", "M-": "Alt+", "S-": "Shift+"}
@@ -601,28 +605,51 @@ def _is_fork_worktree(worktree: Path) -> bool:
     return bool(read_session_meta(worktree).get("forked_from_session_id"))
 
 
+class ClaudeData(NamedTuple):
+    """Transcript data for a project's root and worktrees."""
+
+    path_to_latest: dict[str, ClaudeSession]
+    root_sessions: list[ClaudeSession]
+    # Every parsed transcript, by session id — so a row whose conversation is
+    # known can find it even when it is not its directory's latest.
+    by_id: dict[str, ClaudeSession]
+
+
 def _get_claude_sessions(
     project_root: Path | None,
     worktrees: list[Path],
-) -> tuple[dict[str, ClaudeSession], list[ClaudeSession]]:
-    """Fetch Claude sessions for the project root and worktree paths.
-
-    Returns (path_to_latest_session, project_root_sessions).
-    """
+) -> ClaudeData:
+    """Fetch Claude sessions for the project root and worktree paths."""
     path_to_latest: dict[str, ClaudeSession] = {}
     root_sessions: list[ClaudeSession] = []
+    by_id: dict[str, ClaudeSession] = {}
 
     if project_root is not None:
         root_sessions = get_sessions_for_path(project_root)
         if root_sessions:
             path_to_latest[str(project_root)] = root_sessions[0]
+        by_id.update((cs.session_id, cs) for cs in root_sessions)
 
     for wt in worktrees:
         wt_sessions = get_sessions_for_path(wt)
         if wt_sessions:
             path_to_latest[str(wt)] = wt_sessions[0]
+        by_id.update((cs.session_id, cs) for cs in wt_sessions)
 
-    return path_to_latest, root_sessions
+    return ClaudeData(path_to_latest, root_sessions, by_id)
+
+
+def _live_claude_ids() -> dict[str, str]:
+    """Which conversation each tmux session's claude is writing right now.
+
+    From Claude Code's own registry of running processes, which follows a
+    `/clear` (a new session id) where a recorded id would not.
+    """
+    return {
+        entry.tmux_session: entry.session_id
+        for entry in live.list_live_sessions()
+        if entry.tmux_session
+    }
 
 
 CSS = """\
@@ -1470,6 +1497,9 @@ class SessionApp(App):
         self._project_cwd: Path | None = None
         self._project_name: str = ""
         self._current_branch: str = ""
+        # What the project root (the main clone) has checked out — not the
+        # cwd's branch, which differs when fujimoto runs from a worktree.
+        self._root_branch: str = ""
         self._default_branch: str = ""
         self._active_sessions: set[str] = set()
         self._title_value: str = ""
@@ -1494,7 +1524,9 @@ class SessionApp(App):
         self._finish_action: str = ""
         self._branch_picker_names: dict[str, str] = {}
         self._poll_timer: object | None = None
-        self._claude_state_snapshot: dict[str, tuple[str, SessionState]] = {}
+        # tmux session → the conversation its claude is writing, from Claude
+        # Code's live registry; refreshed alongside `_claude_cache`.
+        self._live_claude_ids: dict[str, str] = {}
         self._resume_sessions: list[ClaudeSession] = []
         self._log_sessions: list[ClaudeSession] = []
         # Fork state. `_fork_source` being set is what turns the shared create
@@ -1513,9 +1545,7 @@ class SessionApp(App):
         self._search_query: str = ""
         # Parsed Claude transcript data for the home screen, memoized so a `/`
         # keystroke re-filters rows instead of re-reading every JSONL log.
-        self._claude_cache: (
-            tuple[dict[str, ClaudeSession], list[ClaudeSession]] | None
-        ) = None
+        self._claude_cache: ClaudeData | None = None
         # `.fujimoto/meta.json` is read once per worktree per app run rather
         # than once per rendered row.
         self._fork_marker_cache: dict[Path, bool] = {}
@@ -1637,8 +1667,10 @@ class SessionApp(App):
     def _init_git_info(self) -> None:
         cwd = self._project_cwd
         self._project_name = get_project_name(cwd)
-        self._project_root = get_project_root(cwd)
+        root = get_project_root(cwd)
+        self._project_root = root
         self._current_branch = get_current_branch(cwd)
+        self._root_branch = _session_branch(root)
         self._default_branch = get_default_branch(cwd)
         self._active_sessions = set(list_project_sessions(self._project_name))
         self._open_sessions = session_state.prune()
@@ -1655,6 +1687,7 @@ class SessionApp(App):
             project=debug.rv(self._project_name),
             root=debug.rp(self._project_root),
             current_branch=debug.rref(self._current_branch),
+            root_branch=debug.rref(self._root_branch),
             default_branch=debug.rref(self._default_branch),
             active_sessions=len(self._active_sessions),
             projects=len(self._available_projects),
@@ -1984,7 +2017,7 @@ class SessionApp(App):
 
     def _claude_session_data(
         self,
-    ) -> tuple[dict[str, ClaudeSession], list[ClaudeSession]]:
+    ) -> ClaudeData:
         """Claude transcript data for the current project, parsed at most once.
 
         Parsing every log under `~/.claude/projects` costs real time per file,
@@ -1998,7 +2031,41 @@ class SessionApp(App):
             self._claude_cache = _get_claude_sessions(
                 self._project_root, self._existing_worktrees
             )
+            self._live_claude_ids = _live_claude_ids()
         return self._claude_cache
+
+    def _claude_for(
+        self, tmux_name: str, path: Path, record_id: str | None = None
+    ) -> ClaudeSession | None:
+        """The conversation behind a home row, for its state and resume id.
+
+        Keyed by directory alone, two sessions in one directory — two root
+        sessions, or a chat beside a worktree's own session — would both show
+        whichever transcript was written last. So prefer, in order: what
+        Claude Code's registry says this tmux session's claude is writing, the
+        id fujimoto recorded at launch, and only then the directory's latest.
+        """
+        data = self._claude_session_data()
+        via = "path"
+        cs: ClaudeSession | None = None
+        for source, sid in (
+            ("registry", self._live_claude_ids.get(tmux_name)),
+            ("record", record_id),
+        ):
+            if sid and (found := data.by_id.get(sid)) is not None:
+                via, cs = source, found
+                break
+        if cs is None:
+            cs = data.path_to_latest.get(str(path))
+            via = "path" if cs is not None else "none"
+        debug.log_once(
+            f"claude-for-{tmux_name}",
+            "tui.claude_for",
+            session=debug.rv(tmux_name),
+            via=via,
+            claude_session=cs.session_id if cs else "none",
+        )
+        return cs
 
     def _matching_worktree(self, path: Path) -> Path | None:
         """The project worktree `path` refers to, if it is one.
@@ -2071,11 +2138,11 @@ class SessionApp(App):
 
         The name has to follow the *directory*, not the row the resume started
         from. A transcript reached through search carries the worktree it ran
-        in, and naming that session `direct-N` cut it loose from that worktree:
+        in, and naming that session `session-N` cut it loose from that worktree:
         the home screen rendered it against the repo root, the worktree still
         looked idle, and resuming it a second time started another claude on
         the same transcript. So prefer the worktree's own tmux name, and fall
-        back to `direct-N` only when that name is genuinely occupied.
+        back to a root-session name only when that name is genuinely occupied.
 
         `session` is the row the resume was started from; a worktree row names
         its own worktree even if the transcript recorded a directory that is no
@@ -2095,7 +2162,9 @@ class SessionApp(App):
                     cwd=debug.rp(cwd),
                 )
                 return name, "worktree"
-        name = get_next_direct_session_name(project, self._active_sessions)
+        name = next_session_name(
+            project, "", self._taken_session_names(), fallback=DEFAULT_SESSION_TITLE
+        )
         debug.log(
             "tui.resume_target",
             via="direct",
@@ -2127,17 +2196,14 @@ class SessionApp(App):
     def _build_home_items(self) -> list[ListItem]:
         """Build the home screen rows, honouring the current search query.
 
-        Also (re)populates `_session_map` and `_claude_state_snapshot`, so it is
+        Also (re)populates `_session_map`, so it is
         the single place that decides which sessions are on screen — the live
         state poller then only touches rows that survived the filter.
         """
         searching = bool(self._search_query.strip())
 
         # Fetch Claude session data for state indicators
-        path_to_latest, root_claude_sessions = self._claude_session_data()
-        self._claude_state_snapshot = {
-            k: (v.session_id, v.state) for k, v in path_to_latest.items()
-        }
+        path_to_latest, root_claude_sessions, _ = self._claude_session_data()
         claimed_claude_ids: set[str] = set()
 
         idle_records = self._idle_records()
@@ -2151,8 +2217,10 @@ class SessionApp(App):
                 ),
                 ListItem(
                     Label(
-                        f"[bold]+ New session in {self._project_name}[/]",
-                        markup=True,
+                        Content.assemble(
+                            ("+ New project-root session", "bold"),
+                            (f"  ({BRANCH_ICON} {self._root_branch})", "dim"),
+                        )
                     ),
                     id="action-direct",
                 ),
@@ -2194,11 +2262,13 @@ class SessionApp(App):
             display_name = sname.split("/", 1)[1] if "/" in sname else sname
             path, branch = self._direct_session_cwd(sname)
             if not self._search_matches(
-                display_name, sname, self._project_name, branch
+                display_name, sname, self._project_name, branch, ROOT_LOCATION
             ):
                 continue
-            cs = path_to_latest.get(str(path))
-            cs_id = cs.session_id if cs else None
+            record = self._open_sessions.get(sname)
+            record_id = record.claude_session_id if record else None
+            cs = self._claude_for(sname, path, record_id)
+            cs_id = cs.session_id if cs else record_id
             cs_state = cs.state if cs else None
             if cs_id:
                 claimed_claude_ids.add(cs_id)
@@ -2233,8 +2303,10 @@ class SessionApp(App):
             branch = f"worktree/{wt.name}"
             if not self._search_matches(wt.name, branch, sname):
                 continue
-            cs = path_to_latest.get(str(wt))
-            cs_id = cs.session_id if cs else None
+            record = self._open_sessions.get(sname)
+            record_id = record.claude_session_id if record else None
+            cs = self._claude_for(sname, wt, record_id)
+            cs_id = cs.session_id if cs else record_id
             cs_state = cs.state if cs else None
             if cs_id:
                 claimed_claude_ids.add(cs_id)
@@ -2291,7 +2363,7 @@ class SessionApp(App):
                 if is_worktree
                 else f"ds-{sname.replace('/', '--')}"
             )
-            cs = path_to_latest.get(str(rec.path))
+            cs = self._claude_for(sname, rec.path, rec.claude_session_id)
             cs_id = cs.session_id if cs else rec.claude_session_id
             if cs_id:
                 claimed_claude_ids.add(cs_id)
@@ -3025,28 +3097,30 @@ class SessionApp(App):
         self._claude_cache = _get_claude_sessions(
             self._project_root, self._existing_worktrees
         )
-        new_path_to_latest, _ = self._claude_cache
-        new_snapshot = {
-            k: (v.session_id, v.state) for k, v in new_path_to_latest.items()
-        }
-        if new_snapshot == self._claude_state_snapshot:
-            return
-
-        self._claude_state_snapshot = new_snapshot
+        self._live_claude_ids = _live_claude_ids()
 
         # Update labels in-place for sessions with changed Claude state
         for item_id, session in self._session_map.items():
             if session.session_type == "claude":
                 continue  # Previous sessions don't need live updates
-            # The row's own path, which for a direct session is where tmux
-            # says it runs — not an assumed project root.
-            new_cs = new_path_to_latest.get(str(session.path))
+            # The row's own conversation where it is known (see
+            # `_claude_for`), else its directory's latest — for a direct
+            # session, where tmux says it runs, not an assumed project root.
+            record = self._open_sessions.get(session.tmux_session)
+            new_cs = self._claude_for(
+                session.tmux_session,
+                session.path,
+                record.claude_session_id if record else None,
+            )
             new_state = new_cs.state if new_cs else None
-            if new_state == session.claude_state:
+            new_id = new_cs.session_id if new_cs else None
+            if new_id is None and record is not None:
+                new_id = record.claude_session_id
+            if (new_id, new_state) == (session.claude_session_id, session.claude_state):
                 continue
             # State changed — update the session and its label
             session.claude_state = new_state
-            session.claude_session_id = new_cs.session_id if new_cs else None
+            session.claude_session_id = new_id
             state_suffix = (
                 _claude_state_label(new_state)
                 if new_state and session.is_active
@@ -3068,24 +3142,11 @@ class SessionApp(App):
         drift apart.
         """
         fork = f" {ICON_FORK}" if session.is_fork else ""
+        location = self._row_location(session)
+        detail = f"[dim]({location}{BRANCH_ICON} {session.branch})[/]"
         if session.is_active:
-            if session.session_type == "direct":
-                # A `direct-N` session is not always in the repo root — a
-                # resume can leave one in a worktree — so name the directory
-                # when it differs instead of implying the root.
-                location = session.project
-                if self._project_root and session.path != self._project_root:
-                    location = f"{session.project}/{session.path.name}"
-                return (
-                    f"{ICON_GREEN_CIRCLE} {session.name}{fork}"
-                    f"  [dim]({location} {BRANCH_ICON}"
-                    f" {session.branch})[/]{state_suffix}"
-                )
-            return (
-                f"{ICON_GREEN_CIRCLE} {session.name}{fork}"
-                f"  [dim]({BRANCH_ICON} {session.branch})[/]{state_suffix}"
-            )
-        if session.stop_kind is StopKind.RECOVERED:
+            icon = ICON_GREEN_CIRCLE
+        elif session.stop_kind is StopKind.RECOVERED:
             icon = ICON_RECOVERED
         elif session.stop_kind is StopKind.PARKED:
             icon = ICON_PARKED
@@ -3093,7 +3154,21 @@ class SessionApp(App):
             icon = ICON_ORANGE_CIRCLE
         else:
             icon = ICON_BLACK_CIRCLE
-        return f"{icon} {session.name}{fork}  [dim]({BRANCH_ICON} {session.branch})[/]"
+        suffix = state_suffix if session.is_active else ""
+        return f"{icon} {session.name}{fork}  {detail}{suffix}"
+
+    def _row_location(self, session: SessionInfo) -> str:
+        """Where a non-worktree row runs, as a label prefix (or "").
+
+        A worktree row's name *is* its location. A root session usually runs
+        in the project root, but a resume can leave one sitting in a worktree,
+        so name that directory rather than implying the root.
+        """
+        if session.session_type != "direct":
+            return ""
+        if self._project_root and session.path != self._project_root:
+            return f"{session.path.name} "
+        return f"{ROOT_LOCATION} "
 
     # -- Stopping and terminating --
 
@@ -4671,25 +4746,39 @@ class SessionApp(App):
     async def _show_direct_title_form(self) -> None:
         await self._clear_main()
         main = self.query_one("#main")
-        default_name = get_next_direct_session_name(
-            self._project_name, self._active_sessions
-        ).split("/", 1)[1]
         await main.mount(
             Container(
-                Label(
-                    f"New Session in {self._project_name}",
-                    classes="form-label",
+                Label("New Project-Root Session", classes="form-label"),
+                Static(
+                    Content.assemble(
+                        (f"Runs in {self._project_root}", "dim"),
+                        (f"  ({BRANCH_ICON} {self._root_branch})", "dim"),
+                    )
                 ),
                 Static(""),
-                Label("Session name:"),
-                Input(value=default_name, id="direct-title-input"),
+                Label("Title (optional):"),
+                Input(placeholder="e.g. fix-unit-tests", id="direct-title-input"),
                 Static("[dim]Press Enter to launch[/]", markup=True, classes="hint"),
                 id="create-panel",
             )
         )
-        title_input = self.query_one("#direct-title-input", Input)
-        title_input.focus()
-        title_input.cursor_position = len(title_input.value)
+        self.query_one("#direct-title-input", Input).focus()
+
+    def _taken_session_names(self) -> set[str]:
+        """Session names a new session must not reuse.
+
+        Running sessions, open records (a stopped or parked session still
+        owns its name — reusing it would overwrite the record) and every
+        worktree's own name, live or not.
+        """
+        return (
+            self._active_sessions
+            | set(self._open_sessions)
+            | {
+                session_name(self._project_name, wt.name)
+                for wt in self._existing_worktrees
+            }
+        )
 
     @on(ListView.Selected, "#session-actions")
     async def on_session_action_selected(self, event: ListView.Selected) -> None:
@@ -4911,11 +5000,21 @@ class SessionApp(App):
 
     @on(Input.Submitted, "#direct-title-input")
     async def on_direct_title_submitted(self, event: Input.Submitted) -> None:
-        value = event.value.strip()
-        if not value:
-            return
-        tmux_name = f"{self._project_name}/{slugify(value)}"
-        project_path = self._project_cwd or Path(".")
+        tmux_name = next_session_name(
+            self._project_name,
+            event.value,
+            self._taken_session_names(),
+            fallback=DEFAULT_SESSION_TITLE,
+        )
+        # The project root, not the cwd: run from inside a worktree, the cwd
+        # would put a "project-root" session in that worktree.
+        project_path = self._project_root or self._project_cwd or Path.cwd()
+        debug.log(
+            "tui.root_session",
+            tmux=debug.rv(tmux_name),
+            titled=bool(slugify(event.value)),
+            path=debug.rp(project_path),
+        )
         self._launch(
             LaunchTarget(
                 self._project_name,
@@ -5693,7 +5792,7 @@ def _resume_cli_target(
     """The launch for `fujimoto resume`, and the peer name it will run under.
 
     Naming follows the directory, as `_resume_target` does in the TUI: a
-    worktree's own tmux name when it is free, else `direct-N`, and `adhoc-N`
+    worktree's own tmux name when it is free, else `session-N`, and `adhoc-N`
     outside any repo. The peer name is the launch options' `--name` if they
     set one, else `<worktree or project>-<id prefix>` (a fork adds `-fork-`
     and a random suffix, since its id isn't known until it starts), passed as
@@ -5712,7 +5811,12 @@ def _resume_cli_target(
         if worktree_name and worktree_name not in active:
             tmux_name, session_type = worktree_name, "worktree"
         else:
-            tmux_name = get_next_direct_session_name(project, active)
+            # A stopped session's record still owns its name, so it is taken
+            # even though tmux has nothing by that name.
+            taken = active | set(session_state.load_state())
+            tmux_name = next_session_name(
+                project, "", taken, fallback=DEFAULT_SESSION_TITLE
+            )
             session_type = "direct"
 
     if claude_args is not None:

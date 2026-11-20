@@ -203,7 +203,7 @@ Notes:
   `continue_on_error: true`. `{{ source_dir }}` and `{{ worktree_dir }}` expand
   to the main repo and worktree paths. On failure you're prompted to acknowledge
   the error before the screen is handed to the session.
-- **`claude_args`** applies to worktree and direct sessions alike (ad hoc
+- **`claude_args`** applies to worktree and project-root sessions alike (ad hoc
   sessions have no project). See [Launch options](#launch-options) for how it
   interacts with options saved per session.
 - fujimoto itself never creates a `.venv` — that's `uv` (or your tooling)
@@ -575,16 +575,16 @@ it stops for a permission prompt, it waits until someone attaches.
 
 ```
 + New worktree session
-+ New session in <project>
++ New project-root session (⎇ main)
 + Ad hoc session
 ───── recovered ─────
 🔄 20260306-flaky-test-hunt     (worktree)
 ───── sessions ─────
 🟢 20260309-cleanup-ui          (worktree)
-🟢 direct-1                     (direct @ main)
+🟢 fix-login                    (project-root ⎇ main)
 🅿️ 20260305-spike-caching       (worktree)
 🟠 20260307-parser-rewrite      (worktree)
-🟠 direct-2                     (direct @ main)
+🟠 session-1                    (project-root ⎇ main)
 ───── inactive worktrees ─────
 ⚫ 20260308-old-experiment      (worktree)
 ⚫ 20260309-cleanup-ui-alt 🍴   (worktree)
@@ -721,7 +721,7 @@ every time.
 
 **Worktree sessions** create an isolated git worktree with its own branch. Useful for standalone tasks that become PRs, or investigations where you want to fork off and explore.
 
-**Direct sessions** launch Claude in an existing repo directory on its current branch. Quick and lightweight — no worktree overhead. A direct row shows the directory it is actually running in, which is usually the repo root but need not be — resuming an old conversation can leave one in a worktree.
+**Project-root sessions** launch Claude in the project root (your main clone) on whatever branch it has checked out — the action shows that branch, e.g. `+ New project-root session (⎇ main)`. Quick and lightweight — no worktree overhead. Give it a title (optional, e.g. `fix-unit-tests`); left blank it is named `session-1`, `session-2`, …, and a title that is already in use gets `-2`. If you want a session on `main`, check out `main` in the clone first: fujimoto deliberately runs where your checkout is rather than switching branches for you. A row shows the directory it is actually running in, which is usually the project root but need not be — resuming an old conversation can leave one in a worktree. Sessions created by older versions as `direct-N` still appear and work as before.
 
 **Ad hoc sessions** launch Claude in a temporary directory outside any git project. For quick questions, investigations, and one-off tasks that don't need a repository.
 
@@ -734,7 +734,7 @@ Select any session to see contextual options:
 | Active worktree | Connect, Fork session, Resume previous session, View session log, Park, Stop, Terminate, Finish |
 | Stopped worktree | Resume previous session, Fork session, View session log, Launch, Terminate, Finish |
 | Inactive worktree | Resume previous session, Fork session, View session log, Launch, Finish |
-| Active direct | Connect, Fork session, Resume previous session, View session log, Park, Stop, Terminate |
+| Active project-root | Connect, Fork session, Resume previous session, View session log, Park, Stop, Terminate |
 
 **Stop** keeps the session in your list as 🟠 and **Park** keeps it as 🅿️;
 **Terminate** marks it done and drops it to ⚫. All three close claude — the
@@ -872,8 +872,8 @@ For already-merged branches: **Delete** or **Delete + remove remote branch**.
 |-------|---------|---------|
 | Worktree directory | `{YYYYMMDD}-{slug}` | `20260309-fix-unit-tests` |
 | Git branch | `worktree/{dir-name}` | `worktree/20260309-fix-unit-tests` |
-| tmux session (worktree) | `{project}/{dir-name}` | `qsic-data/20260309-fix-unit-tests` |
-| tmux session (direct) | `{project}/direct-{N}` | `qsic-data/direct-1` |
+| tmux session (worktree) | `{project}/{dir-name}` | `my-app/20260309-fix-unit-tests` |
+| tmux session (project-root) | `{project}/{slug}` (`session-{N}` untitled) | `my-app/fix-login` |
 
 ### tmux Session Controls
 

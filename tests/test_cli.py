@@ -90,6 +90,7 @@ def _patch_git_info(
     open_sessions: dict[str, object] | None = None,
     worktree_root: Path | None = None,
     session_paths: dict[str, Path] | None = None,
+    live_sessions: list[object] | None = None,
 ):
     """Return a context manager that patches git/tmux info for TUI tests."""
     import contextlib
@@ -143,6 +144,11 @@ def _patch_git_info(
             patch(
                 "fujimoto.cli.list_projects",
                 return_value=projects or [],
+            ),
+            # Claude Code's registry of running processes — never the real one.
+            patch(
+                "fujimoto.claude.live.list_live_sessions",
+                return_value=live_sessions or [],
             ),
             patch(
                 "fujimoto.cli.get_sessions_for_path",
@@ -2143,50 +2149,294 @@ class TestHomeRefresh:
 
 
 class TestSessionAppDirectSession:
+    """A project-root session: titled like any other, run in the main clone."""
+
+    @staticmethod
+    async def _open_form(pilot) -> None:  # noqa: ANN001
+        await pilot.press("down")  # "+ New project-root session"
+        await pilot.press("enter")
+        await pilot.pause()
+
     @pytest.mark.asyncio
-    async def test_launch_direct_session(self) -> None:
-        with (
-            _patch_git_info(),
-            patch(
-                "fujimoto.cli.get_next_direct_session_name",
-                return_value="test-proj/direct-1",
-            ),
-        ):
+    async def test_action_names_project_root_and_its_branch(self) -> None:
+        with _patch_git_info(current="feature-x"):
+            app = SessionApp()
+            async with app.run_test():
+                label = app.query_one("#action-direct").query_one(Label)
+                text = str(label.render())
+                assert "New project-root session" in text
+                assert "feature-x" in text
+                assert "direct" not in text
+
+    @pytest.mark.asyncio
+    async def test_title_is_optional_with_example_placeholder(self) -> None:
+        with _patch_git_info():
             app = SessionApp()
             async with app.run_test() as pilot:
-                await pilot.press("down")  # Move to "New session in..."
-                await pilot.press("enter")
-                await pilot.pause()
-                # Now shows a title form with default name
-                assert len(app.query("#direct-title-input")) > 0
-                # Submit with default value to launch
+                await self._open_form(pilot)
+                title = app.query_one("#direct-title-input", Input)
+                assert title.value == ""
+                assert title.placeholder == "e.g. fix-unit-tests"
+
+    @pytest.mark.asyncio
+    async def test_blank_title_falls_back_to_session_n(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_form(pilot)
                 await pilot.press("enter")
                 await pilot.pause()
                 assert app._launch_target is not None
-                assert app._launch_target[2] == "test-proj/direct-1"
+                assert app._launch_target.tmux_name == "test-proj/session-1"
+                assert app._launch_target.session_type == "direct"
 
     @pytest.mark.asyncio
-    async def test_launch_direct_session_custom_name(self) -> None:
-        with (
-            _patch_git_info(),
-            patch(
-                "fujimoto.cli.get_next_direct_session_name",
-                return_value="test-proj/direct-1",
-            ),
-        ):
+    async def test_title_becomes_the_slug(self) -> None:
+        with _patch_git_info():
             app = SessionApp()
             async with app.run_test() as pilot:
-                await pilot.press("down")
-                await pilot.press("enter")
-                await pilot.pause()
-                # Clear default and type custom name
-                title_input = app.query_one("#direct-title-input", Input)
-                title_input.value = ""
+                await self._open_form(pilot)
                 await pilot.press(*"my task")
                 await pilot.press("enter")
                 await pilot.pause()
                 assert app._launch_target is not None
-                assert app._launch_target[2] == "test-proj/my-task"
+                assert app._launch_target.tmux_name == "test-proj/my-task"
+
+    @pytest.mark.asyncio
+    async def test_runs_in_project_root_not_cwd(self) -> None:
+        """Run from inside a worktree, the cwd is that worktree."""
+        with _patch_git_info():
+            app = SessionApp()
+            app._project_cwd = Path("/fake/worktrees/somewhere")
+            async with app.run_test() as pilot:
+                await self._open_form(pilot)
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+                assert app._launch_target.working_dir == Path("/fake/repo")
+
+    @pytest.mark.asyncio
+    async def test_taken_titles_are_numbered(self) -> None:
+        """A running session and a stopped one both own their names."""
+        stopped = session_state.SessionRecord(
+            cwd="/fake/repo", project="test-proj", session_type="direct"
+        )
+        with _patch_git_info(
+            sessions=["test-proj/my-task"],
+            open_sessions={"test-proj/my-task-2": stopped},
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_form(pilot)
+                await pilot.press(*"my task")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+                assert app._launch_target.tmux_name == "test-proj/my-task-3"
+
+    @pytest.mark.asyncio
+    async def test_title_cannot_take_a_worktree_name(self, tmp_path: Path) -> None:
+        wt_root = tmp_path / "test-proj"
+        wt = wt_root / "20260309-x"
+        with _patch_git_info(worktrees=[wt], worktree_root=wt_root):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_form(pilot)
+                await pilot.press(*"20260309-x")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+                assert app._launch_target.tmux_name == "test-proj/20260309-x-2"
+
+    @pytest.mark.asyncio
+    async def test_root_row_is_labelled_project_root(self) -> None:
+        with _patch_git_info(
+            sessions=["test-proj/my-task"],
+            session_paths={"test-proj/my-task": Path("/fake/repo")},
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                label = app.query_one("#ds-test-proj--my-task").query_one(Label)
+                assert "(project-root " in str(label.render())
+
+    @pytest.mark.asyncio
+    async def test_filter_matches_project_root(self) -> None:
+        with _patch_git_info(
+            sessions=["test-proj/my-task"],
+            session_paths={"test-proj/my-task": Path("/fake/repo")},
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                await pilot.press(*"project-root")
+                await pilot.pause()
+                assert "ds-test-proj--my-task" in app._session_map
+
+    @pytest.mark.asyncio
+    async def test_stopped_root_row_is_labelled_project_root(self) -> None:
+        record = session_state.SessionRecord(
+            cwd="/fake/repo",
+            project="test-proj",
+            session_type="direct",
+            stop_kind=StopKind.STOPPED,
+        )
+        with _patch_git_info(open_sessions={"test-proj/my-task": record}):
+            app = SessionApp()
+            async with app.run_test():
+                label = app.query_one("#ds-test-proj--my-task").query_one(Label)
+                assert "(project-root " in str(label.render())
+
+
+class TestRowConversation:
+    """Two sessions in one directory each show their own conversation."""
+
+    @staticmethod
+    def _live(tmux: str, session_id: str):  # noqa: ANN205
+        from fujimoto.claude.live import LiveSession
+
+        return LiveSession(
+            pid=1,
+            session_id=session_id,
+            cwd=Path("/fake/repo"),
+            peer_name=None,
+            status=None,
+            tmux_session=tmux,
+        )
+
+    @pytest.mark.asyncio
+    async def test_registry_picks_each_rows_transcript(self) -> None:
+        newest = _make_claude_session("aaaa", SessionState.WORKING)
+        older = _make_claude_session("bbbb", SessionState.WAITING_FOR_USER)
+        with _patch_git_info(
+            sessions=["test-proj/one", "test-proj/two"],
+            session_paths={
+                "test-proj/one": Path("/fake/repo"),
+                "test-proj/two": Path("/fake/repo"),
+            },
+            claude_sessions_fn=lambda _p: [newest, older],
+            live_sessions=[
+                self._live("test-proj/one", "aaaa"),
+                self._live("test-proj/two", "bbbb"),
+            ],
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                one = app._session_map["ds-test-proj--one"]
+                two = app._session_map["ds-test-proj--two"]
+                assert (one.claude_session_id, one.claude_state) == (
+                    "aaaa",
+                    SessionState.WORKING,
+                )
+                assert (two.claude_session_id, two.claude_state) == (
+                    "bbbb",
+                    SessionState.WAITING_FOR_USER,
+                )
+
+    @pytest.mark.asyncio
+    async def test_recorded_id_is_used_without_registry(self) -> None:
+        newest = _make_claude_session("aaaa", SessionState.WORKING)
+        older = _make_claude_session("bbbb", SessionState.IDLE)
+        record = session_state.SessionRecord(
+            cwd="/fake/repo",
+            project="test-proj",
+            session_type="direct",
+            claude_session_id="bbbb",
+        )
+        with _patch_git_info(
+            sessions=["test-proj/two"],
+            session_paths={"test-proj/two": Path("/fake/repo")},
+            open_sessions={"test-proj/two": record},
+            claude_sessions_fn=lambda _p: [newest, older],
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                assert app._session_map["ds-test-proj--two"].claude_session_id == (
+                    "bbbb"
+                )
+
+    @pytest.mark.asyncio
+    async def test_stopped_row_resumes_its_own_conversation(self) -> None:
+        newest = _make_claude_session("aaaa")
+        older = _make_claude_session("bbbb")
+        record = session_state.SessionRecord(
+            cwd="/fake/repo",
+            project="test-proj",
+            session_type="direct",
+            claude_session_id="bbbb",
+            stop_kind=StopKind.STOPPED,
+        )
+        with _patch_git_info(
+            open_sessions={"test-proj/two": record},
+            claude_sessions_fn=lambda _p: [newest, older],
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                assert app._session_map["ds-test-proj--two"].claude_session_id == (
+                    "bbbb"
+                )
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_directory_latest(self) -> None:
+        newest = _make_claude_session("aaaa", SessionState.WORKING)
+        with _patch_git_info(
+            sessions=["test-proj/one"],
+            session_paths={"test-proj/one": Path("/fake/repo")},
+            claude_sessions_fn=lambda _p: [newest],
+            live_sessions=[self._live("test-proj/one", "unknown-id")],
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                assert app._session_map["ds-test-proj--one"].claude_session_id == (
+                    "aaaa"
+                )
+
+    @pytest.mark.asyncio
+    async def test_poll_keeps_a_recorded_id_with_no_transcript(self) -> None:
+        """A session launched with `--session-id` has an id before a log."""
+        record = session_state.SessionRecord(
+            cwd="/fake/repo",
+            project="test-proj",
+            session_type="direct",
+            claude_session_id="dddd",
+            stop_kind=StopKind.STOPPED,
+        )
+        with _patch_git_info(open_sessions={"test-proj/one": record}):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                row = app._session_map["ds-test-proj--one"]
+                label = app.query_one("#ds-test-proj--one").query_one(Label)
+                with patch.object(label, "update") as update:
+                    await app._poll_session_states()
+                    await pilot.pause()
+                    update.assert_not_called()
+                assert row.claude_session_id == "dddd"
+
+    @pytest.mark.asyncio
+    async def test_poll_follows_a_clear(self) -> None:
+        """`/clear` starts a new conversation; the registry says which."""
+        first = _make_claude_session("aaaa", SessionState.IDLE)
+        second = _make_claude_session("cccc", SessionState.WORKING)
+        live = [self._live("test-proj/one", "aaaa")]
+        with (
+            _patch_git_info(
+                sessions=["test-proj/one"],
+                session_paths={"test-proj/one": Path("/fake/repo")},
+                claude_sessions_fn=lambda _p: [second, first],
+            ),
+            patch(
+                "fujimoto.claude.live.list_live_sessions",
+                side_effect=lambda: list(live),
+            ),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                row = app._session_map["ds-test-proj--one"]
+                assert row.claude_session_id == "aaaa"
+                live[0] = self._live("test-proj/one", "cccc")
+                await app._poll_session_states()
+                await pilot.pause()
+                assert row.claude_session_id == "cccc"
+                assert row.claude_state == SessionState.WORKING
 
 
 class TestDirectSessionLocation:
@@ -2229,7 +2479,7 @@ class TestDirectSessionLocation:
                 assert info.claude_session_id == cs.session_id
                 assert info.claude_state == SessionState.WORKING
                 label = app.query_one("#ds-test-proj--direct-1").query_one(Label)
-                assert "test-proj/20260309-test" in str(label.render())
+                assert "(20260309-test " in str(label.render())
 
     @pytest.mark.asyncio
     async def test_direct_row_falls_back_to_session_record(
@@ -2305,7 +2555,7 @@ class TestResumeTarget:
                 )
 
     @pytest.mark.asyncio
-    async def test_transcript_in_busy_worktree_falls_back_to_direct(
+    async def test_transcript_in_busy_worktree_falls_back_to_root_session(
         self, tmp_path: Path
     ) -> None:
         wt_root = tmp_path / "worktrees" / "test-proj"
@@ -2316,15 +2566,11 @@ class TestResumeTarget:
                 worktree_root=wt_root,
                 sessions=["test-proj/20260309-test"],
             ),
-            patch(
-                "fujimoto.cli.get_next_direct_session_name",
-                return_value="test-proj/direct-1",
-            ),
         ):
             app = SessionApp()
             async with app.run_test():
                 assert app._resume_target("test-proj", wt) == (
-                    "test-proj/direct-1",
+                    "test-proj/session-1",
                     "direct",
                 )
 
@@ -2639,7 +2885,7 @@ class TestSessionAppSessionActions:
                 assert app._launch_target is not None
                 assert app._launch_target[4] == fake_session.session_id
                 # Active worktree → direct-N name, not the worktree name
-                assert app._launch_target[2].startswith("test-proj/direct-")
+                assert app._launch_target[2].startswith("test-proj/session-")
                 # Working dir comes from cs.cwd, not session.path
                 assert app._launch_target[1] == fake_session.cwd
 
@@ -4879,14 +5125,18 @@ class TestFormatPromptLines:
 class TestGetClaudeSessions:
     def test_returns_empty_when_no_sessions(self) -> None:
         with patch("fujimoto.cli.get_sessions_for_path", return_value=[]):
-            path_to_latest, root_sessions = _get_claude_sessions(Path("/fake/repo"), [])
+            path_to_latest, root_sessions, _ = _get_claude_sessions(
+                Path("/fake/repo"), []
+            )
         assert path_to_latest == {}
         assert root_sessions == []
 
     def test_returns_root_sessions(self) -> None:
         cs = _make_claude_session()
         with patch("fujimoto.cli.get_sessions_for_path", return_value=[cs]):
-            path_to_latest, root_sessions = _get_claude_sessions(Path("/fake/repo"), [])
+            path_to_latest, root_sessions, _ = _get_claude_sessions(
+                Path("/fake/repo"), []
+            )
         assert str(Path("/fake/repo")) in path_to_latest
         assert root_sessions == [cs]
 
@@ -4900,7 +5150,7 @@ class TestGetClaudeSessions:
             return []
 
         with patch("fujimoto.cli.get_sessions_for_path", side_effect=fake_sessions):
-            path_to_latest, root_sessions = _get_claude_sessions(
+            path_to_latest, root_sessions, _ = _get_claude_sessions(
                 Path("/fake/repo"), [wt_path]
             )
         assert str(wt_path) in path_to_latest
@@ -4908,7 +5158,7 @@ class TestGetClaudeSessions:
 
     def test_none_project_root(self) -> None:
         with patch("fujimoto.cli.get_sessions_for_path", return_value=[]):
-            path_to_latest, root_sessions = _get_claude_sessions(None, [])
+            path_to_latest, root_sessions, _ = _get_claude_sessions(None, [])
         assert path_to_latest == {}
         assert root_sessions == []
 
@@ -5036,10 +5286,6 @@ class TestClaudeSessionActions:
             _patch_git_info(
                 claude_sessions_fn=lambda _path: [cs],
             ),
-            patch(
-                "fujimoto.cli.get_next_direct_session_name",
-                return_value="test-proj/direct-1",
-            ),
         ):
             app = SessionApp()
             async with app.run_test() as pilot:
@@ -5055,7 +5301,7 @@ class TestClaudeSessionActions:
                 await pilot.pause()
                 assert app._launch_target is not None
                 assert app._launch_target[4] == cs.session_id
-                assert app._launch_target[2] == "test-proj/direct-1"
+                assert app._launch_target[2] == "test-proj/session-1"
 
 
 class TestPolling:
@@ -10296,17 +10542,17 @@ class TestResumeCommand:
         name = self.launch.call_args.kwargs["extra_args"][-1]
         assert name.startswith("20261020-x-fork-")
 
-    def test_occupied_worktree_name_falls_back_to_direct(
+    def test_occupied_worktree_name_falls_back_to_root_session(
         self, monkeypatch, capsys
     ) -> None:
         with patch("fujimoto.cli.list_all_sessions", return_value=["proj/20261020-x"]):
             self._main(monkeypatch, capsys, "resume", "sess-1234", "--detach", "--fork")
-        assert self.launch.call_args.args[2] == "proj/direct-1"
+        assert self.launch.call_args.args[2] == "proj/session-1"
 
-    def test_root_session_is_direct(self, monkeypatch, capsys) -> None:
+    def test_root_session_gets_a_root_session_name(self, monkeypatch, capsys) -> None:
         self.location = session_query.Location("proj", self.cwd, None)
         self._main(monkeypatch, capsys, "resume", "sess-1234", "--detach")
-        assert self.launch.call_args.args[2] == "proj/direct-1"
+        assert self.launch.call_args.args[2] == "proj/session-1"
         assert self.launch.call_args.kwargs["extra_args"][-1] == "proj-sess-123"
 
     def test_outside_a_repo_is_adhoc(self, monkeypatch, capsys) -> None:

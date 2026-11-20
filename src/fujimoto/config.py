@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Collection
 from datetime import date
 from pathlib import Path
 
@@ -314,13 +315,37 @@ def mark_config_once_applied(worktree_path: Path) -> None:
     (meta_dir / CONFIG_ONCE_MARKER).write_text("")
 
 
-def get_next_direct_session_name(project_name: str, active_sessions: set[str]) -> str:
-    """Compute the next direct-N session name for a project."""
-    prefix = f"{project_name}/direct-"
+DEFAULT_SESSION_TITLE = "session"
+
+
+def next_session_name(
+    project_name: str, title: str, taken: Collection[str], *, fallback: str
+) -> str:
+    """The tmux name for a new titled session: `{project}/{slug}`.
+
+    A blank title (or one with nothing sluggable in it) becomes `fallback-N`,
+    numbered from 1. A title whose name is already `taken` gets `-2`, `-3`, …,
+    so creating a second "fix-tests" never connects to the first one.
+
+    >>> next_session_name("p", "Fix tests", set(), fallback="session")
+    'p/fix-tests'
+    >>> next_session_name("p", "fix tests", {"p/fix-tests"}, fallback="session")
+    'p/fix-tests-2'
+    >>> next_session_name("p", "", {"p/session-1"}, fallback="session")
+    'p/session-2'
+    >>> next_session_name("p", " !! ", set(), fallback="chat")
+    'p/chat-1'
+    """
+    slug = slugify(title)
+    if slug:
+        name, n = f"{project_name}/{slug}", 2
+        while name in taken:
+            name, n = f"{project_name}/{slug}-{n}", n + 1
+        return name
     n = 1
-    while f"{prefix}{n}" in active_sessions:
+    while f"{project_name}/{fallback}-{n}" in taken:
         n += 1
-    return f"{prefix}{n}"
+    return f"{project_name}/{fallback}-{n}"
 
 
 def get_next_adhoc_session_name(active_sessions: set[str]) -> str:
