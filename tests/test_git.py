@@ -22,6 +22,7 @@ from fujimoto.git import (
     get_project_root,
     get_repo_root,
     get_unpushed_commits,
+    has_commits,
     has_remote_branch,
     is_branch_merged,
     list_branches,
@@ -204,6 +205,59 @@ class TestCreateWorktree:
                 ["worktree", "add", "-b", "my-branch", str(worktree_path), "main"],
                 cwd=project_dir,
             )
+
+    def test_bad_base_in_repo_with_commits_still_raises(self, tmp_path: Path) -> None:
+        calls: list[list[str]] = []
+
+        def mock_run(args: list[str], **kwargs) -> str:  # type: ignore[no-untyped-def]
+            calls.append(args)
+            if args[:2] == ["worktree", "add"]:
+                raise GitError("fatal: invalid reference: nope")
+            return "abc123"  # rev-list finds a commit
+
+        with patch("fujimoto.git._run", side_effect=mock_run):
+            with pytest.raises(GitError, match="invalid reference"):
+                create_worktree(tmp_path / "wt", "nope", "b")
+        assert not any("--orphan" in c for c in calls)
+
+    def test_orphan_failure_explains_empty_repo(self, tmp_path: Path) -> None:
+        def mock_run(args: list[str], **kwargs) -> str:  # type: ignore[no-untyped-def]
+            if args[:2] == ["worktree", "add"]:
+                raise GitError("error: unknown option `orphan'")
+            return ""  # rev-list: no commits
+
+        with patch("fujimoto.git._run", side_effect=mock_run):
+            with pytest.raises(GitError, match="no commits yet"):
+                create_worktree(tmp_path / "wt", "main", "b")
+
+    def test_empty_repository_gets_orphan_worktree(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        wt = tmp_path / "wt"
+
+        create_worktree(wt, "main", "worktree/wt", cwd=repo)
+
+        assert (wt / ".git").exists()
+        assert get_current_branch(wt) == "worktree/wt"
+        assert not has_commits(repo)
+
+
+class TestHasCommits:
+    def test_true_when_rev_list_finds_one(self) -> None:
+        with patch("fujimoto.git._run", return_value="abc123"):
+            assert has_commits() is True
+
+    def test_false_when_empty_or_error(self) -> None:
+        with patch("fujimoto.git._run", return_value=""):
+            assert has_commits() is False
+        with patch("fujimoto.git._run", side_effect=GitError("x")):
+            assert has_commits() is False
 
 
 class TestRemoveWorktree:

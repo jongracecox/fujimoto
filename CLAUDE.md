@@ -242,7 +242,8 @@ row on the home screen without buying the user anything.
 - `get_default_branch()` — tries `symbolic-ref`, falls back to checking main/master
 - `fetch_and_rebase_branch(branch)` — `git fetch origin` + `git rebase origin/{branch}`
 - `list_branches()` — sorted list of local branch names
-- `create_worktree(path, base_branch, new_branch)` — `git worktree add -b`
+- `create_worktree(path, base_branch, new_branch)` — `git worktree add -b`. In a repository with no commits yet (fresh `git init`, where `main` is unborn and git says `invalid reference: main`) it falls back to `git worktree add --orphan -b` (git 2.42+); a bad base in a repo that *has* commits still raises
+- `has_commits()` — `git rev-list -n 1 --all` is non-empty
 - `remove_worktree(path)` — `git worktree remove --force`
 - `get_unpushed_commits(branch)` — commits not yet on remote
 - `get_merge_base(branch)` — fork point from default branch

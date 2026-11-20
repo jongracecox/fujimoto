@@ -95,9 +95,39 @@ def get_default_branch(cwd: Path | str | None = None) -> str:
 def create_worktree(
     path: Path, base_branch: str, new_branch: str, cwd: Path | str | None = None
 ) -> None:
+    """Create a worktree at `path` on a new branch started from `base_branch`.
+
+    A repository with no commits yet (straight after `git init`) has nothing
+    to start a branch from — `main` is an unborn branch, and git reports
+    `invalid reference: main`. In that case, and only that one, the worktree
+    is created as an orphan: its branch is unborn too, and its first commit
+    becomes the branch's root. A bad `base_branch` in a repository that does
+    have commits still raises.
+    """
     if path.exists():
         raise GitError(f"Directory already exists: {path}")
-    _run(["worktree", "add", "-b", new_branch, str(path), base_branch], cwd=cwd)
+    try:
+        _run(["worktree", "add", "-b", new_branch, str(path), base_branch], cwd=cwd)
+    except GitError:
+        if has_commits(cwd=cwd):
+            raise
+        debug.log("git.create_worktree", mode="orphan", reason="no-commits")
+        try:
+            _run(["worktree", "add", "--orphan", "-b", new_branch, str(path)], cwd=cwd)
+        except GitError as e:
+            # `worktree add --orphan` needs git 2.42+.
+            raise GitError(
+                f"The repository has no commits yet; make an initial commit "
+                f"and try again ({e})"
+            ) from e
+
+
+def has_commits(cwd: Path | str | None = None) -> bool:
+    """Whether any ref in the repository points at a commit."""
+    try:
+        return bool(_run(["rev-list", "-n", "1", "--all"], cwd=cwd))
+    except GitError:
+        return False
 
 
 def remove_worktree(path: Path, cwd: Path | str | None = None) -> None:
