@@ -1,0 +1,75 @@
+"""The user's global fujimoto config, `~/.config/fujimoto/config.yaml`.
+
+Holds preferences that apply to every project: the default Claude model and
+the quick-terminal toggle. `$XDG_CONFIG_HOME` moves it. Same contract as
+`.fujimoto.yaml`: optional, YAML, validated with pydantic, and a malformed file
+raises `ConfigError` so it can be shown rather than silently ignored.
+
+Runtime state (open sessions, launch-option caches, the update check) stays in
+`~/.cache/fujimoto/`; this file is only for things a user chooses.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import yaml
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+from fujimoto import debug
+
+from .config import ConfigError
+from .yaml_edit import update_key
+
+XDG_CONFIG_HOME_ENV = "XDG_CONFIG_HOME"
+
+
+class GlobalConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Passed to claude as `--model` unless a session's own options set one.
+    model: str | None = None
+    # Whether the server-global quick-terminal key binding is installed.
+    # None means the first-launch prompt has not been answered yet.
+    quick_terminal: bool | None = None
+
+
+def global_config_path() -> Path:
+    base = os.environ.get(XDG_CONFIG_HOME_ENV)
+    root = Path(base) if base else Path.home() / ".config"
+    return root / "fujimoto" / "config.yaml"
+
+
+def load_global_config() -> GlobalConfig:
+    """Load and validate the global config; empty if the file is absent."""
+    path = global_config_path()
+    if not path.exists():
+        debug.log_once("global-config", "global_config.load", found=False)
+        return GlobalConfig()
+    try:
+        raw = yaml.safe_load(path.read_text())
+    except (yaml.YAMLError, OSError) as exc:
+        raise ConfigError(f"Could not read {path}: {exc}") from exc
+    if raw is None:
+        return GlobalConfig()
+    try:
+        config = GlobalConfig.model_validate(raw)
+    except ValidationError as exc:
+        debug.log("global_config.load", path=debug.rp(path), found=True, valid=False)
+        raise ConfigError(f"Invalid {path}:\n{exc}") from exc
+    debug.log_once(
+        "global-config",
+        "global_config.load",
+        path=debug.rp(path),
+        found=True,
+        valid=True,
+        model=config.model is not None,
+        quick_terminal=config.quick_terminal,
+    )
+    return config
+
+
+def update_global_key(key: str, value: object, *, remove: bool = False) -> bool:
+    """Set or remove one key of the global config, keeping its comments."""
+    return update_key(global_config_path(), key, value, GlobalConfig, remove=remove)

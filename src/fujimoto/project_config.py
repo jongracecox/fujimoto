@@ -127,6 +127,9 @@ class ProjectConfig(BaseModel):
     # Extra `claude` arguments every session in the project launches with,
     # unless the session has saved options of its own.
     claude_args: list[str] = Field(default_factory=list)
+    # Passed to claude as `--model` unless the session's options set one.
+    # Beats the global config's `model`.
+    model: str | None = None
 
     @field_validator("claude_args", mode="before")
     @classmethod
@@ -188,6 +191,7 @@ def load_project_config(project_root: Path) -> ProjectConfig:
         init=len(config.init_commands),
         on_error=config.on_error,
         claude_args=len(config.claude_args),
+        model=config.model is not None,
     )
     return config
 

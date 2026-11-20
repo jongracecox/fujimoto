@@ -93,6 +93,54 @@ auto-gitignored). If `FUJIMOTO_GIT_ROOT` is unset, the project switcher is
 hidden. Add these to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.) to
 persist them.
 
+### Global config and default model
+
+Preferences that apply to every project live in
+`~/.config/fujimoto/config.yaml` (`$XDG_CONFIG_HOME` moves it):
+
+```yaml
+model: opus            # default Claude model for every session
+quick_terminal: true   # the global quick-terminal binding (see below)
+```
+
+**Default model.** Claude Code remembers the last model chosen with `/model`
+for *all* future sessions, so switching one session to a different model
+switches every new session too. Set `model` and fujimoto passes `--model` to
+every claude it launches, unless the session's own launch options already set
+one. `.fujimoto.yaml` can set `model` too, and the project value beats the
+global one. The default is added at launch and never saved into a session's
+options, so changing it reaches every session that hasn't chosen its own
+model.
+
+### `fujimoto config`
+
+```sh
+fujimoto config                              # list every key (set or not), both files, env vars
+fujimoto config list --json
+fujimoto config get model                    # effective value; exit 1 when unset
+fujimoto config get model --global
+fujimoto config set model opus --global
+fujimoto config set model sonnet --project
+fujimoto config unset model --project
+fujimoto config set claude_args --project -- --plugin-dir ./plugins
+```
+
+| key | scopes | value |
+|---|---|---|
+| `model` | global, project | model alias or id, passed as `--model` |
+| `quick_terminal` | global | `true` / `false` |
+| `claude_args` | project | extra claude arguments (shell-style) |
+| `on_error` | project | `abort` / `continue` |
+| `copy`, `link`, `init` | project | shown, but edited in `.fujimoto.yaml` itself |
+
+`set` and `unset` need `--global` or `--project`. Project config is the main
+clone's `.fujimoto.yaml`, even when you run the command from a worktree. Only
+the changed key's lines are rewritten, so comments and the rest of the file
+stay as they were, and a value that would make the file invalid is refused
+without touching it. Put a value that starts with `-` after `--`. An invalid
+global config is reported when the TUI opens, the same way an invalid
+`.fujimoto.yaml` is.
+
 ### Per-project setup (`.fujimoto.yaml`)
 
 Worktrees start as clean checkouts, so untracked local files (e.g. `.env`) and
@@ -216,9 +264,11 @@ otherwise.
 Fujimoto can install a **one-press** global tmux binding that toggles a 30%
 bottom terminal pane: press `` Ctrl-` `` once to open the pane in the current
 working directory; press again to cycle focus between the panes. The first
-time you launch fujimoto you'll be asked whether to enable it — the choice is
-remembered in `~/.cache/fujimoto/settings.json` and a toggle on the home
-screen lets you flip it later.
+time you launch fujimoto you'll be asked whether to enable it. The choice is
+remembered as `quick_terminal` in `~/.config/fujimoto/config.yaml`, and a
+toggle on the home screen (or `fujimoto config set quick_terminal off
+--global`) flips it later. A choice made by an older version, in
+`~/.cache/fujimoto/settings.json`, is copied over automatically the first time.
 
 This is a tmux *root-table* binding (`bind-key -n`), which means it's
 **server-global** — installing it affects every tmux session on the machine,
@@ -229,9 +279,8 @@ Override the key with `FUJIMOTO_QUICK_TERMINAL_KEY` (defaults to `` C-` ``).
 Set it to an empty string to disable the feature regardless of the saved
 preference; the home-screen toggle then shows `disabled (env)`.
 
-**Removing the binding.** Because it lives on the tmux server, deleting
-`~/.cache/fujimoto/settings.json` does *not* clear an already-installed
-binding. To remove it:
+**Removing the binding.** Because it lives on the tmux server, removing the
+`quick_terminal` setting does *not* clear an already-installed binding. To remove it:
 
 - Toggle it off from the fujimoto home screen (preferred — runs
   `tmux unbind-key -n` for you), **or**
@@ -719,7 +768,9 @@ and ad hoc sessions while they are running or stopped, since that is when they
 have a record to save onto.
 
 Options are looked up in this order: the session's saved options, a fork's
-parent's options, then `claude_args` in `.fujimoto.yaml`. Saving options that
+parent's options, then `claude_args` in `.fujimoto.yaml`. If none of them sets
+`--model`, the [default model](#global-config-and-default-model) is added at
+launch. The dialog names it, but it isn't part of the saved options. Saving options that
 match the project default clears the override, so the session goes back to
 following `.fujimoto.yaml`. Saving an empty field is a deliberate "no options".
 

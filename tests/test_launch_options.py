@@ -182,3 +182,78 @@ _REAL_CACHE_PATH = launch_options._cache_path
 def test_cache_lives_beside_the_session_state() -> None:
     with patch("pathlib.Path.home", return_value=Path("/h")):
         assert _REAL_CACHE_PATH() == Path("/h/.cache/fujimoto/launch_options.json")
+
+
+class TestDefaultModel:
+    """`model` from `.fujimoto.yaml` or the global config, added at launch."""
+
+    @staticmethod
+    def _global(text: str) -> None:
+        from fujimoto.global_config import global_config_path
+
+        path = global_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    @staticmethod
+    def _project(tmp_path: Path, text: str):
+        root = tmp_path / "repo"
+        root.mkdir(exist_ok=True)
+        (root / ".fujimoto.yaml").write_text(text)
+        return patch(
+            "fujimoto.launch_options.get_main_worktree_root", return_value=root
+        )
+
+    def test_none_configured(self, tmp_path: Path) -> None:
+        default = launch_options.default_model(tmp_path)
+        assert default == launch_options.DefaultModel(
+            None, launch_options.ModelSource.NONE
+        )
+        assert launch_options.with_default_model(("--x",), tmp_path) == ("--x",)
+
+    def test_global(self, tmp_path: Path) -> None:
+        self._global("model: opus\n")
+        default = launch_options.default_model(tmp_path)
+        assert default.model == "opus"
+        assert default.source is launch_options.ModelSource.GLOBAL
+        assert launch_options.with_default_model(("--x",), tmp_path) == (
+            "--x",
+            "--model",
+            "opus",
+        )
+
+    def test_project_beats_global(self, tmp_path: Path) -> None:
+        self._global("model: opus\n")
+        with self._project(tmp_path, "model: sonnet\n"):
+            default = launch_options.default_model(tmp_path)
+        assert default.model == "sonnet"
+        assert default.source is launch_options.ModelSource.PROJECT
+
+    def test_project_without_model_falls_back_to_global(self, tmp_path: Path) -> None:
+        self._global("model: opus\n")
+        with self._project(tmp_path, "claude_args: --verbose\n"):
+            assert launch_options.default_model(tmp_path).model == "opus"
+
+    def test_invalid_files_contribute_nothing(self, tmp_path: Path) -> None:
+        self._global("model: [not, a, string]\n")
+        with self._project(tmp_path, "nope: 1\n"):
+            assert launch_options.default_model(tmp_path).model is None
+
+    @pytest.mark.parametrize(
+        "args", [("--model", "haiku"), ("--model=haiku",), ("--x", "--model", "y")]
+    )
+    def test_explicit_model_wins(self, tmp_path: Path, args: tuple[str, ...]) -> None:
+        self._global("model: opus\n")
+        assert launch_options.with_default_model(args, tmp_path) == args
+
+    def test_labels(self) -> None:
+        assert all(s.label for s in launch_options.ModelSource)
+
+    def test_default_model_is_never_saved(self, tmp_path: Path) -> None:
+        """Saving the resolved options must not pin today's default model."""
+        self._global("model: opus\n")
+        wt = _worktree(tmp_path)
+        launch_options.save(wt, "proj/wt", None, ("--verbose",))
+        assert read_claude_args(wt) == ["--verbose"]
+        resolved = launch_options.resolve(wt, "proj/wt")
+        assert "--model" not in resolved.args

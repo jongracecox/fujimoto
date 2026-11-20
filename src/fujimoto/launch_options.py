@@ -17,6 +17,13 @@ A session's options are resolved from the first of these that has a value:
 An override is only stored when it differs from the project default, so a
 session that never asked for anything different keeps following
 `.fujimoto.yaml` as it changes.
+
+**The default model is added at launch, never saved.** `with_default_model`
+appends `--model X` (from `.fujimoto.yaml`'s `model`, else the global
+config's) only when the resolved options don't already name a model. Keeping it
+out of the saved options means changing the default reaches every session that
+has not pinned a model of its own. Without it, claude starts on whatever model
+was last picked with `/model` in any session, machine-wide.
 """
 
 from __future__ import annotations
@@ -37,6 +44,7 @@ from .config import (
     write_claude_args,
 )
 from .git import GitError, get_main_worktree_root
+from .global_config import load_global_config
 from .project_config import load_project_config
 
 Args = tuple[str, ...]
@@ -62,6 +70,28 @@ class Source(StrEnum):
             Source.PROJECT: "project default from .fujimoto.yaml",
             Source.NONE: "none",
         }[self]
+
+
+class ModelSource(StrEnum):
+    """Where the default model came from."""
+
+    PROJECT = "project"
+    GLOBAL = "global"
+    NONE = "none"
+
+    @property
+    def label(self) -> str:
+        return {
+            ModelSource.PROJECT: ".fujimoto.yaml",
+            ModelSource.GLOBAL: "global config",
+            ModelSource.NONE: "none",
+        }[self]
+
+
+@dataclass(frozen=True)
+class DefaultModel:
+    model: str | None
+    source: ModelSource
 
 
 @dataclass(frozen=True)
@@ -241,3 +271,56 @@ def save(
         count=len(args),
         args=debug.rargs(args),
     )
+
+
+def default_model(working_dir: Path) -> DefaultModel:
+    """The model a launch uses when its options name none.
+
+    The project's `.fujimoto.yaml` `model` (read from the main clone), then the
+    global config's. A malformed file contributes nothing here, since both are
+    reported when the TUI opens.
+    """
+    try:
+        root = get_main_worktree_root(working_dir)
+        project_model = load_project_config(root).model
+    except (GitError, ConfigError, OSError):
+        project_model = None
+    if project_model:
+        return DefaultModel(project_model, ModelSource.PROJECT)
+    try:
+        global_model = load_global_config().model
+    except (ConfigError, OSError):
+        global_model = None
+    if global_model:
+        return DefaultModel(global_model, ModelSource.GLOBAL)
+    return DefaultModel(None, ModelSource.NONE)
+
+
+def has_model_flag(args: Args) -> bool:
+    """Whether `args` already choose a model.
+
+    >>> has_model_flag(("--plugin-dir", "x", "--model", "opus"))
+    True
+    >>> has_model_flag(("--model=sonnet",))
+    True
+    >>> has_model_flag(("--plugin-dir", "--model-dir"))
+    False
+    """
+    return any(a == "--model" or a.startswith("--model=") for a in args)
+
+
+def with_default_model(args: Args, working_dir: Path) -> Args:
+    """`args` plus `--model <default>`, unless they already pick a model."""
+    if has_model_flag(args):
+        debug.log("launch_options.model", applied=False, reason="explicit")
+        return args
+    default = default_model(working_dir)
+    debug.log(
+        "launch_options.model",
+        applied=default.model is not None,
+        source=default.source.value,
+        model=default.model or "none",
+    )
+    if default.model is None:
+        return args
+    return (*args, "--model", default.model)

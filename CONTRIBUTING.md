@@ -38,7 +38,11 @@ src/fujimoto/
 ├── tmux.py       # tmux session management
 ├── debug.py      # --debug / --debug-redacted diagnostic logging + redaction
 ├── project_config.py  # Optional per-project .fujimoto.yaml (copy/link/init/claude_args)
-├── launch_options.py  # Extra claude CLI args per session: resolve, save, replay
+├── launch_options.py  # Extra claude CLI args per session: resolve, save, replay, default model
+├── global_config.py   # ~/.config/fujimoto/config.yaml (model, quick_terminal)
+├── config_command.py  # `fujimoto config` list/get/set/unset, key registry
+├── yaml_edit.py       # Change one top-level YAML key, keeping comments
+├── settings.py        # TUI preferences (stored in the global config; migrates settings.json)
 ├── templates/    # Packaged scaffolds (fujimoto.yaml.template)
 └── claude/
     ├── __init__.py      # Re-exports public API

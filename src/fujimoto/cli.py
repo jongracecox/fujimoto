@@ -105,8 +105,9 @@ from fujimoto.terminal import open_terminal
 from fujimoto.version import get_version
 from fujimoto.version_check import check_for_update, dismiss as dismiss_update_version
 from fujimoto.vscode import open_vscode
+from fujimoto.global_config import load_global_config
 from fujimoto.settings import Settings, load_settings, save_settings
-from fujimoto import session_query, session_state
+from fujimoto import config_command, session_query, session_state
 from fujimoto.session_query import relative_time as _relative_time
 from fujimoto.session_state import StopKind
 from fujimoto.tmux import (
@@ -1179,7 +1180,7 @@ class QuickTerminalPrompt(ModalScreen[bool]):
 
 
 class ConfigErrorDialog(ModalScreen[None]):
-    """Modal shown at startup when `.fujimoto.yaml` fails to parse/validate."""
+    """Modal shown at startup when `.fujimoto.yaml` or the global config is invalid."""
 
     BINDINGS = [
         Binding("escape", "close", show=False),
@@ -1192,11 +1193,11 @@ class ConfigErrorDialog(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         yield Container(
-            Label("[bold red]⚠ .fujimoto.yaml is invalid[/]", markup=True),
+            Label("[bold red]⚠ fujimoto config is invalid[/]", markup=True),
             # markup=False: validation text can contain brackets that aren't markup.
             Static(self._message, markup=False, id="ce-message"),
             Label(
-                "Project config will be skipped until this is fixed.",
+                "The invalid file will be skipped until this is fixed.",
                 classes="hint",
             ),
             Horizontal(
@@ -1239,10 +1240,12 @@ class LaunchOptionsDialog(ModalScreen["tuple[str, ...] | None"]):
         resolved: launch_options.Resolved,
         *,
         editing: bool = False,
+        default_model: launch_options.DefaultModel | None = None,
     ) -> None:
         super().__init__()
         self._title = title
         self._resolved = resolved
+        self._default_model = default_model
         # Opened from the session menu: Enter saves without launching.
         self._editing = editing
 
@@ -1261,6 +1264,7 @@ class LaunchOptionsDialog(ModalScreen["tuple[str, ...] | None"]):
                 markup=True,
                 id="lo-docs",
             ),
+            Static(self._model_hint(), id="lo-model"),
             Input(
                 value=launch_options.render(self._resolved.args),
                 placeholder="--plugin-dir ./plugins",
@@ -1279,6 +1283,21 @@ class LaunchOptionsDialog(ModalScreen["tuple[str, ...] | None"]):
             ),
             id="lo-dialog",
         )
+
+    def _model_hint(self) -> Content:
+        default = self._default_model
+        if default is None or default.model is None:
+            text = (
+                "No default model set: claude uses the last /model choice. "
+                "Set one with `fujimoto config set --global model …`."
+            )
+        else:
+            text = (
+                f"Default model: {default.model} ({default.source.label}), "
+                "added unless these options set --model."
+            )
+        # Content, not markup: the model name comes from a config file.
+        return Content.assemble((text, "dim"))
 
     def on_mount(self) -> None:
         box = self.query_one("#lo-input", Input)
@@ -1746,7 +1765,14 @@ class SessionApp(App):
             self._launch_target = target._replace(claude_args=args)
             self.exit()
 
-        self.push_screen(LaunchOptionsDialog(display, resolved), chosen)
+        self.push_screen(
+            LaunchOptionsDialog(
+                display,
+                resolved,
+                default_model=self._default_model_for(target.working_dir),
+            ),
+            chosen,
+        )
 
     async def _clear_main(self) -> None:
         self._stop_polling()
@@ -1847,14 +1873,18 @@ class SessionApp(App):
     # -- Home screen --
 
     def _project_config_error(self) -> str | None:
-        """Return the project's `.fujimoto.yaml` validation error, if any."""
-        if self._project_root is None:
-            return None
+        """Validation errors from the global config and `.fujimoto.yaml`, if any."""
+        errors: list[str] = []
         try:
-            load_project_config(self._project_root)
+            load_global_config()
         except ConfigError as e:
-            return str(e)
-        return None
+            errors.append(str(e))
+        if self._project_root is not None:
+            try:
+                load_project_config(self._project_root)
+            except ConfigError as e:
+                errors.append(str(e))
+        return "\n\n".join(errors) if errors else None
 
     async def _show_home(self) -> None:
         await self._clear_main()
@@ -3350,6 +3380,16 @@ class SessionApp(App):
             self._options_conversation(session),
         )
 
+    def _default_model_for(self, working_dir: Path) -> launch_options.DefaultModel:
+        """The default model for a launch in `working_dir`.
+
+        A worktree about to be created has no directory yet, so its project
+        config is found through the project root instead.
+        """
+        if not working_dir.exists() and self._project_root is not None:
+            working_dir = self._project_root
+        return launch_options.default_model(working_dir)
+
     def _launch_options_label(self, session: SessionInfo) -> Content:
         resolved = self._resolve_session_options(session)
         summary = launch_options.render(resolved.args) if resolved.args else "none"
@@ -3360,6 +3400,10 @@ class SessionApp(App):
             if resolved.source is not launch_options.Source.NONE
             else ""
         )
+        if not launch_options.has_model_flag(resolved.args):
+            default = self._default_model_for(session.path)
+            if default.model is not None:
+                suffix += f" · model {default.model} ({default.source.label})"
         # Content, not markup: the options are whatever the user typed.
         return Content.assemble("Launch options  ", (f"({summary}{suffix})", "dim"))
 
@@ -3392,7 +3436,13 @@ class SessionApp(App):
             actions.index = [i.id for i in actions.children].index("sa-options")
 
         self.push_screen(
-            LaunchOptionsDialog(session.name, resolved, editing=True), chosen
+            LaunchOptionsDialog(
+                session.name,
+                resolved,
+                editing=True,
+                default_model=self._default_model_for(session.path),
+            ),
+            chosen,
         )
 
     # -- Resume session picker --
@@ -4784,8 +4834,10 @@ class SessionApp(App):
         # Spin up a background Claude session to create the PR
         pr_session_name = f"{session.project}/pr-{session.name}"
         allowed = "Bash(git:*) Bash(gh:*)"
+        model = launch_options.default_model(session.path).model
+        model_arg = f"--model {shlex.quote(model)} " if model else ""
         command = (
-            f'claude -p --allowedTools "{allowed}" '
+            f'claude -p {model_arg}--allowedTools "{allowed}" '
             f'"Push this branch and create a PR. '
             f'Follow project conventions from CLAUDE.md."'
         )
@@ -5401,7 +5453,12 @@ def _start_launch(target: LaunchTarget, *, attach: bool = True) -> str | None:
         if target.fork_in_place
         else resume_id or target.session_id,
     )
-    claude_args = _launch_claude_args(target, resolved_name) + target.extra_args
+    # The default model is added here, after the options are saved, so it is
+    # never stored as one of the session's own options.
+    claude_args = launch_options.with_default_model(
+        _launch_claude_args(target, resolved_name) + target.extra_args,
+        working_dir,
+    )
     launch_claude_in_tmux(
         project_name,
         working_dir,
@@ -5926,6 +5983,131 @@ def _run_search_command(args: argparse.Namespace) -> None:
     _finish_debug_log()
 
 
+def _run_config_command(
+    args: argparse.Namespace, rest: tuple[str, ...] | None = None
+) -> None:
+    """`fujimoto config`: list, get, set and unset global/project config.
+
+    `rest` is whatever followed `--`: `config set claude_args --project --
+    --verbose` passes a value that argparse would otherwise read as a flag.
+    """
+    action = args.config_action or "list"
+    scope = config_command.Scope(args.scope) if args.scope else None
+    try:
+        if action == "list":
+            report = config_command.build_report()
+            if args.json:
+                print(json.dumps(config_command.report_json(report), indent=2))
+            else:
+                print(config_command.format_report(report))
+        elif action == "get":
+            value, source = config_command.get_value(args.key, scope)
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "key": args.key,
+                            "value": value,
+                            "source": source.value if source else None,
+                        }
+                    )
+                )
+            elif value is not None:
+                print(config_command.format_value(value))
+            if value is None:
+                _finish_debug_log()
+                sys.exit(1)  # unset, like `git config`
+        else:
+            assert scope is not None  # argparse requires --global/--project
+            if action == "set":
+                if (args.value is None) == (rest is None):
+                    raise ConfigError("give the value either before or after --")
+                value = args.value if rest is None else shlex.join(rest)
+                result = config_command.set_value(args.key, value, scope)
+                verb = "Set" if result.changed else "Unchanged:"
+                print(f"{verb} {args.key} in {result.path}")
+            else:
+                result = config_command.unset_value(args.key, scope)
+                verb = "Removed" if result.changed else "Not set:"
+                print(f"{verb} {args.key} in {result.path}")
+    except ConfigError as e:
+        _finish_debug_log()
+        print(f"fujimoto: {e}", file=sys.stderr)
+        sys.exit(1)
+    _finish_debug_log()
+
+
+def _add_config_commands(sub: argparse._SubParsersAction) -> None:
+    """`config [list|get|set|unset]`."""
+    config = sub.add_parser(
+        "config",
+        help="Show or change fujimoto configuration",
+        description=(
+            "Show or change configuration. Global config lives in "
+            "~/.config/fujimoto/config.yaml, project config in the main "
+            "clone's .fujimoto.yaml. With no action, lists every key "
+            "(including unset ones), both files and the FUJIMOTO_* "
+            "environment variables."
+        ),
+    )
+    config.add_argument("--json", action="store_true", help="Print JSON")
+    config.set_defaults(scope=None)
+    actions = config.add_subparsers(dest="config_action")
+
+    listing = actions.add_parser("list", help="List every key, set or not")
+    listing.add_argument(
+        "--json", action="store_true", default=argparse.SUPPRESS, help="Print JSON"
+    )
+
+    def scope_flags(parser: argparse.ArgumentParser, *, required: bool) -> None:
+        group = parser.add_mutually_exclusive_group(required=required)
+        group.add_argument(
+            "--global",
+            dest="scope",
+            action="store_const",
+            const="global",
+            help="The global config (~/.config/fujimoto/config.yaml)",
+        )
+        group.add_argument(
+            "--project",
+            dest="scope",
+            action="store_const",
+            const="project",
+            help="The project's .fujimoto.yaml (in the main clone)",
+        )
+
+    get = actions.add_parser(
+        "get",
+        help="Print a key's value (exit 1 if unset)",
+        description=(
+            "Print a key's value. Without --global/--project, prints the "
+            "effective value (project beats global). Exits 1 when unset."
+        ),
+    )
+    get.add_argument("key")
+    get.add_argument(
+        "--json", action="store_true", default=argparse.SUPPRESS, help="Print JSON"
+    )
+    scope_flags(get, required=False)
+
+    set_ = actions.add_parser(
+        "set",
+        help="Set a key (--global or --project)",
+        description=(
+            "Set a key. A value that starts with - goes after --, e.g. "
+            "`fujimoto config set claude_args --project -- --verbose`."
+        ),
+        usage="fujimoto config set KEY (VALUE | -- VALUE...) (--global | --project)",
+    )
+    set_.add_argument("key")
+    set_.add_argument("value", nargs="?")
+    scope_flags(set_, required=True)
+
+    unset = actions.add_parser("unset", help="Remove a key (--global or --project)")
+    unset.add_argument("key")
+    scope_flags(unset, required=True)
+
+
 def _run_log_command(args: argparse.Namespace) -> None:
     """`fujimoto log`: one session's transcript, parsed or raw."""
     roles = (
@@ -6236,6 +6418,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pane.add_argument("--session", required=True)
     _add_query_commands(sub)
     _add_resume_commands(sub)
+    _add_config_commands(sub)
     new = sub.add_parser(
         "new",
         help="Create a worktree and launch Claude in it",
@@ -6289,8 +6472,13 @@ def main() -> None:
     parser = _build_parser()
     argv, claude_args = _split_claude_args(sys.argv[1:])
     args = parser.parse_args(argv)
-    if claude_args is not None and args.command not in ("new", "resume"):
-        parser.error("arguments after -- are only accepted by 'new' and 'resume'")
+    if claude_args is not None and not (
+        args.command in ("new", "resume")
+        or (args.command == "config" and args.config_action == "set")
+    ):
+        parser.error(
+            "arguments after -- are only accepted by 'new', 'resume' and 'config set'"
+        )
     if args.command == "new" and not slugify(args.title):
         parser.error("title must contain at least one letter or digit")
     if args.debug or args.debug_redacted:
@@ -6306,6 +6494,9 @@ def main() -> None:
         return
     if args.command == "stop":
         _run_stop_command(args)
+        return
+    if args.command == "config":
+        _run_config_command(args, claude_args)
         return
     if args.command == "agent-instructions":
         print(session_query.agent_instructions(), end="")
