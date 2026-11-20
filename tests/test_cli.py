@@ -204,6 +204,10 @@ def _isolate_session_state(tmp_path: Path):
     with (
         patch("fujimoto.cli.get_chat_scratch_dir", side_effect=_fake_scratch(tmp_path)),
         patch(
+            "fujimoto.chats.chats_dir",
+            side_effect=lambda project: tmp_path / "chat-meta" / project,
+        ),
+        patch(
             "fujimoto.session_state._state_path",
             return_value=tmp_path / "session-state" / "sessions.json",
         ),
@@ -3060,6 +3064,355 @@ class TestChatRows:
                 await self._open_menu(app, pilot, "ch-test-proj--ask")
                 await app._show_log_picker(app._session_map["ch-test-proj--ask"])
                 assert show.call_args.args[0].session_id == "mmmm"
+
+
+class TestPreviousChats:
+    """Terminated chats stay listed under *previous sessions*."""
+
+    @pytest.fixture(autouse=True)
+    def _no_prune(self):
+        """The test project root (`/fake/repo`) doesn't exist on disk."""
+        from fujimoto import chats
+
+        with patch("fujimoto.cli.chats.prune", side_effect=chats.list_chats):
+            yield
+
+    @staticmethod
+    def _meta(name: str, cwd: Path | str, claude_session_id: str | None = None) -> None:
+        from fujimoto import chats
+
+        chats.record_open(
+            name,
+            project="test-proj",
+            cwd=Path(cwd),
+            claude_session_id=claude_session_id,
+        )
+
+    @staticmethod
+    async def _select(app: SessionApp, pilot, item_id: str) -> list[str]:  # noqa: ANN001
+        home = app.query_one("#home-list", ListView)
+        home.index = next(i for i, c in enumerate(home.children) if c.id == item_id)
+        await pilot.press("enter")
+        await pilot.pause()
+        return [c.id or "" for c in app.query_one("#session-actions").children]
+
+    @pytest.mark.asyncio
+    async def test_terminated_chat_with_a_transcript_stays(self) -> None:
+        from fujimoto import chats
+
+        cs = _make_claude_session("mmmm")
+        self._meta("test-proj/ask", "/fake/repo", claude_session_id="mmmm")
+        with (
+            _patch_git_info(
+                sessions=["test-proj/ask"],
+                session_paths={"test-proj/ask": Path("/fake/repo")},
+                open_sessions={
+                    "test-proj/ask": _chat_record(
+                        "/fake/repo", claude_session_id="mmmm"
+                    )
+                },
+                claude_sessions_fn=lambda _p: [cs],
+            ),
+            patch("fujimoto.cli.kill_session"),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                ids = await self._select(app, pilot, "ch-test-proj--ask")
+                listing = app.query_one("#session-actions", ListView)
+                listing.index = ids.index("sa-terminate")
+                with patch.object(app, "_init_git_info"):
+                    await pilot.press("enter")
+                    await pilot.pause()
+        meta = chats.get("test-proj/ask", "test-proj")
+        assert meta is not None and meta.closed
+        assert meta.claude_session_id == "mmmm"
+
+    @pytest.mark.asyncio
+    async def test_terminate_from_ctrl_a_x_prompt_keeps_a_chat_that_spoke(
+        self,
+    ) -> None:
+        """The prompt's row has no conversation id; the chat's own file does.
+
+        The bug: the id came only from the row, so a chat ended with
+        `Ctrl-A x` always looked silent and was forgotten.
+        """
+        from fujimoto import chats
+        from fujimoto.cli import get_chat_scratch_dir
+
+        scratch = get_chat_scratch_dir("test-proj")
+        cs = _make_claude_session("mmmm", cwd=scratch)
+        self._meta("test-proj/ask", scratch, claude_session_id="mmmm")
+        target = LaunchTarget("test-proj", scratch, "test-proj/ask", "chat")
+        with (
+            _patch_git_info(claude_sessions_fn=lambda p: [cs] if p == scratch else []),
+            patch("fujimoto.cli.kill_session"),
+        ):
+            app = SessionApp(pending_close=target)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert app.query("#terminate-prompt")
+                with patch.object(app, "_init_git_info"):
+                    await pilot.press("enter")  # Terminate is highlighted
+                    await pilot.pause()
+        meta = chats.get("test-proj/ask", "test-proj")
+        assert meta is not None and meta.closed
+        assert meta.claude_session_id == "mmmm"
+
+    @pytest.mark.asyncio
+    async def test_registry_id_wins_for_a_cleared_chat(self) -> None:
+        """After `/clear` the running conversation is a new one."""
+        from fujimoto.claude.live import LiveSession
+
+        self._meta("test-proj/ask", "/fake/repo", claude_session_id="old")
+        live = LiveSession(
+            pid=1,
+            session_id="new",
+            cwd=None,
+            peer_name=None,
+            status=None,
+            tmux_session="test-proj/ask",
+        )
+        with _patch_git_info(live_sessions=[live]):
+            app = SessionApp()
+            async with app.run_test():
+                info = SessionInfo(
+                    name="ask",
+                    session_type="chat",
+                    project="test-proj",
+                    path=Path("/fake/repo"),
+                    tmux_session="test-proj/ask",
+                    is_active=True,
+                    branch="",
+                )
+                assert app._chat_conversation(info) == "new"
+                info.tmux_session = "test-proj/unknown"
+                assert app._chat_conversation(info) is None
+
+    @pytest.mark.asyncio
+    async def test_terminated_chat_that_never_spoke_is_forgotten(
+        self, tmp_path: Path
+    ) -> None:
+        from fujimoto import chats
+        from fujimoto.cli import get_chat_scratch_dir
+
+        scratch = get_chat_scratch_dir("test-proj")
+        (scratch / "ask").mkdir()
+        self._meta("test-proj/ask", scratch)
+        with (
+            _patch_git_info(
+                sessions=["test-proj/ask"],
+                session_paths={"test-proj/ask": scratch},
+                open_sessions={"test-proj/ask": _chat_record(scratch)},
+            ),
+            patch("fujimoto.cli.kill_session"),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                ids = await self._select(app, pilot, "ch-test-proj--ask")
+                listing = app.query_one("#session-actions", ListView)
+                listing.index = ids.index("sa-terminate")
+                with patch.object(app, "_init_git_info"):
+                    await pilot.press("enter")
+                    await pilot.pause()
+        assert chats.get("test-proj/ask", "test-proj") is None
+        assert not (scratch / "ask").exists()
+
+    @pytest.mark.asyncio
+    async def test_previous_section_mixes_worktrees_chats_and_conversations(
+        self, tmp_path: Path
+    ) -> None:
+        from datetime import timedelta
+
+        now = datetime.now(tz=timezone.utc)
+        wt_root = tmp_path / "test-proj"
+        wt = wt_root / "20260101-old"
+        chat_cs = _make_claude_session("chat-c", last_activity=now)
+        wt_cs = _make_claude_session(
+            "wt-c", cwd=wt, last_activity=now - timedelta(days=2)
+        )
+        root_cs = _make_claude_session("root-c", last_activity=now - timedelta(days=1))
+        self._meta("test-proj/ask", "/fake/repo", claude_session_id="chat-c")
+        from fujimoto import chats
+
+        chats.mark_closed("test-proj/ask", "test-proj", None)
+
+        def sessions(path: Path) -> list[ClaudeSession]:
+            return [wt_cs] if path == wt else [chat_cs, root_cs]
+
+        with _patch_git_info(
+            worktrees=[wt], worktree_root=wt_root, claude_sessions_fn=sessions
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                text = _list_text(app)
+                assert "previous sessions" in text
+                assert "inactive worktrees" not in text
+                assert "previous claude sessions" not in text
+                assert f"⚫ ask  ({ICON_CHAT} project-root)" in text
+                ids = [c.id for c in app.query_one("#home-list", ListView).children]
+                order = [
+                    i
+                    for i in ids
+                    if i in ("ch-test-proj--ask", "cs-root-c", "wt-20260101-old")
+                ]
+                # Most recently used first; the chat's own conversation is not
+                # listed again as a root conversation.
+                assert order == ["ch-test-proj--ask", "cs-root-c", "wt-20260101-old"]
+                assert "cs-chat-c" not in ids
+                # `/` reaches previous chats too.
+                await pilot.press("slash")
+                await pilot.press(*"ask")
+                await pilot.pause()
+                assert "ch-test-proj--ask" in app._session_map
+
+    @pytest.mark.asyncio
+    async def test_previous_chat_menu_and_resume(self) -> None:
+        from fujimoto import chats
+
+        cs = _make_claude_session("mmmm")
+        self._meta("test-proj/ask", "/fake/repo", claude_session_id="mmmm")
+        chats.mark_closed("test-proj/ask", "test-proj", None)
+        with _patch_git_info(claude_sessions_fn=lambda _p: [cs]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                ids = await self._select(app, pilot, "ch-test-proj--ask")
+                assert ids[:2] == ["sa-resume-chat", "sa-launch"]
+                assert "sa-remove-chat" in ids
+                assert "sa-rename" not in ids
+                assert "sa-terminate" not in ids
+                await pilot.press("enter")
+                await pilot.pause()
+                target = app._launch_target
+                assert target is not None
+                assert (target.tmux_name, target.session_type) == (
+                    "test-proj/ask",
+                    "chat",
+                )
+                assert target.resume_session_id == "mmmm"
+
+    @pytest.mark.asyncio
+    async def test_remove_from_list_keeps_files(self) -> None:
+        from fujimoto import chats
+        from fujimoto.cli import get_chat_scratch_dir
+
+        scratch = get_chat_scratch_dir("test-proj")
+        files = scratch / "ask"
+        files.mkdir()
+        (files / "notes.md").write_text("x")
+        self._meta("test-proj/ask", scratch, claude_session_id="mmmm")
+        chats.mark_closed("test-proj/ask", "test-proj", None)
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                ids = await self._select(app, pilot, "ch-test-proj--ask")
+                app.query_one("#session-actions", ListView).index = ids.index(
+                    "sa-remove-chat"
+                )
+                with patch.object(app, "notify") as notify:
+                    await pilot.press("enter")
+                    await pilot.pause()
+                assert str(files) in notify.call_args.args[0]
+                assert "ch-test-proj--ask" not in app._session_map
+        assert chats.get("test-proj/ask", "test-proj") is None
+        assert (files / "notes.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_filter_hides_a_non_matching_previous_chat(self) -> None:
+        from fujimoto import chats
+
+        self._meta("test-proj/ask", "/fake/repo", claude_session_id="c")
+        chats.mark_closed("test-proj/ask", "test-proj", None)
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")
+                await pilot.press(*"zzz")
+                await pilot.pause()
+                assert "ch-test-proj--ask" not in app._session_map
+
+    @pytest.mark.asyncio
+    async def test_forgetting_chats_outside_scratch_or_without_files(self) -> None:
+        from fujimoto import chats
+        from fujimoto.cli import get_chat_scratch_dir
+
+        scratch = get_chat_scratch_dir("test-proj")
+        self._meta("test-proj/root", "/fake/repo")
+        self._meta("test-proj/bare", scratch)
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test():
+                for name, path in (("root", Path("/fake/repo")), ("bare", scratch)):
+                    info = SessionInfo(
+                        name=name,
+                        session_type="chat",
+                        project="test-proj",
+                        path=path,
+                        tmux_session=f"test-proj/{name}",
+                        is_active=False,
+                        branch="",
+                    )
+                    assert app._forget_chat(info) is None
+        assert chats.list_chats("test-proj") == []
+
+    @pytest.mark.asyncio
+    async def test_closed_chat_name_is_not_reused(self) -> None:
+        from fujimoto import chats
+
+        self._meta("test-proj/chat-1", "/fake/repo", claude_session_id="c")
+        chats.mark_closed("test-proj/chat-1", "test-proj", None)
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test():
+                assert "test-proj/chat-1" in app._taken_session_names()
+
+    @pytest.mark.asyncio
+    async def test_conversation_row_of_a_chat_resumes_as_the_chat(self) -> None:
+        from fujimoto import chats
+
+        self._meta("test-proj/ask", "/fake/repo", claude_session_id="mmmm")
+        chats.mark_closed("test-proj/ask", "test-proj", None)
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test():
+                assert app._resume_target(
+                    "test-proj", Path("/fake/repo"), None, "mmmm"
+                ) == ("test-proj/ask", "chat")
+
+    @pytest.mark.asyncio
+    async def test_stopped_session_owns_its_conversation(self) -> None:
+        record = session_state.SessionRecord(
+            cwd="/fake/repo",
+            project="test-proj",
+            session_type="direct",
+            claude_session_id="dddd",
+            stop_kind=StopKind.STOPPED,
+        )
+        with _patch_git_info(open_sessions={"test-proj/mine": record}):
+            app = SessionApp()
+            async with app.run_test():
+                assert app._resume_target(
+                    "test-proj", Path("/fake/repo"), None, "dddd"
+                ) == ("test-proj/mine", "direct")
+
+    @pytest.mark.asyncio
+    async def test_transcript_search_covers_chat_dirs(self) -> None:
+        from fujimoto.cli import get_chat_scratch_dir
+
+        scratch = get_chat_scratch_dir("test-proj")
+        self._meta("test-proj/ask", scratch, claude_session_id="c")
+        with (
+            _patch_git_info(),
+            patch(
+                "fujimoto.cli.claude_search.list_session_logs", return_value=[]
+            ) as logs,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("s")
+                await pilot.press(*"hello")
+                await pilot.pause(app.SEARCH_DEBOUNCE + 0.2)
+                await app.workers.wait_for_complete()
+                assert scratch in logs.call_args.args[1]
 
 
 class TestSessionAppSessionActions:
@@ -6286,13 +6639,13 @@ class TestStoppedSessions:
         self, tmp_path: Path
     ) -> None:
         # A worktree with an open record must appear once, as stopped — not
-        # again under "inactive worktrees".
+        # again under "previous sessions".
         records = {"test-proj/wt-a": _record(tmp_path)}
         with _patch_git_info(worktrees=[Path("wt-a")], open_sessions=records):
             app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.pause()
-                assert "inactive worktrees" not in _list_text(app)
+                assert "previous sessions" not in _list_text(app)
                 assert app._session_map["wt-wt-a"].is_stopped is True
 
     @pytest.mark.asyncio
@@ -6304,7 +6657,7 @@ class TestStoppedSessions:
             app = SessionApp()
             async with app.run_test() as pilot:
                 await pilot.pause()
-                assert "inactive worktrees" in _list_text(app)
+                assert "previous sessions" in _list_text(app)
                 assert app._session_map["wt-wt-a"].is_stopped is False
 
     @pytest.mark.asyncio
@@ -10997,6 +11350,24 @@ class TestChatCommand:
         )
         assert code == 1
         assert "unknown project" in err
+
+    def test_resume_of_a_closed_chat_keeps_its_name(self, monkeypatch, capsys) -> None:
+        from fujimoto import chats
+        from fujimoto.cli import _resume_cli_target
+
+        chats.record_open(
+            "proj/ask", project="proj", cwd=self.root, claude_session_id="c1"
+        )
+        chats.mark_closed("proj/ask", "proj", None)
+        session = _make_claude_session("c1", cwd=self.root)
+        location = session_query.Location("proj", self.root, None)
+        with patch("fujimoto.cli.launch_options.resolve") as resolve:
+            resolve.return_value.args = ()
+            target, peer = _resume_cli_target(
+                session, location, fork=False, claude_args=None, parent=None
+            )
+        assert (target.tmux_name, target.session_type) == ("proj/ask", "chat")
+        assert peer == "proj-ask"
 
     def test_tui_chat_launch_gets_its_peer_name(self) -> None:
         from fujimoto.cli import _start_launch

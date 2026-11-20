@@ -110,7 +110,7 @@ from fujimoto.version_check import check_for_update, dismiss as dismiss_update_v
 from fujimoto.vscode import open_vscode
 from fujimoto.global_config import load_global_config
 from fujimoto.settings import Settings, load_settings, save_settings
-from fujimoto import config_command, session_query, session_state
+from fujimoto import chats, config_command, session_query, session_state
 from fujimoto.session_query import relative_time as _relative_time
 from fujimoto.session_state import StopKind
 from fujimoto.tmux import (
@@ -1566,6 +1566,10 @@ class SessionApp(App):
         # once per `_init_git_info` rather than per render, so search keystrokes
         # don't re-read the cache file.
         self._open_sessions: dict[str, session_state.SessionRecord] = {}
+        # This project's chats by name, open or closed (`chats.py`), loaded
+        # with the records; a chat with no record and no tmux session is a
+        # *previous* one.
+        self._chat_metas: dict[str, chats.ChatMeta] = {}
         self._available_projects: list[Path] = []
         self._project_dir_paths: dict[str, Path] = {}
         self._selected_session: SessionInfo | None = None
@@ -1738,6 +1742,7 @@ class SessionApp(App):
         self._default_branch = get_default_branch(cwd)
         self._active_sessions = set(list_project_sessions(self._project_name))
         self._open_sessions = session_state.prune()
+        self._chat_metas = {m.name: m for m in chats.prune(self._project_name)}
         # A different project means different transcripts and worktrees.
         self._claude_cache = None
         self._fork_marker_cache = {}
@@ -2103,13 +2108,12 @@ class SessionApp(App):
     def _chat_dirs(self) -> list[Path]:
         """Directories of this project's chats outside the root and worktrees."""
         known = {self._project_root, *self._existing_worktrees}
-        return [
+        paths = [
             rec.path
             for rec in self._open_sessions.values()
-            if rec.session_type == "chat"
-            and rec.project == self._project_name
-            and rec.path not in known
-        ]
+            if rec.session_type == "chat" and rec.project == self._project_name
+        ] + [meta.path for meta in self._chat_metas.values()]
+        return list(dict.fromkeys(p for p in paths if p not in known))
 
     def _claude_for(
         self, tmux_name: str, path: Path, record_id: str | None = None
@@ -2208,8 +2212,32 @@ class SessionApp(App):
         self._direct_cwd_cache[tmux_name] = resolved
         return resolved
 
+    def _conversation_owner(
+        self, project: str, conversation: str | None
+    ) -> tuple[str, str] | None:
+        """The not-running session (name, type) that recorded `conversation`."""
+        if not conversation:
+            return None
+        for name, meta in self._chat_metas.items():
+            if meta.claude_session_id == conversation and name not in (
+                self._active_sessions
+            ):
+                return name, "chat"
+        for name, rec in self._open_sessions.items():
+            if (
+                rec.claude_session_id == conversation
+                and rec.project == project
+                and name not in self._active_sessions
+            ):
+                return name, rec.session_type or "direct"
+        return None
+
     def _resume_target(
-        self, project: str, cwd: Path, session: SessionInfo | None = None
+        self,
+        project: str,
+        cwd: Path,
+        session: SessionInfo | None = None,
+        conversation: str | None = None,
     ) -> tuple[str, str]:
         """The tmux name and session type for resuming a transcript in `cwd`.
 
@@ -2224,7 +2252,21 @@ class SessionApp(App):
         `session` is the row the resume was started from; a worktree row names
         its own worktree even if the transcript recorded a directory that is no
         longer one of the project's.
+
+        Before any of that: a `conversation` that a not-running chat (closed or
+        stopped) or another stopped session recorded resumes as *that*
+        session, under its own name — a chat found by search comes back as
+        the chat, not as a new `session-N`.
         """
+        owner = self._conversation_owner(project, conversation)
+        if owner is not None:
+            debug.log(
+                "tui.resume_target",
+                via="owner",
+                tmux=debug.rv(owner[0]),
+                session_type=owner[1],
+            )
+            return owner
         worktree = self._matching_worktree(cwd)
         if worktree is None and session is not None:
             if session.session_type == "worktree":
@@ -2515,17 +2557,20 @@ class SessionApp(App):
             )
             items.extend(active_items)
 
-        # Inactive worktrees: no live session, and none the user still wants.
-        # A worktree with an open record is stopped, parked or recovered, and
-        # was rendered above.
+        # Previous sessions: everything with no live session and no open
+        # record — idle worktrees, closed chats and project-root conversations
+        # no row claims — in one section, most recently used first. A worktree
+        # or chat with an open record is stopped, parked or recovered, and was
+        # rendered above.
+        by_id = self._claude_session_data().by_id
+        previous: list[tuple[float, ListItem]] = []
+
         inactive_worktrees = [
             wt
             for wt in self._existing_worktrees
             if session_name(self._project_name, wt.name) not in self._active_sessions
             and session_name(self._project_name, wt.name) not in idle_records
         ]
-
-        inactive_items: list[ListItem] = []
         for wt in inactive_worktrees:
             sname = session_name(self._project_name, wt.name)
             item_id = f"wt-{wt.name}"
@@ -2551,26 +2596,42 @@ class SessionApp(App):
             )
             self._session_map[item_id] = info
             label_text = self._build_session_label(info, "")
-            inactive_items.append(ListItem(Label(label_text, markup=True), id=item_id))
-
-        if inactive_items:
-            items.append(
-                ListItem(
-                    Static(
-                        "───── inactive worktrees ─────",
-                        classes="separator-item",
-                    ),
-                    disabled=True,
-                ),
+            used = _last_used(cs, self._creation_times.get(str(wt), 0.0))
+            previous.append(
+                (used, ListItem(Label(label_text, markup=True), id=item_id))
             )
-            items.extend(inactive_items)
 
-        # Previous Claude sessions (from project root, not claimed by active items)
+        for meta in self._previous_chats():
+            cs = by_id.get(meta.claude_session_id or "")
+            if meta.claude_session_id:
+                claimed_claude_ids.add(meta.claude_session_id)
+            location = self._location_name("chat", meta.path)
+            if not self._search_matches(meta.slug, meta.name, location, "chat"):
+                continue
+            item_id = f"{_row_prefix('chat')}{meta.name.replace('/', '--')}"
+            info = SessionInfo(
+                name=meta.slug,
+                session_type="chat",
+                project=self._project_name,
+                path=meta.path,
+                tmux_session=meta.name,
+                is_active=False,
+                branch="",
+                claude_session_id=meta.claude_session_id,
+                claude_state=cs.state if cs else None,
+            )
+            self._session_map[item_id] = info
+            label_text = self._build_session_label(info, "")
+            used = _last_used(cs, _iso_timestamp(meta.closed or meta.created))
+            previous.append(
+                (used, ListItem(Label(label_text, markup=True), id=item_id))
+            )
+
+        # Project-root conversations no row claims, capped: there can be
+        # hundreds, and `s` finds the rest.
         previous_claude = [
             cs for cs in root_claude_sessions if cs.session_id not in claimed_claude_ids
         ][:5]
-
-        previous_items: list[ListItem] = []
         for cs in previous_claude:
             short_id = cs.session_id[:8]
             if not self._search_matches(short_id, cs.session_id, cs.git_branch or ""):
@@ -2590,19 +2651,25 @@ class SessionApp(App):
                 claude_session_id=cs.session_id,
                 claude_state=cs.state,
             )
-            previous_items.append(ListItem(Label(label_text, markup=True), id=item_id))
+            previous.append(
+                (
+                    _last_used(cs, 0.0),
+                    ListItem(Label(label_text, markup=True), id=item_id),
+                )
+            )
 
-        if previous_items:
+        if previous:
             items.append(
                 ListItem(
                     Static(
-                        "───── previous claude sessions ─────",
+                        "───── previous sessions ─────",
                         classes="separator-item",
                     ),
                     disabled=True,
                 ),
             )
-            items.extend(previous_items)
+            previous.sort(key=lambda entry: entry[0], reverse=True)
+            items.extend(item for _, item in previous)
 
         self._log_home_inventory(path_to_latest, root_claude_sessions)
 
@@ -3004,8 +3071,10 @@ class SessionApp(App):
             self.call_from_thread(self._search_failed, token, str(e))
             return
 
+        # Chats outside the root and worktrees (the shared scratch directory)
+        # are the project's conversations too.
         logs = claude_search.list_session_logs(
-            self._project_root, self._existing_worktrees
+            self._project_root, [*self._existing_worktrees, *self._chat_dirs()]
         )
         total = len(logs)
         try:
@@ -3322,6 +3391,12 @@ class SessionApp(App):
         Either way the stop is *recorded*, which is what stops a session the
         user ended deliberately being mistaken for one a crash took away.
         """
+        # Which conversation a chat is, decided before anything is killed or
+        # deleted: the registry only knows while claude runs, and the record
+        # goes with a terminate. The `Ctrl-A x` prompt's row carries no id.
+        conversation = (
+            self._chat_conversation(session) if session.session_type == "chat" else None
+        )
         try:
             if session.is_active:
                 try:
@@ -3337,6 +3412,8 @@ class SessionApp(App):
             if terminate:
                 self._keep_launch_options(session)
                 session_state.mark_closed(session.tmux_session)
+                if session.session_type == "chat":
+                    self._close_chat(session, conversation)
             else:
                 session_state.mark_stopped(
                     session.tmux_session,
@@ -3347,6 +3424,79 @@ class SessionApp(App):
             await self._show_home()
         except (TmuxError, ConfigError, GitError) as e:
             await self._show_error(str(e))
+
+    def _chat_conversation(self, session: SessionInfo) -> str | None:
+        """A chat's current conversation id, from the best source available.
+
+        Claude Code's registry first (it follows `/clear`), then the row, the
+        session record, and the chat's own file — whichever knows.
+        """
+        record = session_state.load_state().get(session.tmux_session)
+        meta = chats.get(session.tmux_session, session.project)
+        for via, conversation in (
+            ("registry", _live_claude_ids().get(session.tmux_session)),
+            ("row", session.claude_session_id),
+            ("record", record.claude_session_id if record else None),
+            ("chat-file", meta.claude_session_id if meta else None),
+        ):
+            if conversation:
+                debug.log(
+                    "tui.chat_conversation",
+                    chat=debug.rv(session.tmux_session),
+                    via=via,
+                )
+                return conversation
+        debug.log(
+            "tui.chat_conversation", chat=debug.rv(session.tmux_session), via="none"
+        )
+        return None
+
+    def _close_chat(self, session: SessionInfo, conversation: str | None) -> None:
+        """A terminated chat moves to *previous sessions*, if it said anything.
+
+        One that never received a message has no transcript to resume, so it
+        is forgotten outright rather than listed as an empty row.
+        """
+        spoke = bool(conversation) and any(
+            cs.session_id == conversation for cs in get_sessions_for_path(session.path)
+        )
+        debug.log(
+            "tui.chat_closed",
+            chat=debug.rv(session.tmux_session),
+            kept=spoke,
+            conversation=conversation or "none",
+        )
+        if spoke:
+            chats.mark_closed(session.tmux_session, session.project, conversation)
+        else:
+            self._forget_chat(session)
+
+    def _forget_chat(self, session: SessionInfo) -> str | None:
+        """Drop a chat's entry, and its scratch sub-directory if empty.
+
+        Returns the sub-directory when it holds files and so was kept.
+        """
+        chats.remove(session.tmux_session, session.project)
+        scratch = get_chat_scratch_dir(session.project, create=False)
+        if session.path != scratch:
+            return None
+        files = chat_files_dir(scratch, session.tmux_session)
+        try:
+            files.rmdir()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            debug.log("tui.chat_files_kept", path=debug.rp(files))
+            return str(files)
+        return None
+
+    async def _remove_chat(self, session: SessionInfo) -> None:
+        """`Remove from list` on a previous chat. Its transcript stays."""
+        kept = self._forget_chat(session)
+        if kept:
+            self.notify(f"Chat removed; its files are still in {kept}")
+        self._init_git_info()
+        await self._show_home()
 
     def _keep_launch_options(self, session: SessionInfo) -> None:
         """Carry a terminated session's launch options over to its transcript.
@@ -3522,7 +3672,10 @@ class SessionApp(App):
         items.append(ListItem(Label("Open terminal"), id="sa-terminal"))
         items.append(ListItem(Label("Open in VS Code"), id="sa-vscode"))
 
-        if session.session_type != "claude":
+        # A previous chat has no tmux session to rename.
+        if session.session_type != "claude" and (
+            session.session_type != "chat" or session.is_active or session.is_stopped
+        ):
             items.append(ListItem(Label("Rename"), id="sa-rename"))
 
         if self._can_edit_launch_options(session):
@@ -3543,6 +3696,12 @@ class SessionApp(App):
 
         if session.session_type == "worktree":
             items.append(ListItem(Label("Finish (cleanup/merge)"), id="sa-finish"))
+        if (
+            session.session_type == "chat"
+            and not session.is_active
+            and not session.is_stopped
+        ):
+            items.append(ListItem(Label("Remove from list"), id="sa-remove-chat"))
 
         items.append(ListItem(Label("[dim]Cancel[/]", markup=True), id="sa-cancel"))
 
@@ -3676,7 +3835,9 @@ class SessionApp(App):
     # -- Resume session picker --
 
     def _launch_resume(self, session: SessionInfo, cs: ClaudeSession) -> None:
-        tmux_name, session_type = self._resume_target(session.project, cs.cwd, session)
+        tmux_name, session_type = self._resume_target(
+            session.project, cs.cwd, session, cs.session_id
+        )
         self._launch(
             LaunchTarget(
                 session.project,
@@ -4944,7 +5105,17 @@ class SessionApp(App):
                 session_name(self._project_name, wt.name)
                 for wt in self._existing_worktrees
             }
+            # A closed chat is resumable under its name, so it keeps it.
+            | set(self._chat_metas)
         )
+
+    def _previous_chats(self) -> list[chats.ChatMeta]:
+        """This project's chats with neither a tmux session nor an open record."""
+        return [
+            meta
+            for name, meta in self._chat_metas.items()
+            if name not in self._active_sessions and name not in self._open_sessions
+        ]
 
     # -- New chat --
 
@@ -5300,6 +5471,8 @@ class SessionApp(App):
                     else None,
                 )
             )
+        elif action == "sa-remove-chat":
+            await self._remove_chat(session)
         elif action == "sa-resume-chat":
             self._launch(
                 LaunchTarget(
@@ -5312,7 +5485,7 @@ class SessionApp(App):
             )
         elif action == "sa-resume":
             tmux_name, session_type = self._resume_target(
-                session.project, session.path, session
+                session.project, session.path, session, session.claude_session_id
             )
             self._launch(
                 LaunchTarget(
@@ -5544,6 +5717,7 @@ class SessionApp(App):
         try:
             rename_session(session.tmux_session, new_tmux_name)
             session_state.rename(session.tmux_session, new_tmux_name)
+            chats.rename(session.tmux_session, new_tmux_name, session.project)
             self._init_git_info()
             await self._show_home()
         except TmuxError as e:
@@ -5704,6 +5878,27 @@ class SessionApp(App):
                 await self._show_home()
             except (ConfigError, GitError):
                 self.exit()
+
+
+def _last_used(cs: ClaudeSession | None, fallback: float) -> float:
+    """When a previous session was last used: its transcript, else `fallback`."""
+    if cs is not None and cs.last_activity is not None:
+        return cs.last_activity.timestamp()
+    return fallback
+
+
+def _iso_timestamp(stamp: str) -> float:
+    """Epoch seconds for an ISO-8601 stamp, 0.0 if it won't parse.
+
+    >>> _iso_timestamp("1970-01-01T00:01:00+00:00")
+    60.0
+    >>> _iso_timestamp("")
+    0.0
+    """
+    try:
+        return datetime.fromisoformat(stamp).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def _row_prefix(session_type: str) -> str:
@@ -6208,6 +6403,16 @@ def _start_launch(target: LaunchTarget, *, attach: bool = True) -> str | None:
     )
     # The default model is added here, after the options are saved, so it is
     # never stored as one of the session's own options.
+    if session_type == "chat":
+        chats.record_open(
+            resolved_name,
+            project=project_name,
+            cwd=working_dir,
+            claude_session_id=None
+            if target.fork_in_place
+            else resume_id or target.session_id,
+            parent_session=target.parent_session,
+        )
     claude_args = launch_options.with_default_model(
         _launch_claude_args(target, resolved_name) + target.extra_args,
         working_dir,
@@ -6546,11 +6751,17 @@ def _chat_peer_name(project: str, tmux_name: str) -> str:
 
 def _record_owning(
     claude_session_id: str, active: set[str]
-) -> tuple[str, session_state.SessionRecord] | None:
-    """The open, not-running record whose conversation this is, if any."""
+) -> tuple[str, str, str] | None:
+    """(name, project, type) of the not-running session this conversation is.
+
+    A stopped session's open record first, then a closed chat's file.
+    """
     for name, record in session_state.load_state().items():
         if record.claude_session_id == claude_session_id and name not in active:
-            return name, record
+            return name, record.project, record.session_type
+    meta = chats.find_by_conversation(claude_session_id)
+    if meta is not None and meta.name not in active:
+        return meta.name, meta.project, "chat"
     return None
 
 
@@ -6577,8 +6788,7 @@ def _resume_cli_target(
     if owner is not None:
         # A stopped session (a chat, typically) that still has its record:
         # bring it back as itself, not as a new `session-N`.
-        tmux_name, record = owner
-        project, session_type = record.project, record.session_type
+        tmux_name, project, session_type = owner
     elif location.project is None:
         project, session_type = "adhoc", "adhoc"
         tmux_name = get_next_adhoc_session_name(active)
