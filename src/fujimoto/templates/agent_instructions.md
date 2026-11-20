@@ -92,6 +92,34 @@ fujimoto new fix-flaky-test --detach --parent <your peer name> \
 
 Creates a worktree and starts a session in it. The JSON includes its tmux
 session and id, and `-- --name` sets the peer name you will message it at.
+Add `-- --model sonnet` to choose its model; otherwise the configured
+default model applies (see below).
+
+### Configuration: `fujimoto config`
+
+```sh
+fujimoto config list                           # every key, set or not, plus env vars
+fujimoto config list --json
+fujimoto config get model                      # effective value; exit 1 if unset
+fujimoto config set model opus --global        # ~/.config/fujimoto/config.yaml
+fujimoto config set model sonnet --project     # the project's .fujimoto.yaml
+fujimoto config unset model --project
+fujimoto config set claude_args --project -- --verbose  # a value starting with -
+```
+
+- `list` shows **every** key, including unset ones, with the scopes it can
+  be set in and what it does. Read it to find out what is configurable
+  before suggesting a change. The `FUJIMOTO_*` environment variables are
+  listed too, read-only.
+- `set` and `unset` need `--global` or `--project`. Project config lives in
+  the main clone, so running this from a worktree edits the project's file.
+  Comments in the file are kept. Change project config only when the user
+  asks, since it affects every session in the project.
+- `model` is passed to claude as `--model` at every launch unless the
+  session's launch options already set one. Project beats global. It is
+  added at launch and never saved into a session's options. Without it,
+  claude starts on whatever model was last chosen with `/model` in *any*
+  session.
 
 ## When to use them
 

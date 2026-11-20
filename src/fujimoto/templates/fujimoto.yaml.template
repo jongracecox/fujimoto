@@ -9,7 +9,8 @@
 # .git/info/exclude or .gitignore — since it often references local-only files
 # like .env.
 #
-# Three worktree-setup sections, plus `claude_args` (at the end), all optional:
+# Three worktree-setup sections, plus `claude_args` and `model` (at the end),
+# all optional:
 #   copy  — files copied from the main repo into the worktree
 #   link  — files hard/symbolically linked into the worktree
 #   init  — commands run inside the worktree after copy/link
@@ -94,3 +95,13 @@
 #   - ./plugins
 #
 # claude_args: --plugin-dir ./plugins --model opus
+
+# ---------------------------------------------------------------------------
+# model: the Claude model sessions in this project start with
+# ---------------------------------------------------------------------------
+# Passed as `--model` at every launch unless the session's launch options (or
+# `claude_args` above) already set one. Overrides `model` in the global config
+# (~/.config/fujimoto/config.yaml). Without it, claude starts on whatever model
+# was last picked with /model in *any* session.
+# Set it with: fujimoto config set model opus --project
+# model: opus

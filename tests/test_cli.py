@@ -10421,7 +10421,7 @@ class TestResumeCommand:
     def test_claude_args_rejected_elsewhere(self, monkeypatch, capsys) -> None:
         code, _, err = self._main(monkeypatch, capsys, "log", "x", "--", "--model")
         assert code == 2
-        assert "only accepted by 'new' and 'resume'" in err
+        assert "only accepted by 'new', 'resume' and 'config set'" in err
 
     # -- stop --
 
@@ -10540,7 +10540,7 @@ class TestAgentInstructions:
 
     def test_names_every_command(self) -> None:
         text = session_query.agent_instructions()
-        for command in ("search", "log", "resume", "stop", "new"):
+        for command in ("search", "log", "resume", "stop", "new", "config"):
             assert f"fujimoto {command} " in text
 
     def test_stays_generic(self) -> None:
@@ -10551,3 +10551,148 @@ class TestAgentInstructions:
             re.findall(r"\b[A-Z][A-Z0-9]+-\d+\b", session_query.agent_instructions())
         )
         assert keys == {"ABC-123"}
+
+
+def _write_global_config(text: str) -> None:
+    from fujimoto.global_config import global_config_path
+
+    path = global_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+class TestDefaultModel:
+    """The global/project `model` reaches every launch and the TUI shows it."""
+
+    def test_start_launch_appends_model(self) -> None:
+        _write_global_config("model: opus\n")
+        target = LaunchTarget("proj", Path("/tmp/test"), None, "worktree", None)
+        with (
+            patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
+            patch("fujimoto.cli._build_system_prompt", return_value="sp"),
+            patch("fujimoto.cli._session_terminal_title", return_value="t"),
+            patch("fujimoto.cli.set_terminal_title"),
+            patch("fujimoto.cli.session_state.mark_open"),
+            patch("fujimoto.cli._session_branch", return_value="b"),
+            patch(
+                "fujimoto.launch_options.get_main_worktree_root",
+                side_effect=GitError("no repo"),
+            ),
+        ):
+            from fujimoto.cli import _start_launch
+
+            _start_launch(target)
+        assert mock_launch.call_args.kwargs["extra_args"] == ("--model", "opus")
+
+    def test_explicit_model_is_kept_and_saved_without_default(
+        self, tmp_path: Path
+    ) -> None:
+        _write_global_config("model: opus\n")
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        store_session_meta(wt, "main")
+        target = LaunchTarget(
+            "proj", wt, None, "worktree", None, claude_args=("--verbose",)
+        )
+        with (
+            patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
+            patch("fujimoto.cli._build_system_prompt", return_value="sp"),
+            patch("fujimoto.cli.set_terminal_title"),
+            patch("fujimoto.cli._session_terminal_title", return_value="t"),
+            patch("fujimoto.cli.session_state.mark_open"),
+            patch("fujimoto.cli._session_branch", return_value="b"),
+            patch(
+                "fujimoto.launch_options.get_main_worktree_root",
+                side_effect=GitError("no repo"),
+            ),
+        ):
+            from fujimoto.cli import _start_launch
+
+            _start_launch(target)
+        assert mock_launch.call_args.kwargs["extra_args"] == (
+            "--verbose",
+            "--model",
+            "opus",
+        )
+        # The default model is not stored as one of the session's options.
+        assert read_claude_args(wt) == ["--verbose"]
+
+    @pytest.mark.asyncio
+    async def test_dialog_hint_names_default_model(self, tmp_path: Path) -> None:
+        _write_global_config("model: opus\n")
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await TestLaunchOptions()._open_actions(app, pilot, "wt-20260309-test")
+                TestLaunchOptions._select(app, "sa-launch")
+                await pilot.press("o")
+                await pilot.pause()
+                assert isinstance(app.screen, LaunchOptionsDialog)
+                hint = str(app.screen.query_one("#lo-model", Static).render())
+                assert "Default model: opus (global config)" in hint
+                # Not pre-filled, so it can't be saved by accident.
+                assert "--model" not in app.screen.query_one("#lo-input", Input).value
+
+    @pytest.mark.asyncio
+    async def test_dialog_hint_without_default_model(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260309-test"
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await TestLaunchOptions()._open_actions(app, pilot, "wt-20260309-test")
+                TestLaunchOptions._select(app, "sa-launch")
+                await pilot.press("o")
+                await pilot.pause()
+                hint = str(app.screen.query_one("#lo-model", Static).render())
+                assert "No default model set" in hint
+
+    @pytest.mark.asyncio
+    async def test_menu_label_shows_default_model(self, tmp_path: Path) -> None:
+        _write_global_config("model: opus\n")
+        root = tmp_path / "wts"
+        wt = root / "20260309-test"
+        with _patch_git_info(worktrees=[wt], worktree_root=root):
+            store_session_meta(wt, "main")
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                menu = TestLaunchOptionsMenu()
+                await menu._open_actions(app, pilot, "wt-20260309-test")
+                assert "model opus (global config)" in menu._label(app)
+                write_claude_args(wt, ["--model", "haiku"])
+                await app._show_session_actions(app._selected_session)
+                await pilot.pause()
+                assert "model opus" not in menu._label(app)
+
+    @pytest.mark.asyncio
+    async def test_invalid_global_config_shows_dialog(self) -> None:
+        from fujimoto.cli import ConfigErrorDialog
+
+        _write_global_config("modle: opus\n")
+        with _patch_git_info():
+            with patch("fujimoto.cli.load_project_config"):
+                app = SessionApp()
+                async with app.run_test() as pilot:
+                    await pilot.pause()
+                    assert isinstance(app.screen, ConfigErrorDialog)
+                    message = str(app.screen.query_one("#ce-message", Static).render())
+                    assert "config.yaml" in message
+
+    @pytest.mark.asyncio
+    async def test_pr_session_uses_default_model(self, tmp_path: Path) -> None:
+        _write_global_config("model: opus\n")
+        wt = tmp_path / "20260309-test"
+        with (
+            _patch_git_info(worktrees=[wt]),
+            patch("fujimoto.cli.push_branch"),
+            patch("fujimoto.cli.create_session_with_command") as mock_pr_session,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                session = SimpleNamespace(branch="b", project="proj", name="n", path=wt)
+                await app._do_push_and_pr(session)  # type: ignore[arg-type]
+        command = mock_pr_session.call_args.args[2]
+        assert command.startswith("claude -p --model opus --allowedTools")

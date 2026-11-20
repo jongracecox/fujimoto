@@ -111,7 +111,10 @@ src/fujimoto/
 ├── tmux.py       # tmux session lifecycle (create, attach, kill, list, install)
 ├── version.py    # importlib.metadata wrapper for the running fujimoto version
 ├── version_check.py  # daily PyPI update check, dismissal cache (~/.cache/fujimoto/)
-├── settings.py   # persistent user settings (~/.cache/fujimoto/settings.json)
+├── settings.py   # TUI preferences (quick_terminal), stored in the global config
+├── global_config.py   # ~/.config/fujimoto/config.yaml: model, quick_terminal
+├── config_command.py  # `fujimoto config` list/get/set/unset (UI-free) + key registry
+├── yaml_edit.py       # change one top-level YAML key, keeping every other line
 ├── session_state.py   # which sessions the user still considers open
 ├── debug.py      # --debug / --debug-redacted diagnostic logging + redaction
 ├── project_config.py  # optional per-project .fujimoto.yaml (copy/link/init worktree setup, claude_args)
@@ -142,6 +145,7 @@ src/fujimoto/
 - `fujimoto search QUERY [--project NAME|PATH | --all-projects] [-e] [-s] [--raw] [-n N] [--sort recent|relevance] [--include-self] [--json]` and `fujimoto log SESSION [--summary | --grep P [-e] [-s] [-C N]] [--head N | --tail N] [--roles LIST] [--json]` are the read-only query commands, dispatched to `_run_search_command` / `_run_log_command` **before** `_check_prerequisites` — they must work without tmux, and never open the TUI. All logic lives in `session_query.py`; `cli.py` only parses arguments, maps `QueryError` to exit 1 and prints. Text is the default output (for people *and* agents), `--json` the structured form. No match is exit 0.
 - `fujimoto resume SESSION [--fork] [--detach [--wait SECS]] [--prompt T] [--parent NAME] [-- claude args…]` is `new`'s twin for an existing conversation, and shares its plumbing: `_prepare_resume` returns a `LaunchTarget` for the launch loop's `initial_target`, or with `--detach` calls `_start_launch(attach=False)` under `_stdout_to_stderr` and prints `_resume_result` JSON. Rules, in order: an unknown id or unreadable log → exit 1; a missing `cwd` → exit 1 naming the branch (no recreation); already running (by `ActivityIndex`) and no `--fork` → connect (attached) or report (detached), **never a second process on one transcript**, and `--prompt` is an error since only a new process could take it; otherwise `_resume_cli_target` names the tmux session as the TUI's `_resume_target` does (the worktree's own name if free, else `direct-N`; `adhoc-N` outside a repo). `LaunchTarget` gained three `resume`-only fields: `extra_args` (appended after the launch options and **never saved**, which is how the automatic `--name <worktree>-<id8>` / `<worktree>-fork-<hex4>` avoids overwriting a session's chosen options; skipped when the options already set `--name`), `fork_in_place` (`--resume <id> --fork-session` in the same directory, recorded with no id until `wait_for_registration` finds the new one in Claude Code's registry and `mark_open` stores it) and `parent_session` (the `--parent` prompt for sessions with no `meta.json`). claude does not document `--session-id` with `--fork-session`, which is why a fork's id comes from the registry rather than being chosen up front.
 - `fujimoto stop SESSION [--json]` (`_run_stop_command`) resolves a tmux name directly, or a Claude session id via `session_query.tmux_for_session` (registry/tmux, refusing one running outside tmux), then `kill_session` + `mark_stopped`, the same as `Ctrl-A s`. It runs before the prerequisite check.
+- `fujimoto config [list|get KEY|set KEY VALUE|unset KEY] [--global|--project] [--json]` (`_run_config_command`, logic in `config_command.py`) runs before the prerequisite check. Bare `config` is `list`. `set`/`unset` *require* a scope flag (argparse mutually-exclusive group, `required=True`); `get` without one prints the effective value and exits 1 when unset, like `git config`. `config set` is the third command allowed a `--` remainder (after `new`/`resume`): `config set claude_args --project -- --verbose` passes a value argparse would otherwise read as a flag, joined back with `shlex.join`. Giving the value both before and after `--` is an error.
 - `fujimoto agent-instructions` prints `templates/agent_instructions.md` (`session_query.agent_instructions()`, via `importlib.resources`) — a slim guide for agents to the session commands and when to use them. **Keep it in step with the CLI**: `TestAgentInstructions.test_every_example_parses` runs every `fujimoto …` line in it through `_build_parser()` (the parser, extracted from `main()` for exactly this), and `test_stays_generic` checks the only ticket key in this shipped file is the `ABC-123` placeholder. Examples must stay synthetic (`ABC-123`, `8f0e2c1a`).
 - `fujimoto pane <vscode|terminal> --session <name>` dispatches to `_run_pane_command`, used by the in-session tmux key table (`Ctrl-A v` / `Ctrl-A w`). Resolves the session's working directory via `tmux display-message -p '#{session_path}'` and calls the existing `open_vscode` / `open_terminal` helpers; errors are surfaced via `tmux display-message` so they appear in the session's status bar.
 
@@ -265,12 +269,46 @@ row on the home screen without buying the user anything.
 - `open_vscode(directory)` — runs `code <directory>`. Raises `OSError` if the `code` CLI is not on PATH.
 - `_has_vscode()` — checks for `code` on PATH via `shutil.which`
 
-**`settings.py`** — Persistent user settings stored as JSON in
-`~/.cache/fujimoto/settings.json`:
-- `Settings` dataclass: `quick_terminal_enabled: bool | None` (None = never asked)
-- `load_settings()` / `save_settings()` — graceful read/write, swallow OS errors
-  and corrupt JSON (returns defaults). Mirrors the `version_check.py` cache
-  pattern.
+**`settings.py`** — TUI preferences, stored as keys of the global config:
+- `Settings` dataclass: `quick_terminal_enabled: bool | None` (None = never asked),
+  persisted as `quick_terminal` in `~/.config/fujimoto/config.yaml`.
+- `load_settings()` / `save_settings()` keep their old API so `cli.py`/`tmux.py`
+  are unchanged, and still never raise (an invalid global config reads as
+  "never asked"; write failures are logged as `settings.save_failed`).
+- **Migration:** the preference used to live in `~/.cache/fujimoto/settings.json`.
+  When the config has no `quick_terminal` and that file has a bool,
+  `load_settings` copies it into the config (`settings.migrated`) and leaves
+  the old file alone, so an older fujimoto running alongside still reads it.
+
+**`global_config.py`** — `~/.config/fujimoto/config.yaml` (`$XDG_CONFIG_HOME`
+moves it; `global_config_path()`). Pydantic `GlobalConfig(extra="forbid")` with
+`model` and `quick_terminal`. `load_global_config()` has the same contract as
+`load_project_config`: missing file → empty, malformed → `ConfigError`.
+`update_global_key(key, value, remove=)` writes through `yaml_edit`. Runtime
+state stays in `~/.cache/fujimoto/`; only user choices belong here.
+
+**`yaml_edit.py`** — `update_key(path, key, value, model, remove=)` changes one
+top-level key of a YAML file **on the text**: `yaml.compose` gives each
+top-level key's start line, the key's block runs to the next key minus any
+trailing column-0 comments/blank lines, and only those lines are replaced,
+removed or appended (value rendered by `yaml.safe_dump`, so `on` is quoted for
+the PyYAML reader). The result is validated against `model` before an atomic
+write (tmp + `os.replace`); an invalid value leaves the file untouched; an
+unchanged value doesn't rewrite. ruamel.yaml round-tripping was tried and
+rejected: a comment-only file (the `--create-config` template) loads as
+`None`, and deleting the last key drops the comment after it.
+
+**`config_command.py`** — `fujimoto config`, UI-free like `session_query.py`.
+`KEYS` is the registry (`KeySpec(name, description, scopes, parse)`): `model`
+(global+project), `quick_terminal` (global), `claude_args`/`on_error`
+(project), and `copy`/`link`/`init` (project, `parse=None`: listed but
+"edit .fujimoto.yaml"). `build_report()` reads both files (an invalid one is
+reported in `FileState.error`, not raised) and the `ENV_VARS` list;
+**`list` shows every registry key including unset ones**, with its scopes and
+description, so an agent can see what is configurable. Project config is
+found via `get_main_worktree_root` (the file launches read); `--project`
+outside a repo is a `ConfigError`. Instrumented as `config.report`,
+`config.set`, `config.unset`.
 
 **`session_state.py`** — Which sessions the user still considers open, stored
 as JSON in `~/.cache/fujimoto/sessions.json` (same graceful-degradation pattern
@@ -317,8 +355,9 @@ pydantic):
   (`copy`/`link`/`init`) because `copy` would shadow `BaseModel.copy()` — the
   Python attributes are `copy_entries` / `link_entries` / `init_commands`.
   `on_error` (default `ABORT`) governs the caller's reaction to a hard init
-  failure. `claude_args` (default `[]`) is the project's default launch
-  options; a single string is `shlex.split` by a `field_validator`, so both
+  failure. `model` (optional) is the project's default model (see
+  `launch_options.default_model`). `claude_args` (default `[]`) is the
+  project's default launch options; a single string is `shlex.split` by a `field_validator`, so both
   `claude_args: [--a, b]` and `claude_args: --a b` work.
 - `load_project_config(project_root)` — returns an empty config if the file is
   absent; raises `ConfigError` (reusing `config.ConfigError`) on malformed YAML
@@ -452,6 +491,20 @@ session:
   the record that held a direct session's options.
 - `parse(text)` / `render(args)` — `shlex.split` / `shlex.join`;
   `LaunchOptionsError` on an unbalanced quote.
+- **Default model** — `default_model(working_dir)` → `DefaultModel(model,
+  ModelSource)`: `.fujimoto.yaml` `model` (via the main clone), then the global
+  config's; an invalid file contributes nothing. `with_default_model(args,
+  working_dir)` appends `--model X` unless `has_model_flag(args)` (`--model` or
+  `--model=`). It is applied in `_start_launch` *after* `_launch_claude_args`
+  has saved/resolved the options, and to the background PR `claude -p`
+  command, so **the default is never stored as a session option** — changing it
+  reaches every session that hasn't pinned its own `--model`. That matters
+  because Claude Code's `/model` writes the user's global setting, so without
+  a pinned default one session's switch changes every later session.
+  `LaunchOptionsDialog` names the default in `#lo-model` (not in the input), and
+  the session-menu label appends it; `_default_model_for` falls back to the
+  project root for a worktree that doesn't exist yet. Logged as
+  `launch_options.model`.
 - `project_default(working_dir)` reads `.fujimoto.yaml` from
   `get_main_worktree_root(working_dir)`, so a worktree and a direct session
   find the same file; any `GitError`/`ConfigError` contributes `()` (a
@@ -865,7 +918,7 @@ Three custom exception types, all caught in `main()`:
   - **Config is read from the source root (main clone), not the worktree.** `.fujimoto.yaml` is a local, uncommitted file in the main clone, so it isn't present in a worktree checkout — `_apply_worktree_config` calls `load_project_config(source_root)`. (`--create-config` writes it to the main clone's root.)
   - **Worktree detection**: `_resolve_worktree_source` returns the main repo root (from meta `source_root`, else derived via `git.get_main_worktree_root`) only for a *linked* worktree; returns `None` for the main repo / direct / adhoc sessions (which then get no config). This is git-based, not `session_type`-based, so the resume path (historically labelled `"direct"`) is covered too.
   - **`once` vs `always`**: trigger is `CREATE` only on the worktree's first launch — tracked by the `.fujimoto/config_once_applied` marker (`config.config_once_applied` / `mark_config_once_applied`); every later connection uses `LAUNCH` (only `always` entries). The marker is set after a successful (or `on_error=continue`) CREATE application, so `once` truly runs once.
-  - **Syntax errors are surfaced when the TUI opens.** `on_mount` calls `_project_config_error()` (which parses `load_project_config(self._project_root)`) and, on a `ConfigError`, pushes a `ConfigErrorDialog` modal (OK button; Enter/Escape to dismiss) over the home screen. It's informational only — dismissing it doesn't block any action, since you may need to launch a session to fix the file. Shown once per TUI appearance (per `SessionApp` instance / loop iteration). At launch time `_apply_worktree_config` simply skips a malformed config (no pause), since it's already been surfaced. The dialog (and `_show_error`) render the message with `markup=False` / `rich.markup.escape` because pydantic validation text contains brackets that would otherwise be parsed as console markup.
+  - **Syntax errors are surfaced when the TUI opens.** `on_mount` calls `_project_config_error()` (which parses the global config *and* `load_project_config(self._project_root)`, joining both errors) and, on a `ConfigError`, pushes a `ConfigErrorDialog` modal (OK button; Enter/Escape to dismiss) over the home screen. It's informational only — dismissing it doesn't block any action, since you may need to launch a session to fix the file. Shown once per TUI appearance (per `SessionApp` instance / loop iteration). At launch time `_apply_worktree_config` simply skips a malformed config (no pause), since it's already been surfaced. The dialog (and `_show_error`) render the message with `markup=False` / `rich.markup.escape` because pydantic validation text contains brackets that would otherwise be parsed as console markup.
   - **Errors**: copy/link issues are non-fatal warnings printed to stderr. A non-`continue_on_error` init failure is governed by the config's `on_error`: `abort` returns `False` (main `continue`s the loop → TUI reopens, launch skipped) and `continue` attaches anyway. Either way `_pause_for_key` shows the error and waits for a keypress so it isn't wiped by `tmux attach`.
 - **Debug logging (`--debug` / `--debug-redacted`)**: instrumentation lives at
   the call sites that matter (subprocess wrappers, discovery functions, TUI
@@ -1045,6 +1098,11 @@ uv run pytest
 ```
 
 Coverage is reported automatically (configured in `pyproject.toml`).
+
+`tests/conftest.py` points `XDG_CONFIG_HOME` at a per-test temp dir (autouse),
+so a real `~/.config/fujimoto/config.yaml` — e.g. a default `model` — can't
+leak into launch tests' expected claude arguments. Write global config in a
+test through `global_config_path()`.
 
 ### Matrix testing with nox
 
