@@ -319,6 +319,31 @@ DEFAULT_SESSION_TITLE = "session"
 DEFAULT_CHAT_TITLE = "chat"
 
 
+def get_chat_scratch_dir(project_name: str, *, create: bool = True) -> Path:
+    """Where a project's "temp" chats run: `~/.fujimoto/chats/<project>/`.
+
+    One directory per project, shared by all its temp chats, rather than a
+    fresh `mkdtemp` each time: Claude Code asks to trust every new directory
+    outside a trusted repo, and a chat started with `--detach` would sit at
+    that prompt with nobody to answer it. Trusted once, this never asks again.
+    Each chat keeps its files in a sub-directory of its own (see
+    `chat_files_dir`).
+    """
+    path = Path.home() / ".fujimoto" / "chats" / project_name
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def chat_files_dir(scratch_dir: Path, tmux_name: str) -> Path:
+    """A temp chat's own sub-directory of the shared scratch directory.
+
+    >>> chat_files_dir(Path("/s"), "proj/auth-question")
+    PosixPath('/s/auth-question')
+    """
+    return scratch_dir / tmux_name.rsplit("/", 1)[-1]
+
+
 def next_session_name(
     project_name: str, title: str, taken: Collection[str], *, fallback: str
 ) -> str:

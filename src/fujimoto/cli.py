@@ -9,7 +9,6 @@ import secrets
 import shlex
 import subprocess
 import sys
-import tempfile
 import textwrap
 import threading
 import uuid
@@ -51,7 +50,7 @@ from fujimoto.claude import (
     read_raw_transcript,
     read_transcript,
 )
-from fujimoto.claude import live
+from fujimoto.claude import live, trust
 from fujimoto.claude import search as claude_search
 from fujimoto.claude.search import (
     ContentMode,
@@ -67,6 +66,8 @@ from fujimoto.config import (
     get_next_adhoc_session_name,
     DEFAULT_CHAT_TITLE,
     DEFAULT_SESSION_TITLE,
+    chat_files_dir,
+    get_chat_scratch_dir,
     get_project_worktrees_dir,
     list_projects,
     mark_config_once_applied,
@@ -5053,7 +5054,11 @@ class SessionApp(App):
                 Label(
                     Content.assemble(
                         (TEMP_LOCATION, "bold"),
-                        ("  (scratch directory outside the repo)", "dim"),
+                        (
+                            "  (shared scratch directory outside the repo; "
+                            "each chat gets a sub-directory)",
+                            "dim",
+                        ),
                     )
                 ),
                 id="cl-temp",
@@ -5240,7 +5245,7 @@ class SessionApp(App):
             return  # pragma: no cover - the disabled "no matches" row
         path = self._chat_locations[item_id]
         if path is None:
-            path = Path(tempfile.mkdtemp(prefix="fujimoto-chat-"))
+            path = get_chat_scratch_dir(self._project_name)
         tmux_name = next_session_name(
             self._project_name,
             self._chat_title,
@@ -5742,12 +5747,29 @@ def _session_branch(working_dir: Path) -> str:
         return ""
 
 
-def _chat_system_prompt(project: str, working_dir: Path) -> str:
+def _chat_system_prompt(
+    project: str, working_dir: Path, files_dir: Path | None = None
+) -> str:
     """Tell a chat what it is for, where it is, and that work is a decision.
 
     Soft on purpose: a chat may well end in work, but the user should choose
-    where that happens rather than find it done in a shared directory.
+    where that happens rather than find it done in a shared directory. A chat
+    in the project's shared scratch directory (`files_dir` set) is also told
+    to keep any files in its own sub-directory.
     """
+    if files_dir is not None:
+        return (
+            f"This is a fujimoto chat session for project '{project}': it is "
+            "for conversation and questions rather than implementation work. "
+            f"It is running in {working_dir}, a scratch directory outside the "
+            "repository that the project's other chats share, so the "
+            "project's files are not here. If you need to write any files, "
+            f"put them in {files_dir}, this chat's own sub-directory, never "
+            "directly in the shared directory. If work comes up that means "
+            "changing the project's files, make sure the user deliberately "
+            "decides where it should happen (for example a new fujimoto "
+            "worktree session) first."
+        )
     try:
         root = get_main_worktree_root(working_dir)
     except GitError:
@@ -5790,11 +5812,32 @@ def _session_parent(
     return record.parent_session if record else None
 
 
+def _chat_files(project: str, working_dir: Path, tmux_name: str) -> Path | None:
+    """Create and return a scratch-directory chat's own sub-directory.
+
+    None for a chat anywhere else (project root, a worktree), where files
+    belong to the project and a sub-directory would only be clutter.
+    """
+    if working_dir != get_chat_scratch_dir(project, create=False):
+        return None
+    files = chat_files_dir(working_dir, tmux_name)
+    try:
+        files.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:  # pragma: no cover - the scratch dir was just made
+        debug.log("launch.chat_files", path=debug.rp(files), error=type(exc).__name__)
+    return files
+
+
 def _build_system_prompt(
-    session_type: str, project: str, working_dir: Path, parent: str | None = None
+    session_type: str,
+    project: str,
+    working_dir: Path,
+    parent: str | None = None,
+    *,
+    files_dir: Path | None = None,
 ) -> str:
     if session_type == "chat":
-        prompt = _chat_system_prompt(project, working_dir)
+        prompt = _chat_system_prompt(project, working_dir, files_dir)
         return f"{prompt} {_parent_system_prompt(parent)}" if parent else prompt
     if session_type == "adhoc":
         return (
@@ -6124,8 +6167,13 @@ def _start_launch(target: LaunchTarget, *, attach: bool = True) -> str | None:
     else:
         # A resumed chat gets its whole prompt again for the same reason: what
         # it is for is not in the transcript, only in the appended prompt.
+        files_dir = (
+            _chat_files(project_name, working_dir, resolved_name)
+            if session_type == "chat"
+            else None
+        )
         system_prompt = _build_system_prompt(
-            session_type, project_name, working_dir, parent
+            session_type, project_name, working_dir, parent, files_dir=files_dir
         )
     # The appended system prompt does not survive into a resumed process, so
     # this is added on every launch, not only the first.
@@ -6164,6 +6212,11 @@ def _start_launch(target: LaunchTarget, *, attach: bool = True) -> str | None:
         _launch_claude_args(target, resolved_name) + target.extra_args,
         working_dir,
     )
+    if session_type == "chat" and _peer_name_in(claude_args) is None:
+        # A chat is for being talked to, so it gets a predictable address —
+        # the same one however it was started or resumed. Not saved as a
+        # launch option, so renaming the chat renames the address too.
+        claude_args += ("--name", _chat_peer_name(project_name, resolved_name))
     launch_claude_in_tmux(
         project_name,
         working_dir,
@@ -6385,7 +6438,7 @@ def _prepare_chat(
     project = scope.project or ""
     root = scope.root or Path.cwd()
     if args.in_temp:
-        cwd = Path(tempfile.mkdtemp(prefix="fujimoto-chat-"))
+        cwd = get_chat_scratch_dir(project)
         location = TEMP_LOCATION
     elif args.in_worktree:
         cwd = _pick_worktree(scope.worktrees, args.in_worktree)
@@ -6405,11 +6458,8 @@ def _prepare_chat(
         if claude_args is not None
         else launch_options.resolve(cwd, tmux_name, None).args
     )
-    peer = _peer_name_in(configured)
-    extra: tuple[str, ...] = ()
-    if peer is None:
-        peer = f"{project}-{tmux_name.split('/', 1)[1]}"
-        extra = ("--name", peer)
+    # `_start_launch` adds the `--name` when the options don't set one.
+    peer = _peer_name_in(configured) or _chat_peer_name(project, tmux_name)
     target = LaunchTarget(
         project,
         cwd,
@@ -6418,7 +6468,6 @@ def _prepare_chat(
         claude_args=claude_args,
         session_id=str(uuid.uuid4()),
         prompt=args.prompt,
-        extra_args=extra,
         parent_session=args.parent,
     )
     debug.log(
@@ -6432,8 +6481,19 @@ def _prepare_chat(
     )
     if not args.detach:
         return target
+    # Claude Code asks to trust a directory outside any trusted repo, and a
+    # detached session has nobody to answer: say so rather than hang silently.
+    needs_trust = location == TEMP_LOCATION and trust.is_trusted(cwd) is False
     with _stdout_to_stderr():
         _start_launch(target, attach=False)
+    if needs_trust:
+        print(
+            f"fujimoto: Claude Code has not trusted {cwd} yet, so this chat is "
+            "waiting at its trust prompt. Attach once "
+            f"(tmux attach-session -t {shlex.quote(tmux_name)}) and accept; "
+            "later temp chats for this project won't ask.",
+            file=sys.stderr,
+        )
     print(
         json.dumps(
             {
@@ -6444,6 +6504,7 @@ def _prepare_chat(
                 "peer_name": peer,
                 "parent_session": args.parent,
                 "session_started": True,
+                "needs_trust": needs_trust,
                 "attach_command": f"tmux attach-session -t {shlex.quote(tmux_name)}",
                 "stop_command": f"fujimoto stop {shlex.quote(tmux_name)}",
             },
@@ -6472,6 +6533,15 @@ def _peer_name_in(args: tuple[str, ...]) -> str | None:
         if arg.startswith("--name="):
             return arg.split("=", 1)[1]
     return None
+
+
+def _chat_peer_name(project: str, tmux_name: str) -> str:
+    """A chat's `SendMessage` address: `<project>-<chat name>`.
+
+    >>> _chat_peer_name("proj", "proj/auth-question")
+    'proj-auth-question'
+    """
+    return f"{project}-{tmux_name.rsplit('/', 1)[-1]}"
 
 
 def _record_owning(
@@ -6536,7 +6606,10 @@ def _resume_cli_target(
         ).args
     peer = _peer_name_in(configured)
     extra: tuple[str, ...] = ()
-    if peer is None:
+    if peer is None and session_type == "chat":
+        # `_start_launch` names a chat itself, the same way every time.
+        peer = _chat_peer_name(project, tmux_name)
+    elif peer is None:
         base = location.worktree.name if location.worktree else project
         suffix = f"fork-{secrets.token_hex(2)}" if fork else session.session_id[:8]
         peer = f"{base}-{suffix}"
