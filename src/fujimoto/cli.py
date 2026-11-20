@@ -5149,6 +5149,26 @@ def _build_system_prompt(session_type: str, project: str, working_dir: Path) -> 
     )
 
 
+# Appended to every session fujimoto launches (new, fork and resume), so a
+# session asked about fujimoto finds its CLI instead of reading its files.
+FUJIMOTO_CLI_PROMPT = (
+    "The `fujimoto` CLI manages this session: run `fujimoto agent-instructions` "
+    "for its commands (session search/log/resume, and `fujimoto config` to show "
+    "or change fujimoto's settings)."
+)
+
+
+def _with_cli_prompt(prompt: str | None) -> str:
+    """`prompt` followed by `FUJIMOTO_CLI_PROMPT`.
+
+    >>> _with_cli_prompt(None) == FUJIMOTO_CLI_PROMPT
+    True
+    >>> _with_cli_prompt("Hi.").startswith("Hi. The `fujimoto` CLI")
+    True
+    """
+    return f"{prompt} {FUJIMOTO_CLI_PROMPT}" if prompt else FUJIMOTO_CLI_PROMPT
+
+
 def _parent_system_prompt(parent: str) -> str:
     """Tell a session which session started it, and how to reach that one.
 
@@ -5430,6 +5450,9 @@ def _start_launch(target: LaunchTarget, *, attach: bool = True) -> str | None:
         system_prompt = _parent_system_prompt(parent) if parent else None
     else:
         system_prompt = _build_system_prompt(session_type, project_name, working_dir)
+    # The appended system prompt does not survive into a resumed process, so
+    # this is added on every launch, not only the first.
+    system_prompt = _with_cli_prompt(system_prompt)
     if attach:
         set_terminal_title(
             _session_terminal_title(project_name, tmux_name, working_dir, session_type)

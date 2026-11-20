@@ -25,6 +25,7 @@ from fujimoto.claude.log_parser import EntryType, StopReason
 from types import SimpleNamespace
 
 from fujimoto.cli import (
+    FUJIMOTO_CLI_PROMPT,
     CSS,
     ICON_EYES,
     ICON_FORK,
@@ -1320,7 +1321,7 @@ class TestMain:
                 "proj",
                 Path("/tmp/test"),
                 None,
-                system_prompt="test",
+                system_prompt=f"test {FUJIMOTO_CLI_PROMPT}",
                 resume_session_id=None,
                 fork_session=False,
                 extra_args=(),
@@ -1369,7 +1370,7 @@ class TestMain:
                 "proj",
                 Path("/tmp/repo"),
                 "proj/direct-1",
-                system_prompt="test",
+                system_prompt=f"test {FUJIMOTO_CLI_PROMPT}",
                 resume_session_id=None,
                 fork_session=False,
                 extra_args=(),
@@ -5160,7 +5161,7 @@ class TestPolling:
 
 
 class TestMainResume:
-    def test_resume_skips_system_prompt(self) -> None:
+    def test_resume_gets_only_the_cli_prompt(self) -> None:
         app1 = SessionApp.__new__(SessionApp)
         app1._launch_target = LaunchTarget(
             "proj",
@@ -5185,7 +5186,8 @@ class TestMainResume:
                 "proj",
                 Path("/tmp/repo"),
                 "proj/direct-1",
-                system_prompt=None,
+                # Only the CLI pointer: a resume carries its own context.
+                system_prompt=FUJIMOTO_CLI_PROMPT,
                 resume_session_id="resume-session-id",
                 fork_session=False,
                 extra_args=(),
