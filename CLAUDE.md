@@ -128,7 +128,8 @@ src/fujimoto/
     ├── __init__.py      # Re-exports public API
     ├── log_parser.py    # Parse Claude JSONL session logs (state, metadata, session lookup)
     ├── search.py        # Full-text search across JSONL transcripts (batched, cancellable)
-    └── live.py          # Claude Code's running-process registry (~/.claude/sessions/)
+    ├── live.py          # Claude Code's running-process registry (~/.claude/sessions/)
+    └── trust.py         # read-only: has Claude Code trusted a directory? (~/.claude.json)
 ```
 
 ## Architecture
@@ -147,7 +148,7 @@ src/fujimoto/
 - `fujimoto stop SESSION [--json]` (`_run_stop_command`) resolves a tmux name directly, or a Claude session id via `session_query.tmux_for_session` (registry/tmux, refusing one running outside tmux), then `kill_session` + `mark_stopped`, the same as `Ctrl-A s`. It runs before the prerequisite check.
 - `fujimoto config [list|get KEY|set KEY VALUE|unset KEY] [--global|--project] [--json]` (`_run_config_command`, logic in `config_command.py`) runs before the prerequisite check. Bare `config` is `list`. `set`/`unset` *require* a scope flag (argparse mutually-exclusive group, `required=True`); `get` without one prints the effective value and exits 1 when unset, like `git config`. `config set` is the third command allowed a `--` remainder (after `new`/`resume`): `config set claude_args --project -- --verbose` passes a value argparse would otherwise read as a flag, joined back with `shlex.join`. Giving the value both before and after `--` is an error.
 - **Every launch's system prompt ends with `FUJIMOTO_CLI_PROMPT`** (`_with_cli_prompt` in `_start_launch`, covering new, fork and resume — a resume otherwise gets only the parent link, since an appended system prompt does not survive into a new process). It points the session at `fujimoto agent-instructions` and names `fujimoto config`; without it, a session asked to "show the fujimoto config" read the YAML files instead. Keep it one sentence: it is paid on every launch.
-- `fujimoto chat [TITLE] [--in WORKTREE | --in-temp] [--project NAME|PATH] [--prompt T] [--parent NAME] [--detach] [-- claude args…]` (`_prepare_chat`) starts a chat session (see Session Types) without creating a worktree. The project comes from `session_query.resolve_scope` (cwd, or `--project` path/name), so it shares `search`'s rules. Location: the project root by default; `--in` via `_pick_worktree` (exact name, else the one name containing the text; none/several → exit 1 listing them); `--in-temp` a `mkdtemp(prefix="fujimoto-chat-")`. The name is `next_session_name(..., fallback="chat")` against every tmux session, every record and every worktree name. A fresh `--session-id`, `--prompt`, and — unless the launch options already set one (`_peer_name_in`) — an unsaved `--name <project>-<chat name>` in `extra_args`, so the JSON's `peer_name` is a real address before the process registers. `--parent` goes onto the *record* (`mark_open(parent_session=…)`), since a chat has no `meta.json`. `chat --detach` is dispatched before `_check_prerequisites`, so with `--project` it works from outside any repo; attached, it is the launch loop's `initial_target` like `new`.
+- `fujimoto chat [TITLE] [--in WORKTREE | --in-temp] [--project NAME|PATH] [--prompt T] [--parent NAME] [--detach] [-- claude args…]` (`_prepare_chat`) starts a chat session (see Session Types) without creating a worktree. The project comes from `session_query.resolve_scope` (cwd, or `--project` path/name), so it shares `search`'s rules. Location: the project root by default; `--in` via `_pick_worktree` (exact name, else the one name containing the text; none/several → exit 1 listing them); `--in-temp` the project's scratch directory, reporting `needs_trust` (JSON) plus a stderr hint when `claude.trust.is_trusted` says Claude Code has not trusted it yet. The name is `next_session_name(..., fallback="chat")` against every tmux session, every record and every worktree name. A fresh `--session-id`, `--prompt`, and — unless the launch options already set one (`_peer_name_in`) — an unsaved `--name <project>-<chat name>` in `extra_args`, so the JSON's `peer_name` is a real address before the process registers. `--parent` goes onto the *record* (`mark_open(parent_session=…)`), since a chat has no `meta.json`. `chat --detach` is dispatched before `_check_prerequisites`, so with `--project` it works from outside any repo; attached, it is the launch loop's `initial_target` like `new`.
 - `fujimoto agent-instructions` prints `templates/agent_instructions.md` (`session_query.agent_instructions()`, via `importlib.resources`) — a slim guide for agents to the session commands and when to use them. **Keep it in step with the CLI**: `TestAgentInstructions.test_every_example_parses` runs every `fujimoto …` line in it through `_build_parser()` (the parser, extracted from `main()` for exactly this), and `test_stays_generic` checks the only ticket key in this shipped file is the `ABC-123` placeholder. Examples must stay synthetic (`ABC-123`, `8f0e2c1a`).
 - `fujimoto pane <vscode|terminal> --session <name>` dispatches to `_run_pane_command`, used by the in-session tmux key table (`Ctrl-A v` / `Ctrl-A w`). Resolves the session's working directory via `tmux display-message -p '#{session_path}'` and calls the existing `open_vscode` / `open_terminal` helpers; errors are surfaced via `tmux display-message` so they appear in the session's status bar.
 
@@ -225,8 +226,9 @@ row on the home screen without buying the user anything.
 
 **Chat sessions** (`session_type="chat"`) — for questions and conversation, not work:
 - `+ New chat` → optional title (`#chat-title-input`) → location picker
-  (`#chat-location-panel`): `cl-root` (project-root), `cl-temp` (a
-  `mkdtemp(prefix="fujimoto-chat-")`, created only once chosen), then worktrees
+  (`#chat-location-panel`): `cl-root` (project-root), `cl-temp` (the
+  project's shared scratch directory, `config.get_chat_scratch_dir(project)` =
+  `~/.fujimoto/chats/<project>/`, created only once chosen), then worktrees
   `cl-wt-N` ordered by their newest transcript's activity
   (`_chat_worktrees_by_recency`, creation time as fallback). `/` filters
   worktrees by name and `s` by transcript text (`_open_chat_filter(mode)`):
@@ -257,6 +259,17 @@ row on the home screen without buying the user anything.
   enforced — that work which changes files needs the user to choose where it
   happens first. A resumed chat gets the whole prompt again (`_start_launch`),
   since an appended system prompt does not survive into a new process.
+- **Temp chats share one scratch directory per project, not a fresh
+  `mkdtemp`.** Claude Code asks to trust every new directory outside a trusted
+  repo (worktrees inherit the main clone's trust; a temp dir has none), there
+  is no CLI to pre-trust one, and a `--detach`ed chat sat at that prompt
+  forever — no transcript, no registry entry. One directory is trusted once.
+  Each chat gets `chat_files_dir(scratch, tmux_name)` (created by
+  `_chat_files` in `_start_launch`), and `_chat_system_prompt(files_dir=…)`
+  tells it to write files there, never in the shared directory.
+  `claude/trust.py` only *reads* `hasTrustDialogAccepted` from
+  `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json`) — fujimoto must never
+  write that file, which Claude Code rewrites constantly.
 - A chat skips `_apply_worktree_config`: in a worktree it is a guest, and the
   worktree's own session already runs its copy/link/init.
 - `launch_options._uses_worktree_meta` keeps a chat (or any session whose

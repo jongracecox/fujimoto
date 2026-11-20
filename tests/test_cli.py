@@ -185,10 +185,24 @@ def _clean_argv(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("sys.argv", ["fujimoto"])
 
 
+def _fake_scratch(tmp_path: Path):
+    def scratch(project: str, *, create: bool = True) -> Path:
+        path = tmp_path / "chats" / project
+        if create:
+            path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    return scratch
+
+
 @pytest.fixture(autouse=True)
 def _isolate_session_state(tmp_path: Path):
-    """Keep the TUI tests off the real ~/.cache/fujimoto/sessions.json."""
+    """Keep the TUI tests off the real ~/.cache/fujimoto/sessions.json.
+
+    And off the real `~/.fujimoto/chats` scratch directory.
+    """
     with (
+        patch("fujimoto.cli.get_chat_scratch_dir", side_effect=_fake_scratch(tmp_path)),
         patch(
             "fujimoto.session_state._state_path",
             return_value=tmp_path / "session-state" / "sessions.json",
@@ -1324,7 +1338,9 @@ class TestMain:
             patch("fujimoto.cli._session_terminal_title", return_value="test-title"),
         ):
             main()
-            mock_sp.assert_called_once_with("worktree", "proj", Path("/tmp/test"), None)
+            mock_sp.assert_called_once_with(
+                "worktree", "proj", Path("/tmp/test"), None, files_dir=None
+            )
             mock_apply.assert_called_once_with(Path("/tmp/test"), interactive=True)
             mock_launch.assert_called_once_with(
                 "proj",
@@ -2703,7 +2719,7 @@ class TestNewChat:
                 target = app._launch_target
                 assert target is not None
                 assert target.tmux_name == "test-proj/quick-q"
-                assert target.working_dir.name.startswith("fujimoto-chat-")
+                assert target.working_dir.parts[-2:] == ("chats", "test-proj")
                 assert target.working_dir.is_dir()
 
     @pytest.mark.asyncio
@@ -10922,18 +10938,43 @@ class TestChatCommand:
         assert "no worktree matches 'zzz'" in err
 
     def test_in_temp(self, monkeypatch, capsys) -> None:
-        with patch("fujimoto.cli.get_main_worktree_root", side_effect=GitError("no")):
-            code, out, _ = self._main(
-                monkeypatch, capsys, "chat", "--in-temp", "--detach"
+        with patch("fujimoto.cli.trust.is_trusted", return_value=True):
+            code, out, err = self._main(
+                monkeypatch, capsys, "chat", "ask", "--in-temp", "--detach"
             )
         assert code == 0
         result = json.loads(out)
         assert result["location"] == "temp"
-        assert Path(result["working_dir"]).name.startswith("fujimoto-chat-")
-        assert (
-            "temporary scratch directory"
-            in self.launch.call_args.kwargs["system_prompt"]
-        )
+        assert result["needs_trust"] is False
+        scratch = Path(result["working_dir"])
+        assert scratch.parts[-2:] == ("chats", "proj")
+        # The chat's own sub-directory exists and the prompt points at it.
+        assert (scratch / "ask").is_dir()
+        prompt = self.launch.call_args.kwargs["system_prompt"]
+        assert f"put them in {scratch / 'ask'}" in prompt
+        assert "trust" not in err
+
+    def test_untrusted_scratch_dir_is_reported(self, monkeypatch, capsys) -> None:
+        with patch("fujimoto.cli.trust.is_trusted", return_value=False):
+            code, out, err = self._main(
+                monkeypatch, capsys, "chat", "--in-temp", "--detach"
+            )
+        assert code == 0
+        assert json.loads(out)["needs_trust"] is True
+        assert "trust prompt" in err
+        assert "tmux attach-session -t proj/chat-2" in err
+
+    def test_unknown_trust_is_not_reported(self, monkeypatch, capsys) -> None:
+        with patch("fujimoto.cli.trust.is_trusted", return_value=None):
+            code, out, _ = self._main(
+                monkeypatch, capsys, "chat", "--in-temp", "--detach"
+            )
+        assert json.loads(out)["needs_trust"] is False
+
+    def test_root_chat_never_checks_trust(self, monkeypatch, capsys) -> None:
+        with patch("fujimoto.cli.trust.is_trusted") as is_trusted:
+            self._main(monkeypatch, capsys, "chat", "--detach")
+        is_trusted.assert_not_called()
 
     def test_in_and_in_temp_are_exclusive(self, monkeypatch, capsys) -> None:
         code, _, _ = self._main(
@@ -10956,6 +10997,22 @@ class TestChatCommand:
         )
         assert code == 1
         assert "unknown project" in err
+
+    def test_tui_chat_launch_gets_its_peer_name(self) -> None:
+        from fujimoto.cli import _start_launch
+
+        target = LaunchTarget("proj", self.root, "proj/ask", "chat", session_id="u1")
+        _start_launch(target, attach=False)
+        assert self.launch.call_args.kwargs["extra_args"][-2:] == ("--name", "proj-ask")
+
+    def test_chat_name_in_options_is_not_doubled(self) -> None:
+        from fujimoto.cli import _start_launch
+
+        target = LaunchTarget(
+            "proj", self.root, "proj/ask", "chat", claude_args=("--name", "mine")
+        )
+        _start_launch(target, attach=False)
+        assert self.launch.call_args.kwargs["extra_args"] == ("--name", "mine")
 
     def test_attached_chat_returns_a_target(self) -> None:
         args = SimpleNamespace(
@@ -11263,6 +11320,8 @@ class TestResumeCommand:
         assert code == 0
         assert self.launch.call_args.args[2] == "proj/ask"
         assert "chat session" in self.launch.call_args.kwargs["system_prompt"]
+        # Same address as when it was started, not a new `<dir>-<id>` one.
+        assert self.launch.call_args.kwargs["extra_args"][-2:] == ("--name", "proj-ask")
 
     # -- stop --
 

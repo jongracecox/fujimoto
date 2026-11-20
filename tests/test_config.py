@@ -461,3 +461,19 @@ class TestWorktreeRootWithoutCreate:
         path = get_project_worktrees_dir("proj", create=False)
         assert path == (tmp_path / "wt").resolve() / "proj"
         assert not (tmp_path / "wt").exists()
+
+
+class TestChatScratchDir:
+    def test_per_project_under_home(self, tmp_path: Path) -> None:
+        from fujimoto.config import get_chat_scratch_dir
+
+        with patch("fujimoto.config.Path.home", return_value=tmp_path):
+            path = get_chat_scratch_dir("proj")
+            assert path == tmp_path / ".fujimoto" / "chats" / "proj"
+            assert path.is_dir()
+
+    def test_create_false_does_not_create(self, tmp_path: Path) -> None:
+        from fujimoto.config import get_chat_scratch_dir
+
+        with patch("fujimoto.config.Path.home", return_value=tmp_path):
+            assert not get_chat_scratch_dir("proj", create=False).exists()
