@@ -657,17 +657,29 @@ def _get_claude_sessions(
     return ClaudeData(path_to_latest, root_sessions, by_id)
 
 
-def _live_claude_ids() -> dict[str, str]:
-    """Which conversation each tmux session's claude is writing right now.
+def _live_claude() -> dict[str, live.LiveSession]:
+    """Claude Code's registry entry for each tmux session running claude.
 
-    From Claude Code's own registry of running processes, which follows a
-    `/clear` (a new session id) where a recorded id would not.
+    Says which conversation it is writing (it follows a `/clear`, which a
+    recorded id does not) and what it is doing right now (`status`).
     """
     return {
-        entry.tmux_session: entry.session_id
+        entry.tmux_session: entry
         for entry in live.list_live_sessions()
         if entry.tmux_session
     }
+
+
+# Claude Code's registry `status` for a running session, as a row state. It is
+# what the process is doing *now*, which a transcript can only guess at: a
+# `tool_use` with no result yet reads the same whether the tool is running or
+# waiting for permission (verified: a permission prompt is `waiting`). Other
+# values (`shell`, …) fall back to the transcript.
+_REGISTRY_STATES = {
+    "busy": SessionState.WORKING,
+    "waiting": SessionState.WAITING_FOR_TOOL_APPROVAL,
+    "idle": SessionState.WAITING_FOR_USER,
+}
 
 
 CSS = """\
@@ -1578,7 +1590,7 @@ class SessionApp(App):
         self._poll_timer: object | None = None
         # tmux session → the conversation its claude is writing, from Claude
         # Code's live registry; refreshed alongside `_claude_cache`.
-        self._live_claude_ids: dict[str, str] = {}
+        self._live_claude: dict[str, live.LiveSession] = {}
         self._resume_sessions: list[ClaudeSession] = []
         self._log_sessions: list[ClaudeSession] = []
         # Fork state. `_fork_source` being set is what turns the shared create
@@ -2102,7 +2114,7 @@ class SessionApp(App):
             self._claude_cache = _get_claude_sessions(
                 self._project_root, self._existing_worktrees, self._chat_dirs()
             )
-            self._live_claude_ids = _live_claude_ids()
+            self._live_claude = _live_claude()
         return self._claude_cache
 
     def _chat_dirs(self) -> list[Path]:
@@ -2129,8 +2141,9 @@ class SessionApp(App):
         data = self._claude_session_data()
         via = "path"
         cs: ClaudeSession | None = None
+        entry = self._live_claude.get(tmux_name)
         for source, sid in (
-            ("registry", self._live_claude_ids.get(tmux_name)),
+            ("registry", entry.session_id if entry else None),
             ("record", record_id),
         ):
             if sid and (found := data.by_id.get(sid)) is not None:
@@ -2139,12 +2152,20 @@ class SessionApp(App):
         if cs is None:
             cs = data.path_to_latest.get(str(path))
             via = "path" if cs is not None else "none"
+        # A running process says what it is doing; the transcript only hints.
+        status = entry.status if entry else None
+        live_state = _REGISTRY_STATES.get(status or "")
+        if cs is not None and live_state is not None and entry is not None:
+            if entry.session_id == cs.session_id and cs.state != live_state:
+                cs = replace(cs, state=live_state)
         debug.log_once(
             f"claude-for-{tmux_name}",
             "tui.claude_for",
             session=debug.rv(tmux_name),
             via=via,
             claude_session=cs.session_id if cs else "none",
+            status=status or "none",
+            state=cs.state.value if cs else "none",
         )
         return cs
 
@@ -3275,7 +3296,7 @@ class SessionApp(App):
         self._claude_cache = _get_claude_sessions(
             self._project_root, self._existing_worktrees, self._chat_dirs()
         )
-        self._live_claude_ids = _live_claude_ids()
+        self._live_claude = _live_claude()
 
         # Update labels in-place for sessions with changed Claude state
         for item_id, session in self._session_map.items():
@@ -3433,8 +3454,9 @@ class SessionApp(App):
         """
         record = session_state.load_state().get(session.tmux_session)
         meta = chats.get(session.tmux_session, session.project)
+        entry = _live_claude().get(session.tmux_session)
         for via, conversation in (
-            ("registry", _live_claude_ids().get(session.tmux_session)),
+            ("registry", entry.session_id if entry else None),
             ("row", session.claude_session_id),
             ("record", record.claude_session_id if record else None),
             ("chat-file", meta.claude_session_id if meta else None),
