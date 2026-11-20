@@ -2340,7 +2340,7 @@ class TestRowConversation:
     """Two sessions in one directory each show their own conversation."""
 
     @staticmethod
-    def _live(tmux: str, session_id: str):  # noqa: ANN205
+    def _live(tmux: str, session_id: str, status: str | None = None):  # noqa: ANN205
         from fujimoto.claude.live import LiveSession
 
         return LiveSession(
@@ -2348,9 +2348,53 @@ class TestRowConversation:
             session_id=session_id,
             cwd=Path("/fake/repo"),
             peer_name=None,
-            status=None,
+            status=status,
             tmux_session=tmux,
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status", "transcript", "shown"),
+        [
+            # A busy session whose transcript last shows a finished turn.
+            ("busy", SessionState.WAITING_FOR_USER, SessionState.WORKING),
+            # A tool running vs a permission prompt: the transcript can't tell.
+            ("busy", SessionState.WAITING_FOR_TOOL_APPROVAL, SessionState.WORKING),
+            ("waiting", SessionState.WORKING, SessionState.WAITING_FOR_TOOL_APPROVAL),
+            ("idle", SessionState.WORKING, SessionState.WAITING_FOR_USER),
+            # Statuses fujimoto doesn't map leave the transcript's state.
+            ("shell", SessionState.WORKING, SessionState.WORKING),
+            (None, SessionState.WAITING_FOR_USER, SessionState.WAITING_FOR_USER),
+        ],
+    )
+    async def test_registry_status_is_the_running_state(
+        self, status: str | None, transcript: SessionState, shown: SessionState
+    ) -> None:
+        cs = _make_claude_session("aaaa", transcript)
+        with _patch_git_info(
+            sessions=["test-proj/one"],
+            session_paths={"test-proj/one": Path("/fake/repo")},
+            claude_sessions_fn=lambda _p: [cs],
+            live_sessions=[self._live("test-proj/one", "aaaa", status)],
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                assert app._session_map["ds-test-proj--one"].claude_state == shown
+
+    @pytest.mark.asyncio
+    async def test_status_of_another_conversation_is_not_borrowed(self) -> None:
+        """The registry names a conversation fujimoto has no transcript for."""
+        cs = _make_claude_session("aaaa", SessionState.WAITING_FOR_USER)
+        with _patch_git_info(
+            sessions=["test-proj/one"],
+            session_paths={"test-proj/one": Path("/fake/repo")},
+            claude_sessions_fn=lambda _p: [cs],
+            live_sessions=[self._live("test-proj/one", "zzzz", "busy")],
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                row = app._session_map["ds-test-proj--one"]
+                assert row.claude_state == SessionState.WAITING_FOR_USER
 
     @pytest.mark.asyncio
     async def test_registry_picks_each_rows_transcript(self) -> None:

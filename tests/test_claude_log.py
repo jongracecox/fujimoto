@@ -331,7 +331,27 @@ class TestParseSession:
         assert session.state == SessionState.WAITING_FOR_USER
         assert session.stop_reason is None
 
-    def test_last_prompt_makes_session_idle(self, tmp_path: Path) -> None:
+    def test_last_prompt_does_not_mean_ended(self, tmp_path: Path) -> None:
+        """Claude Code writes `last-prompt` after every prompt, mid-session.
+
+        It used to be read as "the session ended" (→ IDLE), which showed
+        every busy session as 💤 idle.
+        """
+        log = tmp_path / "abc123.jsonl"
+        lines = [
+            _make_entry(type="user", text="do the thing"),
+            json.dumps({"type": "last-prompt"}),
+            json.dumps({"type": "ai-title"}),
+            _make_entry(type="assistant", stop_reason="tool_use", text="running"),
+            json.dumps({"type": "last-prompt"}),
+        ]
+        log.write_text("\n".join(lines) + "\n")
+
+        session = parse_session(log)
+
+        assert session.state == SessionState.WAITING_FOR_TOOL_APPROVAL
+
+    def test_finished_turn_then_last_prompt_awaits_input(self, tmp_path: Path) -> None:
         log = tmp_path / "abc123.jsonl"
         lines = [
             _make_entry(
@@ -343,24 +363,7 @@ class TestParseSession:
         ]
         log.write_text("\n".join(lines) + "\n")
 
-        session = parse_session(log)
-
-        assert session.state == SessionState.IDLE
-        assert session.is_active is False
-
-    def test_canceled_response_with_last_prompt_is_idle(self, tmp_path: Path) -> None:
-        """Esc cancel followed by session exit → idle."""
-        log = tmp_path / "abc123.jsonl"
-        lines = [
-            _make_entry(type="user", stop_reason=None),
-            json.dumps({"type": "assistant", "cwd": "/test", "timestamp": ""}),
-            json.dumps({"type": "last-prompt"}),
-        ]
-        log.write_text("\n".join(lines) + "\n")
-
-        session = parse_session(log)
-
-        assert session.state == SessionState.IDLE
+        assert parse_session(log).state == SessionState.WAITING_FOR_USER
 
     def test_queue_operation_skipped(self, tmp_path: Path) -> None:
         log = tmp_path / "abc123.jsonl"

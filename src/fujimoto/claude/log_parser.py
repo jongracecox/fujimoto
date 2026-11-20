@@ -71,8 +71,10 @@ class SessionState(StrEnum):
     UNKNOWN = "unknown"
 
 
-# Raw entry type strings that signal the session has ended.
-_SESSION_END_TYPES = frozenset({"last-prompt"})
+# `last-prompt` used to be read as "the session ended" (→ IDLE). Claude Code
+# now writes one after every prompt, mid-session — 132 in one busy transcript —
+# so it says nothing about whether a session is running. Liveness comes from
+# tmux and Claude Code's registry (`claude.live`), never from the transcript.
 
 
 @dataclass(frozen=True)
@@ -356,7 +358,6 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
 
     last_meaningful: dict | None = None
     last_any: dict | None = None
-    session_ended = False
     tool_result_after_last_tool_use = False
     custom_title: str | None = None
     first_prompt: str | None = None
@@ -376,10 +377,6 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
             continue
 
         raw_type = entry.get("type", "")
-
-        if raw_type in _SESSION_END_TYPES:
-            session_ended = True
-            continue
 
         if raw_type == "custom-title":
             custom_title = entry.get("customTitle") or custom_title
@@ -432,7 +429,7 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
         return ClaudeSession(
             jsonl_path=jsonl_path,
             session_id=session_id,
-            state=SessionState.IDLE if session_ended else SessionState.UNKNOWN,
+            state=SessionState.UNKNOWN,
             last_entry_type=last_any_type
             if last_any_type is not None
             else EntryType.SYSTEM,
@@ -449,10 +446,7 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
     stop_reason: StopReason | None = None
     state: SessionState
 
-    if session_ended:
-        # Session has a last-prompt marker — it's no longer running
-        state = SessionState.IDLE
-    elif entry_type == EntryType.ASSISTANT:
+    if entry_type == EntryType.ASSISTANT:
         raw_stop = last_meaningful.get("message", {}).get("stop_reason")
         if raw_stop is not None:
             stop_reason = StopReason.from_raw(raw_stop)
@@ -489,7 +483,6 @@ def parse_session(jsonl_path: Path) -> ClaudeSession:
         state=state,
         last_entry=entry_type,
         stop_reason=stop_reason,
-        ended=session_ended,
         tool_result_after_tool_use=tool_result_after_last_tool_use,
         cwd=debug.rp(session.cwd),
         branch=debug.rv(session.git_branch),
