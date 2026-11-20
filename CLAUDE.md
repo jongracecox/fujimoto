@@ -1306,10 +1306,6 @@ field, do not edit a version string when cutting a release. The release flow,
 recovery procedures, and one-time setup are documented in
 [CONTRIBUTING.md](CONTRIBUTING.md#releasing).
 
-## Git Commits and PRs
-
-Do not mention Claude or AI when authoring git commits or pull requests. No co-authored-by lines referencing Claude.
-
 ## Linting and Type Checking
 
 Pre-commit hooks handle all linting and formatting automatically — do not run `ruff`, `ty`, or other linters manually. Let the hooks run at commit time and fix any issues they report. Any new linting or formatting tools should be added to `.pre-commit-config.yaml`, not run ad hoc.
