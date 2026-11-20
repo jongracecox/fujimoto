@@ -121,6 +121,27 @@ fujimoto config set claude_args --project -- --verbose  # a value starting with 
   claude starts on whatever model was last chosen with `/model` in *any*
   session.
 
+### Start a conversation: `fujimoto chat`
+
+```sh
+fujimoto chat --detach --parent <your peer name> --prompt "..."
+fujimoto chat auth-question --in fix-login --detach ...   # inside a worktree
+fujimoto chat --in-temp --detach ...                       # outside the repo
+fujimoto chat --project other-repo --detach ...            # about another repo
+```
+
+Starts a session for talking, not working: no worktree, no branch. By default
+it runs in the project root (the main clone), so it can read the code and the
+project's CLAUDE.md. `--in` puts it in a worktree (a unique part of the name
+is enough), `--in-temp` in a scratch directory. The title is optional
+(`chat-1`, `chat-2`, … without one). It is told it is a chat, and to have the
+user choose where any real work should happen.
+
+The JSON gives `peer_name` (where to `SendMessage`; `<project>-<chat name>`
+unless `-- --name` sets one), `claude_session_id` and `stop_command`. It
+shows on the fujimoto home screen as `💬`. `stop` it when the conversation is
+over; there is no worktree to clean up.
+
 ## When to use them
 
 Each of these is a starting point. Combine the commands as the question needs.
@@ -143,3 +164,17 @@ Each of these is a starting point. Combine the commands as the question needs.
   `links`: which PRs and tickets came out of which sessions.
 - **Delegate and supervise.** `new --detach --parent ...`, follow progress
   with `log --tail`, steer it with `SendMessage`, then `stop` it.
+- **Get a second opinion.** `chat` a fresh session to review a plan or a
+  diff. It starts without your assumptions, so give it the material rather
+  than your conclusion.
+- **Ask about another repo.** `chat --project NAME` answers from that repo's
+  code and docs without you leaving your own.
+- **Ask about work in progress.** `chat --in <worktree>` reads a worktree's
+  uncommitted state without interrupting the session working there.
+- **Broker between sessions.** A `chat` session can `search`, `log` and
+  message other sessions for you, which keeps their transcripts out of your
+  context.
+- **Pick the right starter.** `new` when the task changes code (it gets a
+  branch to finish), `chat` when the answer is the deliverable, `resume` or
+  `SendMessage` when the question is for the session that did the work. A
+  `new` session started just to ask something leaves a worktree behind.

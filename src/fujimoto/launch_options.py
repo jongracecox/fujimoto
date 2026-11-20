@@ -170,9 +170,20 @@ def remember_for_conversation(claude_session_id: str, args: Args | None) -> None
     )
 
 
-def _is_worktree(working_dir: Path) -> bool:
-    """Whether fujimoto created this directory as a worktree (it has meta)."""
-    return has_session_meta(working_dir)
+def _uses_worktree_meta(working_dir: Path, tmux_name: str | None) -> bool:
+    """Whether a session keeps its options in the worktree's `meta.json`.
+
+    Only the worktree's *own* session does. A chat — or a root session
+    resumed into a worktree — running there would otherwise read the
+    worktree's options and, worse, save over them. Its record says which it
+    is; the tmux name can't, since a worktree session can be renamed.
+    """
+    if not has_session_meta(working_dir):
+        return False
+    if tmux_name is None:
+        return True
+    record = session_state.load_state().get(tmux_name)
+    return record is None or record.session_type in ("", "worktree")
 
 
 def saved_args(
@@ -181,9 +192,10 @@ def saved_args(
     claude_session_id: str | None = None,
 ) -> Args | None:
     """Options saved for a session, or None if it never had an override."""
-    worktree_args = read_claude_args(working_dir)
-    if worktree_args is not None:
-        return tuple(worktree_args)
+    if _uses_worktree_meta(working_dir, tmux_name):
+        worktree_args = read_claude_args(working_dir)
+        if worktree_args is not None:
+            return tuple(worktree_args)
     if tmux_name:
         record = session_state.load_state().get(tmux_name)
         if record is not None and record.claude_args is not None:
@@ -254,7 +266,7 @@ def save(
     goes back to following `.fujimoto.yaml`.
     """
     value: Args | None = None if args == project_default(working_dir) else args
-    if _is_worktree(working_dir):
+    if _uses_worktree_meta(working_dir, tmux_name):
         write_claude_args(working_dir, None if value is None else list(value))
         where = "worktree-meta"
     else:

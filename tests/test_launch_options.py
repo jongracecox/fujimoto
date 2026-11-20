@@ -125,6 +125,30 @@ class TestSave:
         assert not (tmp_path / ".fujimoto").exists()
 
 
+class TestGuestInWorktree:
+    """A chat in someone else's worktree keeps its own options."""
+
+    def test_chat_does_not_read_or_overwrite_worktree_options(
+        self, tmp_path: Path
+    ) -> None:
+        wt = _worktree(tmp_path)
+        launch_options.save(wt, "p/wt", None, ("--worktree-own",))
+        session_state.mark_open("p/ask", cwd=wt, project="p", session_type="chat")
+        assert launch_options.saved_args(wt, "p/ask") is None
+        launch_options.save(wt, "p/ask", None, ("--chat-own",))
+        assert read_claude_args(wt) == ["--worktree-own"]
+        assert launch_options.saved_args(wt, "p/ask") == ("--chat-own",)
+        assert launch_options.saved_args(wt, "p/wt") == ("--worktree-own",)
+
+    def test_renamed_worktree_session_still_uses_meta(self, tmp_path: Path) -> None:
+        wt = _worktree(tmp_path)
+        session_state.mark_open(
+            "p/renamed", cwd=wt, project="p", session_type="worktree"
+        )
+        launch_options.save(wt, "p/renamed", None, ("--a",))
+        assert read_claude_args(wt) == ["--a"]
+
+
 class TestConversationCache:
     def test_clear(self, tmp_path: Path) -> None:
         launch_options.remember_for_conversation("c", ("--a",))

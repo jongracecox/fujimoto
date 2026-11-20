@@ -428,3 +428,31 @@ class TestClaudeArgs:
             json.dumps({"proj/x": {"cwd": "/tmp", "claude_args": raw}})
         )
         assert session_state.load_state()["proj/x"].claude_args is None
+
+
+class TestParentSession:
+    def _open(self, **kw: object) -> None:
+        session_state.mark_open(
+            "p/chat-1", cwd=Path("/r"), project="p", session_type="chat", **kw
+        )
+
+    def test_recorded_and_loaded(self) -> None:
+        self._open(parent_session="boss")
+        assert session_state.load_state()["p/chat-1"].parent_session == "boss"
+
+    def test_reconnect_without_parent_keeps_it(self) -> None:
+        self._open(parent_session="boss")
+        self._open()
+        assert session_state.load_state()["p/chat-1"].parent_session == "boss"
+
+    def test_latest_parent_wins(self) -> None:
+        self._open(parent_session="boss")
+        self._open(parent_session="other")
+        assert session_state.load_state()["p/chat-1"].parent_session == "other"
+
+    def test_bad_value_loads_as_none(self, _isolate_state: Path) -> None:
+        _isolate_state.parent.mkdir(parents=True, exist_ok=True)
+        _isolate_state.write_text(
+            json.dumps({"p/x": {"cwd": "/r", "parent_session": 3}})
+        )
+        assert session_state.load_state()["p/x"].parent_session is None
