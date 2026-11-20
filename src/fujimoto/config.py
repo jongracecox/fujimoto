@@ -316,6 +316,7 @@ def mark_config_once_applied(worktree_path: Path) -> None:
 
 
 DEFAULT_SESSION_TITLE = "session"
+DEFAULT_CHAT_TITLE = "chat"
 
 
 def next_session_name(

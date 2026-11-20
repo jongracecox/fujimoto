@@ -203,8 +203,8 @@ Notes:
   `continue_on_error: true`. `{{ source_dir }}` and `{{ worktree_dir }}` expand
   to the main repo and worktree paths. On failure you're prompted to acknowledge
   the error before the screen is handed to the session.
-- **`claude_args`** applies to worktree and project-root sessions alike (ad hoc
-  sessions have no project). See [Launch options](#launch-options) for how it
+- **`claude_args`** applies to worktree, project-root and chat sessions alike
+  (a chat in a temp directory is outside the repo, so it doesn't see them). See [Launch options](#launch-options) for how it
   interacts with options saved per session.
 - fujimoto itself never creates a `.venv` — that's `uv` (or your tooling)
   running inside the worktree. Use an `init: [uv sync]` entry to set one up.
@@ -226,7 +226,7 @@ Supported placeholders:
 | `{worktree_path}` | Absolute path to the working directory |
 | `{git_project_dir}` | Absolute path to the main project directory |
 | `{branch}` | Current git branch (empty outside a repo) |
-| `{session_type}` | `worktree`, `direct`, or `adhoc` |
+| `{session_type}` | `worktree`, `direct` (project-root), `chat`, or `adhoc` (older versions) |
 | `{tmux_name}` | tmux session name |
 
 Unknown placeholders render as empty strings.
@@ -383,6 +383,26 @@ fujimoto new fix-flaky-test --prompt "…" \
   Choosing it up front gives the parent an address for the child before the
   child is running. Since arguments after `--` are saved as launch options,
   the name stays the same across relaunches.
+
+### Starting a chat from the command line
+
+```sh
+fujimoto chat [TITLE] [--in WORKTREE | --in-temp] [--project NAME|PATH] \
+  [--prompt TEXT] [--parent NAME] [--detach] [-- claude args…]
+```
+
+`fujimoto chat` starts a chat session — for questions and conversation rather
+than work — without creating a worktree. It runs in the project root unless
+`--in` names a worktree (any unique part of its name) or `--in-temp` asks for
+a scratch directory outside the repo. Without a title it is named `chat-1`,
+`chat-2`, …. `--project` picks another repo (a path, or a name under
+`$FUJIMOTO_GIT_ROOT`); with `--detach` that works from anywhere, inside a repo
+or not.
+
+`--prompt`, `--parent` and `--detach` work as they do for `fujimoto new`. With
+`--detach` the JSON names the session's `peer_name` — `<project>-<chat name>`
+unless `-- --name` sets one — so the session that started it can
+`SendMessage` it straight away. Stop it with `fujimoto stop <tmux session>`.
 
 ### Session tools for agents
 
@@ -564,6 +584,9 @@ fujimoto stop myproject/20261013-fix-flaky-test
   then: message it instead. `--fork` still starts a separate fork.
 - **Deleted directory.** A session whose worktree is gone is refused, with
   the branch it ran on.
+- **Stopped sessions come back as themselves.** If a stopped (or parked)
+  session's record still names the conversation — a chat, typically — it
+  resumes under its own name and type rather than as a new `session-N`.
 - **`fujimoto stop`** takes a tmux session name or a Claude session id. It
   stops the process the way `Ctrl-A s` does: the session stays on the home
   screen as stopped, ready to resume.
@@ -576,13 +599,15 @@ it stops for a permission prompt, it waits until someone attaches.
 ```
 + New worktree session
 + New project-root session (⎇ main)
-+ Ad hoc session
++ New chat
 ───── recovered ─────
 🔄 20260306-flaky-test-hunt     (worktree)
 ───── sessions ─────
 🟢 20260309-cleanup-ui          (worktree)
 🟢 fix-login                    (project-root ⎇ main)
+🟢 auth-question                (💬 project-root)
 🅿️ 20260305-spike-caching       (worktree)
+🅿️ chat-1                       (💬 temp)
 🟠 20260307-parser-rewrite      (worktree)
 🟠 session-1                    (project-root ⎇ main)
 ───── inactive worktrees ─────
@@ -723,7 +748,7 @@ every time.
 
 **Project-root sessions** launch Claude in the project root (your main clone) on whatever branch it has checked out — the action shows that branch, e.g. `+ New project-root session (⎇ main)`. Quick and lightweight — no worktree overhead. Give it a title (optional, e.g. `fix-unit-tests`); left blank it is named `session-1`, `session-2`, …, and a title that is already in use gets `-2`. If you want a session on `main`, check out `main` in the clone first: fujimoto deliberately runs where your checkout is rather than switching branches for you. A row shows the directory it is actually running in, which is usually the project root but need not be — resuming an old conversation can leave one in a worktree. Sessions created by older versions as `direct-N` still appear and work as before.
 
-**Ad hoc sessions** launch Claude in a temporary directory outside any git project. For quick questions, investigations, and one-off tasks that don't need a repository.
+**Chat sessions** (`+ New chat`, or `fujimoto chat`) are for questions and conversation rather than work. Give it a title (optional; `chat-1`, `chat-2`, … without one), then choose where it runs: **project-root** first, then **temp** (a scratch directory outside the repo), then your worktrees, most recently used first. On that list `/` filters the worktrees by name and `s` by what their sessions said, so "the worktree where we talked about the flaky test" is a few keystrokes away. A chat row shows `💬` and where it runs — `(💬 project-root)`, `(💬 temp)` or `(💬 <worktree>)` — and belongs to the project you started it from, so it stays on the home screen and comes back after a restart like any other session. Its system prompt says it is a chat, and that if work comes up the user should decide where it happens (a new worktree, say) before anything changes. A chat in a worktree doesn't re-run the project's `.fujimoto.yaml` setup there, and keeps launch options of its own. Chats replace the old ad hoc sessions.
 
 ### Session Actions
 
@@ -735,6 +760,8 @@ Select any session to see contextual options:
 | Stopped worktree | Resume previous session, Fork session, View session log, Launch, Terminate, Finish |
 | Inactive worktree | Resume previous session, Fork session, View session log, Launch, Finish |
 | Active project-root | Connect, Fork session, Resume previous session, View session log, Park, Stop, Terminate |
+| Active chat | Connect, View session log, Park, Stop, Terminate |
+| Stopped chat | Resume chat, New conversation, View session log, Terminate |
 
 **Stop** keeps the session in your list as 🟠 and **Park** keeps it as 🅿️;
 **Terminate** marks it done and drops it to ⚫. All three close claude — the
@@ -748,7 +775,7 @@ All session types also offer **Open terminal**, **Open in VS Code** and
 To start claude with extra CLI arguments (`--plugin-dir`, `--model`, …), press
 **Shift+Enter** instead of Enter on whatever launches the session — a branch
 in the create flow, *Launch* / *Resume* / *Fork session* in the session menu,
-*Ad hoc session* on the home screen. A dialog opens pre-filled with the options
+a location in the *New chat* flow. A dialog opens pre-filled with the options
 the launch would otherwise use; edit them and press Enter to launch, or Escape
 to cancel. Typing is shell-style, so quote arguments that contain spaces. The
 dialog links to the [claude CLI flags reference](https://code.claude.com/docs/en/cli-reference#cli-flags);
@@ -763,8 +790,8 @@ To change them without launching, use **Launch options** in the session menu.
 The item shows the current options and where they come from; Enter in its
 dialog saves them for the next launch. Editing a running session's options
 does not touch the running claude; they apply the next time it starts. The
-item is offered for worktrees and Claude conversations always, and for direct
-and ad hoc sessions while they are running or stopped, since that is when they
+item is offered for worktrees and Claude conversations always, and for
+project-root and chat sessions while they are running or stopped, since that is when they
 have a record to save onto.
 
 Options are looked up in this order: the session's saved options, a fork's
@@ -874,6 +901,7 @@ For already-merged branches: **Delete** or **Delete + remove remote branch**.
 | Git branch | `worktree/{dir-name}` | `worktree/20260309-fix-unit-tests` |
 | tmux session (worktree) | `{project}/{dir-name}` | `my-app/20260309-fix-unit-tests` |
 | tmux session (project-root) | `{project}/{slug}` (`session-{N}` untitled) | `my-app/fix-login` |
+| tmux session (chat) | `{project}/{slug}` (`chat-{N}` untitled) | `my-app/auth-question` |
 
 ### tmux Session Controls
 

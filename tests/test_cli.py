@@ -17,6 +17,7 @@ from textual.widgets import Collapsible, Input, Label, ListItem, ListView, Stati
 from fujimoto.claude import (
     ClaudeSession,
     ContentMode,
+    SearchHit,
     SessionState,
     Snippet,
     TranscriptMessage,
@@ -27,6 +28,7 @@ from types import SimpleNamespace
 from fujimoto.cli import (
     FUJIMOTO_CLI_PROMPT,
     CSS,
+    ICON_CHAT,
     ICON_EYES,
     ICON_FORK,
     ICON_GEAR,
@@ -57,6 +59,7 @@ from fujimoto.cli import (
     _relative_time,
     _render_snippet,
     _pair_results,
+    _prepare_chat,
     _tool_run_title,
     _tool_summary,
     main,
@@ -1321,7 +1324,7 @@ class TestMain:
             patch("fujimoto.cli._session_terminal_title", return_value="test-title"),
         ):
             main()
-            mock_sp.assert_called_once_with("worktree", "proj", Path("/tmp/test"))
+            mock_sp.assert_called_once_with("worktree", "proj", Path("/tmp/test"), None)
             mock_apply.assert_called_once_with(Path("/tmp/test"), interactive=True)
             mock_launch.assert_called_once_with(
                 "proj",
@@ -1519,9 +1522,35 @@ class TestBuildSystemPrompt:
         from fujimoto.cli import _build_system_prompt
 
         prompt = _build_system_prompt("direct", "myproj", tmp_path)
-        assert "direct" in prompt
+        assert "project-root session" in prompt
         assert "myproj" in prompt
         assert "not an isolated worktree" in prompt
+
+    def test_chat_prompt_in_temp_dir(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _build_system_prompt
+
+        with patch("fujimoto.cli.get_main_worktree_root", side_effect=GitError("no")):
+            prompt = _build_system_prompt("chat", "myproj", tmp_path)
+        assert "chat session for project 'myproj'" in prompt
+        assert "temporary scratch directory" in prompt
+        assert "deliberately" in prompt
+        assert "SendMessage" not in prompt
+
+    def test_chat_prompt_in_project_root(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _build_system_prompt
+
+        with patch("fujimoto.cli.get_main_worktree_root", return_value=tmp_path):
+            prompt = _build_system_prompt("chat", "myproj", tmp_path)
+        assert "the project root" in prompt
+
+    def test_chat_prompt_in_worktree_names_parent(self, tmp_path: Path) -> None:
+        from fujimoto.cli import _build_system_prompt
+
+        wt = tmp_path / "20261120-x"
+        with patch("fujimoto.cli.get_main_worktree_root", return_value=tmp_path):
+            prompt = _build_system_prompt("chat", "myproj", wt, "boss")
+        assert "the worktree '20261120-x'" in prompt
+        assert "peer address is 'boss'" in prompt
 
     def test_adhoc_prompt(self, tmp_path: Path) -> None:
         from fujimoto.cli import _build_system_prompt
@@ -2610,48 +2639,411 @@ class TestResumeTarget:
                 assert app._launch_target[1] == wt
 
 
-class TestSessionAppAdhocSession:
-    @pytest.mark.asyncio
-    async def test_launch_adhoc_session(self) -> None:
-        with (
-            _patch_git_info(),
-            patch("fujimoto.cli.list_all_sessions", return_value=[]),
-        ):
-            app = SessionApp()
-            async with app.run_test() as pilot:
-                # Navigate to "Ad hoc session" (3rd item, index 2)
-                await pilot.press("down", "down")
-                await pilot.press("enter")
-                await pilot.pause()
-                assert app._launch_target is not None
-                target = app._launch_target
-                assert target.project == "adhoc"
-                assert target.session_type == "adhoc"
-                assert target.tmux_name == "adhoc-1"
-                assert target.resume_session_id is None
-                assert target.forked_from_session_id is None
-                assert target.working_dir.exists()
+def _chat_record(cwd: Path | str, **fields: object) -> session_state.SessionRecord:
+    return session_state.SessionRecord(
+        cwd=str(cwd), project="test-proj", session_type="chat", **fields
+    )
+
+
+class TestNewChat:
+    """`+ New chat`: an optional title, then where it runs."""
+
+    @staticmethod
+    async def _open_locations(app: SessionApp, pilot, title: str = "") -> None:  # noqa: ANN001
+        await pilot.press("down", "down")  # "+ New chat"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.query_one("#chat-title-input", Input).placeholder == (
+            "e.g. fix-unit-tests"
+        )
+        if title:
+            await pilot.press(*title)
+        await pilot.press("enter")
+        await pilot.pause()
+
+    @staticmethod
+    def _location_ids(app: SessionApp) -> list[str]:
+        listing = app.query_one("#chat-location-list", ListView)
+        return [item.id or "" for item in listing.children]
 
     @pytest.mark.asyncio
-    async def test_launch_adhoc_increments_name(self) -> None:
-        with (
-            _patch_git_info(),
-            patch("fujimoto.cli.list_all_sessions", return_value=["adhoc-1"]),
-        ):
-            app = SessionApp()
-            async with app.run_test() as pilot:
-                await pilot.press("down", "down")
-                await pilot.press("enter")
-                await pilot.pause()
-                assert app._launch_target is not None
-                assert app._launch_target[2] == "adhoc-2"
-
-    @pytest.mark.asyncio
-    async def test_home_shows_adhoc_option(self) -> None:
+    async def test_home_offers_chat_not_adhoc(self) -> None:
         with _patch_git_info():
             app = SessionApp()
             async with app.run_test():
-                assert app.query_one("#action-adhoc")
+                assert app.query("#action-chat")
+                assert not app.query("#action-adhoc")
+
+    @pytest.mark.asyncio
+    async def test_untitled_chat_in_project_root(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_locations(app, pilot)
+                assert self._location_ids(app)[:2] == ["cl-root", "cl-temp"]
+                await pilot.press("enter")  # project-root is first
+                await pilot.pause()
+                target = app._launch_target
+                assert target is not None
+                assert target.tmux_name == "test-proj/chat-1"
+                assert target.session_type == "chat"
+                assert target.working_dir == Path("/fake/repo")
+                assert target.session_id is not None
+
+    @pytest.mark.asyncio
+    async def test_titled_chat_in_temp(self) -> None:
+        with _patch_git_info(sessions=["test-proj/chat-1"]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_locations(app, pilot, "quick q")
+                listing = app.query_one("#chat-location-list", ListView)
+                listing.index = 1
+                await pilot.press("enter")
+                await pilot.pause()
+                target = app._launch_target
+                assert target is not None
+                assert target.tmux_name == "test-proj/quick-q"
+                assert target.working_dir.name.startswith("fujimoto-chat-")
+                assert target.working_dir.is_dir()
+
+    @pytest.mark.asyncio
+    async def test_worktrees_follow_root_and_temp_most_recent_first(
+        self, tmp_path: Path
+    ) -> None:
+        wt_root = tmp_path / "test-proj"
+        old, new = wt_root / "20260101-old", wt_root / "20260102-new"
+        recent = datetime(2026, 11, 20, tzinfo=timezone.utc)
+        stale = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        def sessions(path: Path) -> list[ClaudeSession]:
+            # The older worktree was used last.
+            if path == old:
+                return [_make_claude_session("o", cwd=old, last_activity=recent)]
+            if path == new:
+                return [_make_claude_session("n", cwd=new, last_activity=stale)]
+            return []
+
+        with _patch_git_info(
+            worktrees=[old, new], worktree_root=wt_root, claude_sessions_fn=sessions
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_locations(app, pilot)
+                ids = self._location_ids(app)
+                assert [app._chat_locations[i] for i in ids[2:]] == [old, new]
+                listing = app.query_one("#chat-location-list", ListView)
+                listing.index = 2
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._launch_target is not None
+                assert app._launch_target.working_dir == old
+
+    @pytest.mark.asyncio
+    async def test_slash_filters_worktrees_by_name(self, tmp_path: Path) -> None:
+        wt_root = tmp_path / "test-proj"
+        a, b = wt_root / "20260101-alpha", wt_root / "20260102-beta"
+        with _patch_git_info(worktrees=[a, b], worktree_root=wt_root):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_locations(app, pilot)
+                await pilot.press("slash")
+                await pilot.press(*"alp")
+                await pilot.pause()
+                await pilot.pause()
+                shown = [app._chat_locations.get(i) for i in self._location_ids(app)]
+                assert a in shown and b not in shown
+                # root and temp are always offered
+                assert self._location_ids(app)[:2] == ["cl-root", "cl-temp"]
+                await pilot.press("escape")
+                await pilot.pause()
+                assert app._chat_filter_query == ""
+                assert b in [
+                    app._chat_locations.get(i) for i in self._location_ids(app)
+                ]
+                assert app.focused is app.query_one("#chat-location-list")
+
+    @pytest.mark.asyncio
+    async def test_no_name_match_says_so(self, tmp_path: Path) -> None:
+        wt_root = tmp_path / "test-proj"
+        with _patch_git_info(
+            worktrees=[wt_root / "20260101-alpha"], worktree_root=wt_root
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_locations(app, pilot)
+                await pilot.press("slash")
+                await pilot.press(*"zzz")
+                await pilot.pause()
+                await pilot.pause()
+                labels = app.query_one("#chat-location-list").query(Static)
+                assert any("no matching worktrees" in str(w.render()) for w in labels)
+
+    @pytest.mark.asyncio
+    async def test_s_filters_worktrees_by_transcript_text(self, tmp_path: Path) -> None:
+        wt_root = tmp_path / "test-proj"
+        a, b = wt_root / "20260101-alpha", wt_root / "20260102-beta"
+        hit = SearchHit(
+            session=_make_claude_session("x", cwd=b), match_count=1, snippets=()
+        )
+        with (
+            _patch_git_info(worktrees=[a, b], worktree_root=wt_root),
+            patch(
+                "fujimoto.cli.claude_search.list_session_logs", return_value=[Path("x")]
+            ),
+            patch(
+                "fujimoto.cli.claude_search.iter_hits",
+                side_effect=lambda logs, matcher, is_cancelled: iter([(1, (hit,))]),
+            ),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_locations(app, pilot)
+                await pilot.press("s")
+                await pilot.press(*"flaky")
+                await pilot.pause(app.SEARCH_DEBOUNCE + 0.2)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                await pilot.pause()
+                shown = [app._chat_locations.get(i) for i in self._location_ids(app)]
+                assert b in shown and a not in shown
+                status = app.query_one("#chat-location-status", Static)
+                assert "1 worktree mention" in str(status.render())
+                # Enter in the box hands focus to the list, keeping the filter.
+                app.query_one("#chat-location-filter", Input).focus()
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app.focused is app.query_one("#chat-location-list")
+                # Escape on the list drops the filter before leaving the view.
+                await pilot.press("escape")
+                await pilot.pause()
+                assert app._chat_text_matches is None
+                assert app._on_chat_location
+
+    @pytest.mark.asyncio
+    async def test_short_text_query_asks_for_more(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_locations(app, pilot)
+                await pilot.press("s")
+                await pilot.press("x")
+                await pilot.pause(app.SEARCH_DEBOUNCE + 0.2)
+                status = app.query_one("#chat-location-status", Static)
+                assert "at least" in str(status.render())
+
+    @pytest.mark.asyncio
+    async def test_stale_text_result_is_dropped(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_locations(app, pilot)
+                app._apply_chat_text_search(-1, "q", {Path("/x")}, 1)
+                assert app._chat_text_matches is None
+
+    @pytest.mark.asyncio
+    async def test_pending_text_scan_is_cancelled_by_escape_and_teardown(
+        self,
+    ) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_locations(app, pilot)
+                await pilot.press("s")
+                await pilot.press(*"ab")
+                assert app._chat_debounce is not None
+                await pilot.press("escape")  # in the box: clears the filter
+                await pilot.pause()
+                assert app._chat_debounce is None
+                await pilot.press("s")
+                await pilot.press(*"ab")
+                assert app._chat_debounce is not None
+                await app._show_home()
+                assert app._chat_debounce is None
+                assert not app._on_chat_location
+
+    @pytest.mark.asyncio
+    async def test_chat_filter_helpers_are_inert_off_the_picker(self) -> None:
+        """A refresh queued just before the view went away must not fail."""
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test():
+                await app._refresh_chat_locations()
+                app._open_chat_filter("name")
+                assert not app.query("#chat-location-filter")
+
+    @pytest.mark.asyncio
+    async def test_escape_leaves_for_home(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_locations(app, pilot)
+                await pilot.press("escape")
+                await pilot.pause()
+                assert not app._on_chat_location
+                assert app.query("#home-list")
+
+    @pytest.mark.asyncio
+    async def test_up_down_in_filter_move_the_list(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_locations(app, pilot)
+                await pilot.press("slash")
+                await pilot.press("down")
+                assert app.query_one("#chat-location-list", ListView).index == 1
+                await pilot.press("up")
+                assert app.query_one("#chat-location-list", ListView).index == 0
+
+
+class TestChatRows:
+    """Chats on the home screen and in the session menu."""
+
+    @pytest.mark.asyncio
+    async def test_running_chat_in_root(self) -> None:
+        with _patch_git_info(
+            sessions=["test-proj/ask"],
+            session_paths={"test-proj/ask": Path("/fake/repo")},
+            open_sessions={"test-proj/ask": _chat_record("/fake/repo")},
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                info = app._session_map["ch-test-proj--ask"]
+                assert info.session_type == "chat"
+                label = app.query_one("#ch-test-proj--ask").query_one(Label)
+                assert f"({ICON_CHAT} project-root)" in str(label.render())
+
+    @pytest.mark.asyncio
+    async def test_chat_in_worktree_and_temp(self, tmp_path: Path) -> None:
+        wt_root = tmp_path / "test-proj"
+        wt = wt_root / "20260101-x"
+        temp = tmp_path / "fujimoto-chat-1"
+        temp.mkdir()
+        with _patch_git_info(
+            worktrees=[wt],
+            worktree_root=wt_root,
+            sessions=["test-proj/in-wt"],
+            session_paths={"test-proj/in-wt": wt},
+            open_sessions={
+                "test-proj/in-wt": _chat_record(wt),
+                "test-proj/scratch": _chat_record(temp, stop_kind=StopKind.STOPPED),
+            },
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                text = _list_text(app)
+                assert f"({ICON_CHAT} 20260101-x)" in text
+                assert f"({ICON_CHAT} temp)" in text
+                # The worktree itself is still an inactive worktree row.
+                assert "wt-20260101-x" in app._session_map
+                await pilot.press("slash")
+                await pilot.press(*"temp")
+                await pilot.pause()
+                assert list(app._session_map) == ["ch-test-proj--scratch"]
+
+    @pytest.mark.asyncio
+    async def test_temp_chat_transcript_gives_state(self, tmp_path: Path) -> None:
+        temp = tmp_path / "fujimoto-chat-1"
+        temp.mkdir()
+        cs = _make_claude_session("tttt", SessionState.WORKING, cwd=temp)
+        with _patch_git_info(
+            sessions=["test-proj/scratch"],
+            session_paths={"test-proj/scratch": temp},
+            open_sessions={"test-proj/scratch": _chat_record(temp)},
+            claude_sessions_fn=lambda p: [cs] if p == temp else [],
+        ):
+            app = SessionApp()
+            async with app.run_test():
+                info = app._session_map["ch-test-proj--scratch"]
+                assert info.claude_state == SessionState.WORKING
+
+    @staticmethod
+    async def _open_menu(app: SessionApp, pilot, item_id: str) -> list[str]:  # noqa: ANN001
+        home = app.query_one("#home-list", ListView)
+        home.index = next(i for i, c in enumerate(home.children) if c.id == item_id)
+        await pilot.press("enter")
+        await pilot.pause()
+        return [c.id or "" for c in app.query_one("#session-actions").children]
+
+    @pytest.mark.asyncio
+    async def test_running_chat_menu(self) -> None:
+        cs = _make_claude_session("aaaa")
+        with _patch_git_info(
+            sessions=["test-proj/ask"],
+            session_paths={"test-proj/ask": Path("/fake/repo")},
+            open_sessions={
+                "test-proj/ask": _chat_record("/fake/repo", claude_session_id="aaaa")
+            },
+            claude_sessions_fn=lambda _p: [cs],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                ids = await self._open_menu(app, pilot, "ch-test-proj--ask")
+                assert ids[0] == "sa-connect"
+                assert "sa-fork" not in ids
+                assert "sa-resume-picker" not in ids
+                assert "sa-finish" not in ids
+                assert {"sa-viewlog", "sa-rename", "sa-park", "sa-stop"} <= set(ids)
+                info = str(app.query_one(".session-info", Static).render())
+                assert info.startswith("chat | active")
+                assert f"{ICON_CHAT} project-root" in info
+
+    @pytest.mark.asyncio
+    async def test_stopped_chat_resumes_its_conversation(self) -> None:
+        newer = _make_claude_session("nnnn")
+        mine = _make_claude_session("mmmm")
+        record = _chat_record(
+            "/fake/repo", claude_session_id="mmmm", stop_kind=StopKind.STOPPED
+        )
+        with _patch_git_info(
+            open_sessions={"test-proj/ask": record},
+            claude_sessions_fn=lambda _p: [newer, mine],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                ids = await self._open_menu(app, pilot, "ch-test-proj--ask")
+                assert ids[:2] == ["sa-resume-chat", "sa-launch"]
+                await pilot.press("enter")
+                await pilot.pause()
+                target = app._launch_target
+                assert target is not None
+                assert target.tmux_name == "test-proj/ask"
+                assert target.session_type == "chat"
+                assert target.resume_session_id == "mmmm"
+
+    @pytest.mark.asyncio
+    async def test_stopped_chat_new_conversation(self) -> None:
+        record = _chat_record("/fake/repo", stop_kind=StopKind.STOPPED)
+        with _patch_git_info(open_sessions={"test-proj/ask": record}):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                ids = await self._open_menu(app, pilot, "ch-test-proj--ask")
+                assert ids[0] == "sa-launch"
+                await pilot.press("enter")
+                await pilot.pause()
+                target = app._launch_target
+                assert target is not None
+                assert target.resume_session_id is None
+                assert target.session_id is not None
+
+    @pytest.mark.asyncio
+    async def test_chat_log_opens_its_own_transcript(self) -> None:
+        newer = _make_claude_session("nnnn")
+        mine = _make_claude_session("mmmm")
+        record = _chat_record(
+            "/fake/repo", claude_session_id="mmmm", stop_kind=StopKind.STOPPED
+        )
+        with (
+            _patch_git_info(
+                open_sessions={"test-proj/ask": record},
+                claude_sessions_fn=lambda _p: [newer, mine],
+            ),
+            patch.object(SessionApp, "_show_session_log") as show,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await self._open_menu(app, pilot, "ch-test-proj--ask")
+                await app._show_log_picker(app._session_map["ch-test-proj--ask"])
+                assert show.call_args.args[0].session_id == "mmmm"
 
 
 class TestSessionAppSessionActions:
@@ -5123,6 +5515,15 @@ class TestFormatPromptLines:
 
 
 class TestGetClaudeSessions:
+    def test_extra_dirs_are_indexed_once(self) -> None:
+        temp = Path("/tmp/fujimoto-chat-x")
+        cs = _make_claude_session("tttt", cwd=temp)
+        with patch("fujimoto.cli.get_sessions_for_path", return_value=[cs]) as get:
+            data = _get_claude_sessions(None, [], [temp, temp])
+        assert data.path_to_latest[str(temp)] is cs
+        assert data.by_id["tttt"] is cs
+        assert get.call_count == 1
+
     def test_returns_empty_when_no_sessions(self) -> None:
         with patch("fujimoto.cli.get_sessions_for_path", return_value=[]):
             path_to_latest, root_sessions, _ = _get_claude_sessions(
@@ -10414,6 +10815,182 @@ class TestQueryCommands:
         assert "debug log written to" in err
 
 
+class TestChatCommand:
+    """`fujimoto chat`: a titled chat in project-root, a worktree or temp."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, tmp_path: Path):
+        self.root = tmp_path / "proj"
+        self.root.mkdir()
+        self.wts = [
+            tmp_path / "wt" / n
+            for n in ("20261101-alpha", "20261102-beta", "20261103-betamax")
+        ]
+        for wt in self.wts:
+            wt.mkdir(parents=True)
+        scope = session_query.Scope(
+            all_projects=False,
+            project="proj",
+            root=self.root,
+            worktrees=tuple(self.wts),
+        )
+        with (
+            patch(
+                "fujimoto.cli.session_query.resolve_scope", return_value=scope
+            ) as self.scope,
+            patch("fujimoto.cli.list_all_sessions", return_value=["proj/chat-1"]),
+            patch("fujimoto.cli._session_branch", return_value=""),
+            patch("fujimoto.cli.get_main_worktree_root", return_value=self.root),
+            patch("fujimoto.cli.launch_claude_in_tmux") as self.launch,
+            patch(
+                "fujimoto.launch_options.get_main_worktree_root",
+                side_effect=GitError("not a repo"),
+            ),
+        ):
+            yield
+
+    def _main(self, monkeypatch, capsys, *argv: str) -> tuple[int, str, str]:
+        monkeypatch.setattr("sys.argv", ["fujimoto", *argv])
+        code = 0
+        try:
+            main()
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 1
+        out, err = capsys.readouterr()
+        return code, out, err
+
+    def test_detached_untitled_chat_in_project_root(self, monkeypatch, capsys) -> None:
+        code, out, _ = self._main(
+            monkeypatch,
+            capsys,
+            "chat",
+            "--detach",
+            "--prompt",
+            "hi",
+            "--parent",
+            "boss",
+        )
+        assert code == 0
+        result = json.loads(out)
+        assert result["tmux_session"] == "proj/chat-2"
+        assert result["location"] == "project-root"
+        assert result["working_dir"] == str(self.root)
+        assert result["peer_name"] == "proj-chat-2"
+        assert result["stop_command"] == "fujimoto stop proj/chat-2"
+        kwargs = self.launch.call_args.kwargs
+        assert kwargs["session_id"] == result["claude_session_id"]
+        assert kwargs["prompt"] == "hi"
+        assert kwargs["attach"] is False
+        assert kwargs["extra_args"][-2:] == ("--name", "proj-chat-2")
+        assert "chat session" in kwargs["system_prompt"]
+        assert "peer address is 'boss'" in kwargs["system_prompt"]
+        record = session_state.load_state()["proj/chat-2"]
+        assert record.session_type == "chat"
+        assert record.parent_session == "boss"
+        assert record.claude_session_id == result["claude_session_id"]
+
+    def test_titled_chat_in_a_worktree(self, monkeypatch, capsys) -> None:
+        code, out, _ = self._main(
+            monkeypatch, capsys, "chat", "Auth question", "--in", "alpha", "--detach"
+        )
+        assert code == 0
+        result = json.loads(out)
+        assert result["tmux_session"] == "proj/auth-question"
+        assert result["location"] == "20261101-alpha"
+        assert result["working_dir"] == str(self.wts[0])
+
+    def test_exact_worktree_name_beats_partial(self, monkeypatch, capsys) -> None:
+        code, out, _ = self._main(
+            monkeypatch, capsys, "chat", "--in", "20261102-beta", "--detach"
+        )
+        assert code == 0
+        assert json.loads(out)["location"] == "20261102-beta"
+
+    def test_ambiguous_worktree(self, monkeypatch, capsys) -> None:
+        code, _, err = self._main(
+            monkeypatch, capsys, "chat", "--in", "beta", "--detach"
+        )
+        assert code == 1
+        assert "matches several worktrees" in err
+        self.launch.assert_not_called()
+
+    def test_unknown_worktree(self, monkeypatch, capsys) -> None:
+        code, _, err = self._main(
+            monkeypatch, capsys, "chat", "--in", "zzz", "--detach"
+        )
+        assert code == 1
+        assert "no worktree matches 'zzz'" in err
+
+    def test_in_temp(self, monkeypatch, capsys) -> None:
+        with patch("fujimoto.cli.get_main_worktree_root", side_effect=GitError("no")):
+            code, out, _ = self._main(
+                monkeypatch, capsys, "chat", "--in-temp", "--detach"
+            )
+        assert code == 0
+        result = json.loads(out)
+        assert result["location"] == "temp"
+        assert Path(result["working_dir"]).name.startswith("fujimoto-chat-")
+        assert (
+            "temporary scratch directory"
+            in self.launch.call_args.kwargs["system_prompt"]
+        )
+
+    def test_in_and_in_temp_are_exclusive(self, monkeypatch, capsys) -> None:
+        code, _, _ = self._main(
+            monkeypatch, capsys, "chat", "--in", "alpha", "--in-temp", "--detach"
+        )
+        assert code == 2
+
+    def test_name_from_launch_options_is_kept(self, monkeypatch, capsys) -> None:
+        code, out, _ = self._main(
+            monkeypatch, capsys, "chat", "--detach", "--", "--name", "asker"
+        )
+        assert code == 0
+        assert json.loads(out)["peer_name"] == "asker"
+        assert self.launch.call_args.kwargs["extra_args"] == ("--name", "asker")
+
+    def test_unknown_project(self, monkeypatch, capsys) -> None:
+        self.scope.side_effect = session_query.QueryError("unknown project 'x'")
+        code, _, err = self._main(
+            monkeypatch, capsys, "chat", "--project", "x", "--detach"
+        )
+        assert code == 1
+        assert "unknown project" in err
+
+    def test_attached_chat_returns_a_target(self) -> None:
+        args = SimpleNamespace(
+            project=None,
+            in_temp=False,
+            in_worktree=None,
+            title="q",
+            prompt=None,
+            parent=None,
+            detach=False,
+        )
+        target = _prepare_chat(args, None)
+        assert target is not None
+        assert target.tmux_name == "proj/q"
+        assert target.session_type == "chat"
+        self.launch.assert_not_called()
+
+    def test_attached_chat_goes_through_the_launch_loop(
+        self, monkeypatch, capsys
+    ) -> None:
+        idle = SessionApp.__new__(SessionApp)
+        idle._launch_target = None
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", return_value=idle),
+            patch.object(idle, "run"),
+            patch("fujimoto.cli.take_pending_action", return_value=None),
+            patch("fujimoto.cli._session_terminal_title", return_value="t"),
+        ):
+            code, _, _ = self._main(monkeypatch, capsys, "chat", "q")
+        assert code == 0
+        assert self.launch.call_args.args[2] == "proj/q"
+        assert self.launch.call_args.kwargs["attach"] is True
+
+
 class TestResumeCommand:
     """`fujimoto resume` / `fujimoto stop`."""
 
@@ -10669,7 +11246,23 @@ class TestResumeCommand:
     def test_claude_args_rejected_elsewhere(self, monkeypatch, capsys) -> None:
         code, _, err = self._main(monkeypatch, capsys, "log", "x", "--", "--model")
         assert code == 2
-        assert "only accepted by 'new', 'resume' and 'config set'" in err
+        assert "only accepted by 'new', 'resume', 'chat' and 'config set'" in err
+
+    def test_resume_of_a_stopped_chat_keeps_its_name(self, monkeypatch, capsys) -> None:
+        session_state.mark_open(
+            "proj/ask",
+            cwd=self.cwd,
+            project="proj",
+            session_type="chat",
+            claude_session_id="sess-1234abcd",
+        )
+        session_state.mark_stopped("proj/ask")
+        code, _, _ = self._main(
+            monkeypatch, capsys, "resume", "sess-1234abcd", "--detach"
+        )
+        assert code == 0
+        assert self.launch.call_args.args[2] == "proj/ask"
+        assert "chat session" in self.launch.call_args.kwargs["system_prompt"]
 
     # -- stop --
 

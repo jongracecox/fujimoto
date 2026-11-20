@@ -143,10 +143,11 @@ src/fujimoto/
   `_prepare_new_session` adds the rest: a session that isn't already running gets a fresh `uuid4` as `LaunchTarget.session_id` (→ `claude --session-id`, and recorded on the `SessionRecord` by `mark_open`, so the id is known before any transcript exists) and `--prompt` as `LaunchTarget.prompt` (claude's positional first message). Neither is saved or replayed, which is why the prompt is not a launch option. `--prompt` against an already-running session exits 1. `--detach` calls `_start_launch(target, attach=False)` — the launch-loop body, factored out so both paths share it — then prints `_new_session_result` as JSON and exits without the TUI. In that mode stdout is reserved for the JSON: `_stdout_to_stderr` redirects **fd 1** (not `sys.stdout`, which a child process never sees) around the launch so `.fujimoto.yaml` init output goes to stderr, `_apply_worktree_config(interactive=False)` skips the keypress pause, `set_terminal_title` is skipped, and the `--debug` "log written to" notices print to stderr (always, now).
   `--parent NAME` records the starting session's peer address in the worktree's meta (on create *and* on connect) via `write_parent_session`. `_build_system_prompt` appends `_parent_system_prompt(name)` for a worktree that has one, and `_start_launch` passes that sentence alone as the system prompt on a **resume** — the appended system prompt does not carry over into a new claude process, so without it a resumed child would lose its parent. `_new_session_result` reports it as `parent_session`. A child's own address is set with claude's `--name` after `--`, which is saved as a launch option and so is stable across relaunches; Claude Code's derived names (`<cwd basename>-<2 hex>`) are not predictable, and a session id does not work as a `SendMessage` address.
 - `fujimoto search QUERY [--project NAME|PATH | --all-projects] [-e] [-s] [--raw] [-n N] [--sort recent|relevance] [--include-self] [--json]` and `fujimoto log SESSION [--summary | --grep P [-e] [-s] [-C N]] [--head N | --tail N] [--roles LIST] [--json]` are the read-only query commands, dispatched to `_run_search_command` / `_run_log_command` **before** `_check_prerequisites` — they must work without tmux, and never open the TUI. All logic lives in `session_query.py`; `cli.py` only parses arguments, maps `QueryError` to exit 1 and prints. Text is the default output (for people *and* agents), `--json` the structured form. No match is exit 0.
-- `fujimoto resume SESSION [--fork] [--detach [--wait SECS]] [--prompt T] [--parent NAME] [-- claude args…]` is `new`'s twin for an existing conversation, and shares its plumbing: `_prepare_resume` returns a `LaunchTarget` for the launch loop's `initial_target`, or with `--detach` calls `_start_launch(attach=False)` under `_stdout_to_stderr` and prints `_resume_result` JSON. Rules, in order: an unknown id or unreadable log → exit 1; a missing `cwd` → exit 1 naming the branch (no recreation); already running (by `ActivityIndex`) and no `--fork` → connect (attached) or report (detached), **never a second process on one transcript**, and `--prompt` is an error since only a new process could take it; otherwise `_resume_cli_target` names the tmux session as the TUI's `_resume_target` does (the worktree's own name if free, else `session-N`; `adhoc-N` outside a repo). `LaunchTarget` gained three `resume`-only fields: `extra_args` (appended after the launch options and **never saved**, which is how the automatic `--name <worktree>-<id8>` / `<worktree>-fork-<hex4>` avoids overwriting a session's chosen options; skipped when the options already set `--name`), `fork_in_place` (`--resume <id> --fork-session` in the same directory, recorded with no id until `wait_for_registration` finds the new one in Claude Code's registry and `mark_open` stores it) and `parent_session` (the `--parent` prompt for sessions with no `meta.json`). claude does not document `--session-id` with `--fork-session`, which is why a fork's id comes from the registry rather than being chosen up front.
+- `fujimoto resume SESSION [--fork] [--detach [--wait SECS]] [--prompt T] [--parent NAME] [-- claude args…]` is `new`'s twin for an existing conversation, and shares its plumbing: `_prepare_resume` returns a `LaunchTarget` for the launch loop's `initial_target`, or with `--detach` calls `_start_launch(attach=False)` under `_stdout_to_stderr` and prints `_resume_result` JSON. Rules, in order: an unknown id or unreadable log → exit 1; a missing `cwd` → exit 1 naming the branch (no recreation); already running (by `ActivityIndex`) and no `--fork` → connect (attached) or report (detached), **never a second process on one transcript**, and `--prompt` is an error since only a new process could take it; otherwise `_resume_cli_target` names the tmux session: a stopped session whose record still holds this conversation id (`_record_owning`; a chat, typically) comes back under its own name and type, and only then as the TUI's `_resume_target` does (the worktree's own name if free, else `session-N`; `adhoc-N` outside a repo). A fork never reuses a record. `LaunchTarget` gained three `resume`-only fields: `extra_args` (appended after the launch options and **never saved**, which is how the automatic `--name <worktree>-<id8>` / `<worktree>-fork-<hex4>` avoids overwriting a session's chosen options; skipped when the options already set `--name`), `fork_in_place` (`--resume <id> --fork-session` in the same directory, recorded with no id until `wait_for_registration` finds the new one in Claude Code's registry and `mark_open` stores it) and `parent_session` (the `--parent` prompt for sessions with no `meta.json`). claude does not document `--session-id` with `--fork-session`, which is why a fork's id comes from the registry rather than being chosen up front.
 - `fujimoto stop SESSION [--json]` (`_run_stop_command`) resolves a tmux name directly, or a Claude session id via `session_query.tmux_for_session` (registry/tmux, refusing one running outside tmux), then `kill_session` + `mark_stopped`, the same as `Ctrl-A s`. It runs before the prerequisite check.
 - `fujimoto config [list|get KEY|set KEY VALUE|unset KEY] [--global|--project] [--json]` (`_run_config_command`, logic in `config_command.py`) runs before the prerequisite check. Bare `config` is `list`. `set`/`unset` *require* a scope flag (argparse mutually-exclusive group, `required=True`); `get` without one prints the effective value and exits 1 when unset, like `git config`. `config set` is the third command allowed a `--` remainder (after `new`/`resume`): `config set claude_args --project -- --verbose` passes a value argparse would otherwise read as a flag, joined back with `shlex.join`. Giving the value both before and after `--` is an error.
 - **Every launch's system prompt ends with `FUJIMOTO_CLI_PROMPT`** (`_with_cli_prompt` in `_start_launch`, covering new, fork and resume — a resume otherwise gets only the parent link, since an appended system prompt does not survive into a new process). It points the session at `fujimoto agent-instructions` and names `fujimoto config`; without it, a session asked to "show the fujimoto config" read the YAML files instead. Keep it one sentence: it is paid on every launch.
+- `fujimoto chat [TITLE] [--in WORKTREE | --in-temp] [--project NAME|PATH] [--prompt T] [--parent NAME] [--detach] [-- claude args…]` (`_prepare_chat`) starts a chat session (see Session Types) without creating a worktree. The project comes from `session_query.resolve_scope` (cwd, or `--project` path/name), so it shares `search`'s rules. Location: the project root by default; `--in` via `_pick_worktree` (exact name, else the one name containing the text; none/several → exit 1 listing them); `--in-temp` a `mkdtemp(prefix="fujimoto-chat-")`. The name is `next_session_name(..., fallback="chat")` against every tmux session, every record and every worktree name. A fresh `--session-id`, `--prompt`, and — unless the launch options already set one (`_peer_name_in`) — an unsaved `--name <project>-<chat name>` in `extra_args`, so the JSON's `peer_name` is a real address before the process registers. `--parent` goes onto the *record* (`mark_open(parent_session=…)`), since a chat has no `meta.json`. `chat --detach` is dispatched before `_check_prerequisites`, so with `--project` it works from outside any repo; attached, it is the launch loop's `initial_target` like `new`.
 - `fujimoto agent-instructions` prints `templates/agent_instructions.md` (`session_query.agent_instructions()`, via `importlib.resources`) — a slim guide for agents to the session commands and when to use them. **Keep it in step with the CLI**: `TestAgentInstructions.test_every_example_parses` runs every `fujimoto …` line in it through `_build_parser()` (the parser, extracted from `main()` for exactly this), and `test_stays_generic` checks the only ticket key in this shipped file is the `ABC-123` placeholder. Examples must stay synthetic (`ABC-123`, `8f0e2c1a`).
 - `fujimoto pane <vscode|terminal> --session <name>` dispatches to `_run_pane_command`, used by the in-session tmux key table (`Ctrl-A v` / `Ctrl-A w`). Resolves the session's working directory via `tmux display-message -p '#{session_path}'` and calls the existing `open_vscode` / `open_terminal` helpers; errors are surfaced via `tmux display-message` so they appear in the session's status bar.
 
@@ -222,11 +223,50 @@ row on the home screen without buying the user anything.
   `{project}/{slug}`, or `{project}/session-N` when blank. Older sessions
   named `{project}/direct-N` still list and work as before
 
-**Ad hoc sessions** — Claude launched in a temporary directory, outside any git project:
-- For quick questions, investigations, and one-off tasks
-- Working directory is a `tempfile.mkdtemp(prefix="fujimoto-adhoc-")` temp dir
-- Named `adhoc-N` in tmux (not project-scoped)
-- System prompt tells Claude there is no git repository
+**Chat sessions** (`session_type="chat"`) — for questions and conversation, not work:
+- `+ New chat` → optional title (`#chat-title-input`) → location picker
+  (`#chat-location-panel`): `cl-root` (project-root), `cl-temp` (a
+  `mkdtemp(prefix="fujimoto-chat-")`, created only once chosen), then worktrees
+  `cl-wt-N` ordered by their newest transcript's activity
+  (`_chat_worktrees_by_recency`, creation time as fallback). `/` filters
+  worktrees by name and `s` by transcript text (`_open_chat_filter(mode)`):
+  the text scan is `claude_search.iter_hits` over the worktrees' logs in a
+  `chat-text-search` thread worker, debounced, with `_chat_search_token` as the
+  staleness check, mapping each hit's `cwd` back through `_matching_worktree`.
+  Root and temp are never filtered out. `check_action` enables the `search`
+  and `session_search` bindings on this view, and both actions branch on
+  `_on_chat_location`.
+- Named `{project}/{slug}`, `{project}/chat-N` untitled, and recorded with the
+  project it was started from — even in a temp dir — so it is listed on that
+  project's home screen and survives a restart. The record's `session_type` is
+  the *only* thing that tells a running chat from a project-root session (both
+  are "a live session that is not a worktree's own"), and rows use the `ch-`
+  widget prefix (`_row_prefix`).
+- Row label `(💬 <location>)` from `_location_name` (memoized in
+  `_location_cache`): `project-root`, the worktree's name, or `temp`. No branch.
+- Menu: Connect (running) / **Resume chat** (`sa-resume-chat`, its own
+  `claude_session_id`, same tmux name) + **New conversation** (stopped), View
+  session log (opens the chat's own transcript, not a picker of its
+  directory's), Rename, Park/Stop/Terminate. No Fork, Resume picker or Finish.
+- Every new chat process gets a fresh `--session-id`, so its row finds its own
+  conversation (`_claude_for`) even beside other sessions in one directory.
+  Temp-dir transcripts reach `_get_claude_sessions` through `extra`
+  (`_chat_dirs()`: chat records outside the root and worktrees).
+- `_chat_system_prompt`: it is a chat, where it runs (root / another session's
+  worktree / temp, decided via `get_main_worktree_root`), and — soft, not
+  enforced — that work which changes files needs the user to choose where it
+  happens first. A resumed chat gets the whole prompt again (`_start_launch`),
+  since an appended system prompt does not survive into a new process.
+- A chat skips `_apply_worktree_config`: in a worktree it is a guest, and the
+  worktree's own session already runs its copy/link/init.
+- `launch_options._uses_worktree_meta` keeps a chat (or any session whose
+  record type is not `worktree`) in a worktree away from that worktree's
+  `meta.json` options — decided by the record, not the tmux name, because a
+  worktree session can be renamed.
+
+**Ad hoc sessions** (legacy) — `adhoc-N`, a temp dir, no project. The TUI no
+longer creates them; `fujimoto resume` still uses one for a transcript whose
+`cwd` is outside every repo, and old records keep their system prompt.
 
 ### Module Responsibilities
 
@@ -325,7 +365,10 @@ state, never an error):
 - `SessionRecord` dataclass: `cwd`, `project`, `session_type`, `branch`,
   `claude_session_id`, `stop_kind`, `created`, `last_seen`, `claude_args`
   (saved launch options for a non-worktree session; `None` = no override, and
-  `mark_open` preserves it — only `set_claude_args` changes it). `created` is
+  `mark_open` preserves it — only `set_claude_args` changes it),
+  `parent_session` (the starting session's peer address for sessions without
+  a `meta.json` — chats; `mark_open(parent_session=…)` sets it, `None` keeps
+  it). `created` is
   stamped by the *first* `mark_open` and preserved by every later one, so it is
   the session's creation order rather than its last reconnect; it is what the
   home screen sorts by. Only `cwd` is required — every
@@ -486,7 +529,8 @@ session:
   session's saved options (`Source.SESSION`), a fork parent's
   (`Source.PARENT`), the project's `.fujimoto.yaml` `claude_args`
   (`Source.PROJECT`), nothing (`Source.NONE`).
-- `saved_args(...)` checks three stores in order: the worktree's `meta.json`,
+- `saved_args(...)` checks three stores in order: the worktree's `meta.json`
+  (only for the worktree's own session — `_uses_worktree_meta`),
   the `session_state` record (by tmux name), and
   `~/.cache/fujimoto/launch_options.json` keyed by Claude conversation id.
 - `save(working_dir, tmux_name, claude_session_id, args)` writes to the
@@ -668,7 +712,7 @@ responsible for running it off the event loop.
   the rebuild (appending rows moves the highlight) and re-applied after; the
   `/` filter is preserved because `_refresh_home_list` re-applies
   `_search_query`. Guarded on `_on_home`, so `r` is inert in other views.
-- Home screen sections: actions ("New worktree session", "New project-root session (⎇ <root branch>)" — `_root_branch`, the main clone's branch, not the cwd's, "Ad hoc session"), recovered 🔄 (only when there are any — see Session Status), sessions — running 🟢, parked 🅿️ and stopped 🟠 together, since the icon carries the distinction (with Claude state indicators on the running ones), inactive worktrees, previous Claude sessions (resumable, capped at 5), switch project
+- Home screen sections: actions ("New worktree session", "New project-root session (⎇ <root branch>)" — `_root_branch`, the main clone's branch, not the cwd's, "New chat"), recovered 🔄 (only when there are any — see Session Status), sessions — running 🟢, parked 🅿️ and stopped 🟠 together, since the icon carries the distinction (with Claude state indicators on the running ones), inactive worktrees, previous Claude sessions (resumable, capped at 5), switch project
 - Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
 - Session actions submenu (in order): for active sessions, Connect → Fork session → Resume previous session; for inactive worktrees, Resume previous session → Fork session → Launch (resume is the more common action when picking an idle worktree). Then: View session log (whenever the path has a previous Claude session), Open terminal, Open in VS Code, Rename, Park session and Stop session (active only), Terminate session (active or stopped), Finish (worktree only), Cancel. Park, Stop and Terminate are separate menu items rather than one item plus a prompt — a menu is already a choice — but all route into the single `_end_session(session, terminate=..., park=...)` handler, which is also what the `Ctrl-A x` prompt calls. Claude-session items show just "Resume" + View session log + Open terminal/VS Code + Launch options + Cancel. "Launch options" sits after Rename for every session that has somewhere to save them (see the launch-options design decision). "Fork session" is always inserted at index 1 (`items.insert(1, ...)`) so its position holds across both layouts.
 - "Resume previous session" auto-launches the sole candidate when only one previous Claude session exists for the path, skipping the picker. Two or more sessions still show the picker.
@@ -830,7 +874,10 @@ Three custom exception types, all caught in `main()`:
 | tmux session (worktree) | `{project}/{dir-name}` | `my-app/20260309-fix-unit-tests` |
 | tmux session (project-root) | `{project}/{slug}`, or `{project}/session-{N}` untitled | `my-app/fix-login` |
 | tmux session (legacy direct) | `{project}/direct-{N}` | `my-app/direct-1` |
-| tmux session (adhoc) | `adhoc-{N}` | `adhoc-1` |
+| tmux session (chat) | `{project}/{slug}`, or `{project}/chat-{N}` untitled | `my-app/auth-question` |
+| Widget ID (chat) | `ch-{project}--{name}` | `ch-my-app--auth-question` |
+| Widget ID (chat location) | `cl-root`, `cl-temp`, `cl-wt-{i}` | `cl-wt-0` |
+| tmux session (adhoc, legacy) | `adhoc-{N}` | `adhoc-1` |
 | Widget ID (project-root) | `ds-{project}--{name}` | `ds-my-app--fix-login` |
 | Widget ID (claude session) | `cs-{session-id}` | `cs-abc12345-def6-7890` |
 | Widget ID (fork picker) | `fp-{index}` | `fp-0` |

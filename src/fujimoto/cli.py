@@ -13,11 +13,11 @@ import tempfile
 import textwrap
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, NoReturn
 
 from rich.markup import escape
 from textual import events, on, work
@@ -65,6 +65,7 @@ from fujimoto.config import (
     build_worktree_path,
     config_once_applied,
     get_next_adhoc_session_name,
+    DEFAULT_CHAT_TITLE,
     DEFAULT_SESSION_TITLE,
     get_project_worktrees_dir,
     list_projects,
@@ -152,6 +153,9 @@ ICON_FORK = "\U0001f374"
 # How a session running in the project root (the main clone) is labelled.
 # Deliberately not the branch: whatever the clone has checked out can change.
 ROOT_LOCATION = "project-root"
+# A chat session in a scratch directory outside the repository.
+TEMP_LOCATION = "temp"
+ICON_CHAT = "\U0001f4ac"
 
 
 _KEY_PREFIX_LABELS = {"C-": "Ctrl+", "M-": "Alt+", "S-": "Shift+"}
@@ -618,8 +622,13 @@ class ClaudeData(NamedTuple):
 def _get_claude_sessions(
     project_root: Path | None,
     worktrees: list[Path],
+    extra: Iterable[Path] = (),
 ) -> ClaudeData:
-    """Fetch Claude sessions for the project root and worktree paths."""
+    """Fetch Claude sessions for the project root and worktree paths.
+
+    `extra` adds directories that are neither — a chat's temp directory —
+    whose transcripts the home screen still has rows for.
+    """
     path_to_latest: dict[str, ClaudeSession] = {}
     root_sessions: list[ClaudeSession] = []
     by_id: dict[str, ClaudeSession] = {}
@@ -635,6 +644,14 @@ def _get_claude_sessions(
         if wt_sessions:
             path_to_latest[str(wt)] = wt_sessions[0]
         by_id.update((cs.session_id, cs) for cs in wt_sessions)
+
+    for path in extra:
+        if str(path) in path_to_latest:
+            continue
+        sessions = get_sessions_for_path(path)
+        if sessions:
+            path_to_latest[str(path)] = sessions[0]
+        by_id.update((cs.session_id, cs) for cs in sessions)
 
     return ClaudeData(path_to_latest, root_sessions, by_id)
 
@@ -712,6 +729,34 @@ Screen {
 
 #home-list > ListItem {
     padding: 0 2;
+}
+
+#chat-location-panel {
+    height: 1fr;
+    padding: 1 2;
+    border: round $primary;
+}
+
+#chat-location-panel .form-label {
+    margin-bottom: 1;
+    text-style: bold;
+}
+
+#chat-location-status {
+    color: $text-muted;
+    height: 1;
+}
+
+#chat-location-list {
+    height: 1fr;
+}
+
+#chat-location-list > ListItem {
+    padding: 0 2;
+}
+
+#chat-location-list:focus > ListItem.--highlight {
+    background: $accent;
 }
 
 #home-list:focus > ListItem.--highlight {
@@ -1357,7 +1402,7 @@ class LaunchOptionsDialog(ModalScreen["tuple[str, ...] | None"]):
 @dataclass
 class SessionInfo:
     name: str
-    session_type: str  # "worktree", "direct", "adhoc", or "claude"
+    session_type: str  # "worktree", "direct", "chat", "adhoc", or "claude"
     project: str
     path: Path
     tmux_session: str
@@ -1392,6 +1437,8 @@ _LAUNCH_OPTION_WIDGETS = frozenset(
         "branch-filter",
         "conflict-list",
         "direct-title-input",
+        "chat-title-input",
+        "chat-location-list",
         "fork-title-input",
         "fork-branch-list",
         "fork-picker",
@@ -1553,6 +1600,8 @@ class SessionApp(App):
         # branch. Resolving it runs subprocesses, and `_build_home_items` runs
         # on every `/` keystroke, so it is memoized like `_claude_cache`.
         self._direct_cwd_cache: dict[str, tuple[Path, str]] = {}
+        # `_location_name` per (session type, path); same lifetime.
+        self._location_cache: dict[tuple[str, Path], str] = {}
         # Creation time (epoch seconds) per worktree/session directory, used to
         # order every home-screen section newest-first. Filled by
         # `_init_git_info` because it is one `stat` per directory.
@@ -1576,6 +1625,20 @@ class SessionApp(App):
         # Set when the session-actions menu was opened from a search result, so
         # Cancel/Escape returns to the results instead of the home screen.
         self._actions_from_search: bool = False
+        # -- New chat: title, then where it runs --
+        self._chat_title: str = ""
+        self._on_chat_location: bool = False
+        # Item id → directory for the location rows on screen; `None` is the
+        # temp-dir row, created only once it is chosen.
+        self._chat_locations: dict[str, Path | None] = {}
+        # "name" (`/`) filters worktrees by name; "text" (`s`) by what their
+        # transcripts say. `_chat_text_matches` is None until a text scan has
+        # answered for the current query.
+        self._chat_filter_mode: str = "name"
+        self._chat_filter_query: str = ""
+        self._chat_text_matches: set[Path] | None = None
+        self._chat_search_token: int = 0
+        self._chat_debounce: Timer | None = None
         # Which result row the actions menu was opened from, so backing out
         # lands the highlight there instead of at the top of the list.
         self._search_selected_index: int | None = None
@@ -1678,6 +1741,7 @@ class SessionApp(App):
         self._claude_cache = None
         self._fork_marker_cache = {}
         self._direct_cwd_cache = {}
+        self._location_cache = {}
         self._available_projects = list_projects()
         self.sub_title = self._project_name
         set_terminal_title(_session_manager_title(self._project_name))
@@ -1732,11 +1796,11 @@ class SessionApp(App):
         what we want, so this returns `False`, never `None`.
         """
         if action == "search":
-            return self._on_home
+            return self._on_home or self._on_chat_location
         if action == "log_search":
             return self._on_log
         if action == "session_search":
-            return self._on_home
+            return self._on_home or self._on_chat_location
         if action == "refresh":
             # `action_refresh` already no-ops off the home screen; this is so
             # the footer stops offering it there.
@@ -1811,6 +1875,7 @@ class SessionApp(App):
         self._stop_polling()
         self._stop_transcript_search()
         self._stop_log_search()
+        self._stop_chat_location()
         self._on_home = False
         main = self.query_one("#main")
         await main.remove_children()
@@ -2029,10 +2094,21 @@ class SessionApp(App):
         """
         if self._claude_cache is None:
             self._claude_cache = _get_claude_sessions(
-                self._project_root, self._existing_worktrees
+                self._project_root, self._existing_worktrees, self._chat_dirs()
             )
             self._live_claude_ids = _live_claude_ids()
         return self._claude_cache
+
+    def _chat_dirs(self) -> list[Path]:
+        """Directories of this project's chats outside the root and worktrees."""
+        known = {self._project_root, *self._existing_worktrees}
+        return [
+            rec.path
+            for rec in self._open_sessions.values()
+            if rec.session_type == "chat"
+            and rec.project == self._project_name
+            and rec.path not in known
+        ]
 
     def _claude_for(
         self, tmux_name: str, path: Path, record_id: str | None = None
@@ -2225,8 +2301,16 @@ class SessionApp(App):
                     id="action-direct",
                 ),
                 ListItem(
-                    Label("[bold]+ Ad hoc session[/]", markup=True),
-                    id="action-adhoc",
+                    Label(
+                        Content.assemble(
+                            ("+ New chat", "bold"),
+                            (
+                                "  (talk, not work — in project-root, temp or a worktree)",
+                                "dim",
+                            ),
+                        )
+                    ),
+                    id="action-chat",
                 ),
             ]
 
@@ -2258,14 +2342,22 @@ class SessionApp(App):
         running: list[tuple[tuple[float, tuple[object, ...]], ListItem]] = []
 
         for sname in direct_sessions:
-            item_id = f"ds-{sname.replace('/', '--')}"
+            # Any running session that is not a worktree's own: a project-root
+            # session, or a chat (which only its record can tell apart).
+            record = self._open_sessions.get(sname)
+            kind = "chat" if record and record.session_type == "chat" else "direct"
+            item_id = f"{_row_prefix(kind)}{sname.replace('/', '--')}"
             display_name = sname.split("/", 1)[1] if "/" in sname else sname
             path, branch = self._direct_session_cwd(sname)
             if not self._search_matches(
-                display_name, sname, self._project_name, branch, ROOT_LOCATION
+                display_name,
+                sname,
+                self._project_name,
+                branch,
+                self._location_name(kind, path),
+                kind,
             ):
                 continue
-            record = self._open_sessions.get(sname)
             record_id = record.claude_session_id if record else None
             cs = self._claude_for(sname, path, record_id)
             cs_id = cs.session_id if cs else record_id
@@ -2275,7 +2367,7 @@ class SessionApp(App):
             state_suffix = _claude_state_label(cs_state) if cs_state else ""
             info = SessionInfo(
                 name=display_name,
-                session_type="direct",
+                session_type=kind,
                 project=self._project_name,
                 path=path,
                 tmux_session=sname,
@@ -2356,12 +2448,18 @@ class SessionApp(App):
             branch = rec.branch or (
                 f"worktree/{display_name}" if is_worktree else self._current_branch
             )
-            if not self._search_matches(display_name, sname, branch):
+            if not self._search_matches(
+                display_name,
+                sname,
+                branch,
+                self._location_name(rec.session_type, rec.path),
+                rec.session_type,
+            ):
                 continue
             item_id = (
                 f"wt-{display_name}"
                 if is_worktree
-                else f"ds-{sname.replace('/', '--')}"
+                else f"{_row_prefix(rec.session_type)}{sname.replace('/', '--')}"
             )
             cs = self._claude_for(sname, rec.path, rec.claude_session_id)
             cs_id = cs.session_id if cs else rec.claude_session_id
@@ -2543,7 +2641,10 @@ class SessionApp(App):
         return items
 
     async def action_search(self) -> None:
-        """Arm the home-screen name filter (bound to `/` on the home screen)."""
+        """Arm the name filter (`/`): home-screen rows, or chat locations."""
+        if self._on_chat_location:
+            self._open_chat_filter("name")
+            return
         if not self._on_home or not self.query("#home-search"):
             return
         self._searching = True
@@ -2642,7 +2743,14 @@ class SessionApp(App):
     SEARCH_MIN_QUERY = 2
 
     async def action_session_search(self) -> None:
-        """Open the transcript search view (bound to `s` on the home screen)."""
+        """Open the transcript search view (bound to `s` on the home screen).
+
+        On the chat location picker `s` instead filters worktrees by what
+        their transcripts say.
+        """
+        if self._on_chat_location:
+            self._open_chat_filter("text")
+            return
         if not self._on_home:
             return
         await self._show_session_search()
@@ -3095,7 +3203,7 @@ class SessionApp(App):
         # Refresh (rather than bypass) the render cache, so the next filter
         # keystroke renders from freshly polled data without re-parsing.
         self._claude_cache = _get_claude_sessions(
-            self._project_root, self._existing_worktrees
+            self._project_root, self._existing_worktrees, self._chat_dirs()
         )
         self._live_claude_ids = _live_claude_ids()
 
@@ -3142,8 +3250,14 @@ class SessionApp(App):
         drift apart.
         """
         fork = f" {ICON_FORK}" if session.is_fork else ""
-        location = self._row_location(session)
-        detail = f"[dim]({location}{BRANCH_ICON} {session.branch})[/]"
+        if session.session_type == "chat":
+            # A chat is not on a branch in any sense that matters; where it
+            # runs is the whole story.
+            location = self._location_name("chat", session.path)
+            detail = f"[dim]({ICON_CHAT} {location})[/]"
+        else:
+            location = self._row_location(session)
+            detail = f"[dim]({location}{BRANCH_ICON} {session.branch})[/]"
         if session.is_active:
             icon = ICON_GREEN_CIRCLE
         elif session.stop_kind is StopKind.RECOVERED:
@@ -3156,6 +3270,27 @@ class SessionApp(App):
             icon = ICON_BLACK_CIRCLE
         suffix = state_suffix if session.is_active else ""
         return f"{icon} {session.name}{fork}  {detail}{suffix}"
+
+    def _location_name(self, session_type: str, path: Path) -> str:
+        """Where a chat or root session runs: project-root, a worktree, or temp.
+
+        Memoized: it runs per row on every `/` keystroke, and matching a
+        worktree resolves paths on disk.
+        """
+        if session_type not in ("chat", "direct"):
+            return ""
+        key = (session_type, path)
+        cached = self._location_cache.get(key)
+        if cached is not None:
+            return cached
+        if self._project_root and path == self._project_root:
+            name = ROOT_LOCATION
+        elif (worktree := self._matching_worktree(path)) is not None:
+            name = worktree.name
+        else:
+            name = TEMP_LOCATION if session_type == "chat" else path.name
+        self._location_cache[key] = name
+        return name
 
     def _row_location(self, session: SessionInfo) -> str:
         """Where a non-worktree row runs, as a label prefix (or "").
@@ -3340,6 +3475,19 @@ class SessionApp(App):
         if session.session_type == "claude":
             items.append(ListItem(Label("Resume"), id="sa-resume"))
             items.append(ListItem(Label("View session log"), id="sa-viewlog"))
+        elif session.session_type == "chat":
+            # A chat is one conversation, so it resumes that, not a pick of
+            # every transcript in its directory (which may be a busy worktree's
+            # or the project root's). No fork: forking is how work starts, and
+            # `Ctrl-A f` still offers it from inside.
+            if session.is_active:
+                items.append(ListItem(Label("Connect"), id="sa-connect"))
+            else:
+                if session.claude_session_id:
+                    items.append(ListItem(Label("Resume chat"), id="sa-resume-chat"))
+                items.append(ListItem(Label("New conversation"), id="sa-launch"))
+            if session.claude_session_id:
+                items.append(ListItem(Label("View session log"), id="sa-viewlog"))
         else:
             has_previous = bool(get_sessions_for_path(session.path))
             if session.is_active:
@@ -3407,8 +3555,8 @@ class SessionApp(App):
             # Strip markup tags for plain text info line
             status_label = status_label.replace("[dim]", "").replace("[/]", "")
         else:
-            type_label = (
-                session.project if session.session_type == "direct" else "worktree"
+            type_label = {"direct": ROOT_LOCATION, "chat": "chat"}.get(
+                session.session_type, "worktree"
             )
             if session.is_active:
                 status_label = "active"
@@ -3416,7 +3564,11 @@ class SessionApp(App):
                 status_label = session.stop_kind.value
             else:
                 status_label = "inactive"
-        info_text = f"{type_label} | {status_label} | {BRANCH_ICON} {session.branch}"
+        if session.session_type == "chat":
+            where = f"{ICON_CHAT} {self._location_name('chat', session.path)}"
+        else:
+            where = f"{BRANCH_ICON} {session.branch}"
+        info_text = f"{type_label} | {status_label} | {where}"
 
         await main.mount(
             Container(
@@ -3613,6 +3765,17 @@ class SessionApp(App):
         """
         self._selected_session = session
         sessions = get_sessions_for_path(session.path)
+
+        if session.session_type == "chat" and session.claude_session_id:
+            # A chat names its conversation, like a `claude` row — and its
+            # directory may hold other sessions' transcripts.
+            match = next(
+                (c for c in sessions if c.session_id == session.claude_session_id),
+                None,
+            )
+            if match is not None:
+                await self._show_session_log(match)
+                return
 
         if session.session_type == "claude":
             match = next(
@@ -4625,6 +4788,22 @@ class SessionApp(App):
                 await self._clear_log_search()
             return
 
+        if self.focused.id == "chat-location-filter":
+            if event.key == "escape":
+                event.prevent_default()
+                event.stop()
+                await self._clear_chat_filter()
+                return
+            if event.key in ("down", "up") and self.query("#chat-location-list"):
+                event.prevent_default()
+                event.stop()
+                listing = self.query_one("#chat-location-list", ListView)
+                if event.key == "down":
+                    listing.action_cursor_down()
+                else:
+                    listing.action_cursor_up()
+            return
+
         if self.focused.id == "home-search":
             if event.key == "escape":
                 event.prevent_default()
@@ -4705,8 +4884,8 @@ class SessionApp(App):
             await self._show_create_form()
         elif item_id == "action-direct":
             await self._launch_direct_session()
-        elif item_id == "action-adhoc":
-            self._launch_adhoc_session()
+        elif item_id == "action-chat":
+            await self._show_chat_title_form()
         elif item_id == "action-switch-project":
             await self._show_project_select()
         elif item_id == "action-toggle-quick-terminal":
@@ -4725,20 +4904,6 @@ class SessionApp(App):
         else:
             disable_quick_terminal_binding()
         await self._show_home()
-
-    def _launch_adhoc_session(self) -> None:
-        all_sessions = set(list_all_sessions())
-        tmux_name = get_next_adhoc_session_name(all_sessions)
-        adhoc_dir = Path(tempfile.mkdtemp(prefix="fujimoto-adhoc-"))
-        self._launch(
-            LaunchTarget(
-                "adhoc",
-                adhoc_dir,
-                tmux_name,
-                "adhoc",
-                None,
-            )
-        )
 
     async def _launch_direct_session(self) -> None:
         await self._show_direct_title_form()
@@ -4780,6 +4945,324 @@ class SessionApp(App):
             }
         )
 
+    # -- New chat --
+
+    async def _show_chat_title_form(self) -> None:
+        await self._clear_main()
+        main = self.query_one("#main")
+        await main.mount(
+            Container(
+                Label("New Chat", classes="form-label"),
+                Static(
+                    "[dim]For questions and conversation rather than work. "
+                    "Next: choose where it runs.[/]",
+                    markup=True,
+                ),
+                Static(""),
+                Label("Title (optional):"),
+                Input(placeholder="e.g. fix-unit-tests", id="chat-title-input"),
+                Static("[dim]Press Enter to continue[/]", markup=True, classes="hint"),
+                id="create-panel",
+            )
+        )
+        self.query_one("#chat-title-input", Input).focus()
+
+    @on(Input.Submitted, "#chat-title-input")
+    async def on_chat_title_submitted(self, event: Input.Submitted) -> None:
+        self._chat_title = event.value.strip()
+        self._chat_filter_mode = "name"
+        self._chat_filter_query = ""
+        self._chat_text_matches = None
+        await self._show_chat_location()
+
+    def _chat_worktrees_by_recency(self) -> list[Path]:
+        """Worktrees, most recently *used* first — the likeliest place to ask.
+
+        Use is the newest transcript's activity; a worktree with none falls back
+        to its creation time.
+        """
+        latest = self._claude_session_data().path_to_latest
+
+        def key(wt: Path) -> float:
+            cs = latest.get(str(wt))
+            if cs is not None and cs.last_activity is not None:
+                return cs.last_activity.timestamp()
+            return self._creation_times.get(str(wt), 0.0)
+
+        return sorted(self._existing_worktrees, key=key, reverse=True)
+
+    async def _show_chat_location(self) -> None:
+        await self._clear_main()
+        self._on_chat_location = True
+        preview = next_session_name(
+            self._project_name,
+            self._chat_title,
+            self._taken_session_names(),
+            fallback=DEFAULT_CHAT_TITLE,
+        ).split("/", 1)[1]
+        main = self.query_one("#main")
+        search = Input(id="chat-location-filter", select_on_focus=False)
+        search.display = False
+        await main.mount(
+            Container(
+                Label(
+                    Content.assemble(
+                        (f"New chat: {preview}", "bold"),
+                        ("  — where should it run?", "dim"),
+                    ),
+                    classes="form-label",
+                ),
+                search,
+                Static("", id="chat-location-status"),
+                PagingListView(id="chat-location-list"),
+                Static(
+                    "[dim]Enter start · / filter worktrees by name · "
+                    "s filter by transcript text · Esc back[/]",
+                    markup=True,
+                    classes="hint",
+                ),
+                id="chat-location-panel",
+            )
+        )
+        await self._refresh_chat_locations()
+        self.query_one("#chat-location-list", ListView).focus()
+        self.refresh_bindings()
+
+    async def _refresh_chat_locations(self) -> None:
+        """Rebuild the location rows for the current filter.
+
+        project-root and temp are always offered; the filter only narrows the
+        worktrees, which is where there are too many to scan by eye.
+        """
+        if not self.query("#chat-location-list"):
+            return
+        listing = self.query_one("#chat-location-list", ListView)
+        await listing.clear()
+        self._chat_locations = {"cl-root": self._project_root, "cl-temp": None}
+        items = [
+            ListItem(
+                Label(
+                    Content.assemble(
+                        (ROOT_LOCATION, "bold"),
+                        (f"  ({BRANCH_ICON} {self._root_branch})", "dim"),
+                    )
+                ),
+                id="cl-root",
+            ),
+            ListItem(
+                Label(
+                    Content.assemble(
+                        (TEMP_LOCATION, "bold"),
+                        ("  (scratch directory outside the repo)", "dim"),
+                    )
+                ),
+                id="cl-temp",
+            ),
+        ]
+        query = self._chat_filter_query.strip().lower()
+        latest = self._claude_session_data().path_to_latest
+        shown = 0
+        for i, wt in enumerate(self._chat_worktrees_by_recency()):
+            if self._chat_filter_mode == "name":
+                if query and query not in wt.name.lower():
+                    continue
+            elif (
+                self._chat_text_matches is not None
+                and wt not in self._chat_text_matches
+            ):
+                continue
+            item_id = f"cl-wt-{i}"
+            self._chat_locations[item_id] = wt
+            cs = latest.get(str(wt))
+            when = _relative_time(cs.last_activity) if cs else ""
+            items.append(
+                ListItem(
+                    Label(Content.assemble((wt.name, ""), (f"  {when}", "dim"))),
+                    id=item_id,
+                )
+            )
+            shown += 1
+        filtering = bool(query) and (
+            self._chat_filter_mode == "name" or self._chat_text_matches is not None
+        )
+        if filtering and not shown:
+            items.append(
+                ListItem(
+                    Static("no matching worktrees", classes="separator-item"),
+                    disabled=True,
+                )
+            )
+        await listing.extend(items)
+        listing.index = 0
+        debug.log(
+            "tui.chat_locations",
+            mode=self._chat_filter_mode,
+            query=debug.rv(query) if query else "none",
+            worktrees=shown,
+        )
+
+    def _open_chat_filter(self, mode: str) -> None:
+        """`/` (worktree names) or `s` (transcript text) on the location picker."""
+        if not self._on_chat_location or not self.query("#chat-location-filter"):
+            return
+        if mode != self._chat_filter_mode:
+            self._chat_filter_mode = mode
+            self._chat_text_matches = None
+            self._start_chat_filter()
+        box = self.query_one("#chat-location-filter", Input)
+        box.placeholder = (
+            "Filter worktrees by name..."
+            if mode == "name"
+            else "Filter worktrees by what their sessions said..."
+        )
+        box.display = True
+        box.focus()
+
+    @on(Input.Changed, "#chat-location-filter")
+    def on_chat_filter_changed(self, event: Input.Changed) -> None:
+        if event.value == self._chat_filter_query:
+            return
+        self._chat_filter_query = event.value
+        if self._chat_filter_mode == "name":
+            self.run_worker(
+                self._refresh_chat_locations(), exclusive=True, group="chat-loc"
+            )
+            return
+        if self._chat_debounce is not None:
+            self._chat_debounce.stop()
+        self._chat_debounce = self.set_timer(
+            self.SEARCH_DEBOUNCE, self._start_chat_filter
+        )
+
+    @on(Input.Submitted, "#chat-location-filter")
+    def on_chat_filter_submitted(self, event: Input.Submitted) -> None:
+        self.query_one("#chat-location-list", ListView).focus()
+
+    def _start_chat_filter(self) -> None:
+        """Apply the current filter; a text query scans transcripts off-thread."""
+        self._chat_debounce = None
+        self._chat_search_token += 1
+        self.workers.cancel_group(self, "chat-text-search")
+        query = self._chat_filter_query.strip()
+        status = ""
+        if self._chat_filter_mode == "text":
+            self._chat_text_matches = None
+            if len(query) >= self.SEARCH_MIN_QUERY:
+                status = "searching transcripts…"
+                self._run_chat_text_search(query, self._chat_search_token)
+            elif query:
+                status = f"type at least {self.SEARCH_MIN_QUERY} characters"
+        self._set_chat_status(status)
+        self.run_worker(
+            self._refresh_chat_locations(), exclusive=True, group="chat-loc"
+        )
+
+    def _set_chat_status(self, text: str) -> None:
+        if self.query("#chat-location-status"):
+            self.query_one("#chat-location-status", Static).update(
+                Content.styled(text, "dim")
+            )
+
+    @work(thread=True, exclusive=True, group="chat-text-search")
+    def _run_chat_text_search(self, query: str, token: int) -> None:
+        """Which worktrees have a transcript whose messages match `query`."""
+        worker = get_current_worker()
+        matcher = claude_search.compile_matcher(
+            query, regex=False, mode=ContentMode.TEXT
+        )
+        logs = claude_search.list_session_logs(None, self._existing_worktrees)
+        matched: set[Path] = set()
+        try:
+            for _, hits in claude_search.iter_hits(
+                logs, matcher, is_cancelled=lambda: worker.is_cancelled
+            ):
+                for hit in hits:
+                    wt = self._matching_worktree(hit.session.cwd)
+                    if wt is not None:
+                        matched.add(wt)
+        except RuntimeError:  # pragma: no cover - app shut down mid-scan
+            return
+        if worker.is_cancelled:  # pragma: no cover - racy early out
+            return
+        self.call_from_thread(
+            self._apply_chat_text_search, token, query, matched, len(logs)
+        )
+
+    def _apply_chat_text_search(
+        self, token: int, query: str, matched: set[Path], scanned: int
+    ) -> None:
+        if token != self._chat_search_token or not self._on_chat_location:
+            debug.log("tui.chat_text_search", outcome="stale")
+            return
+        self._chat_text_matches = matched
+        noun = "worktree" if len(matched) == 1 else "worktrees"
+        self._set_chat_status(f"{len(matched)} {noun} mention “{query}”")
+        debug.log(
+            "tui.chat_text_search",
+            outcome="done",
+            query=debug.rv(query),
+            logs=scanned,
+            worktrees=len(matched),
+        )
+        self.run_worker(
+            self._refresh_chat_locations(), exclusive=True, group="chat-loc"
+        )
+
+    async def _clear_chat_filter(self) -> None:
+        self._chat_filter_query = ""
+        self._chat_text_matches = None
+        self._chat_search_token += 1
+        self.workers.cancel_group(self, "chat-text-search")
+        if self._chat_debounce is not None:
+            self._chat_debounce.stop()
+            self._chat_debounce = None
+        if self.query("#chat-location-filter"):
+            box = self.query_one("#chat-location-filter", Input)
+            box.value = ""
+            box.display = False
+        self._set_chat_status("")
+        await self._refresh_chat_locations()
+        if self.query("#chat-location-list"):
+            self.query_one("#chat-location-list", ListView).focus()
+
+    def _stop_chat_location(self) -> None:
+        self._on_chat_location = False
+        self._chat_search_token += 1
+        self.workers.cancel_group(self, "chat-text-search")
+        if self._chat_debounce is not None:
+            self._chat_debounce.stop()
+            self._chat_debounce = None
+
+    @on(ListView.Selected, "#chat-location-list")
+    def on_chat_location_selected(self, event: ListView.Selected) -> None:
+        item_id = event.item.id or ""
+        if item_id not in self._chat_locations:
+            return  # pragma: no cover - the disabled "no matches" row
+        path = self._chat_locations[item_id]
+        if path is None:
+            path = Path(tempfile.mkdtemp(prefix="fujimoto-chat-"))
+        tmux_name = next_session_name(
+            self._project_name,
+            self._chat_title,
+            self._taken_session_names(),
+            fallback=DEFAULT_CHAT_TITLE,
+        )
+        debug.log(
+            "tui.new_chat",
+            tmux=debug.rv(tmux_name),
+            location=_chat_location_kind(item_id),
+            path=debug.rp(path),
+        )
+        self._launch(
+            LaunchTarget(
+                self._project_name,
+                path,
+                tmux_name,
+                "chat",
+                session_id=str(uuid.uuid4()),
+            )
+        )
+
     @on(ListView.Selected, "#session-actions")
     async def on_session_action_selected(self, event: ListView.Selected) -> None:
         session = self._selected_session
@@ -4805,6 +5288,21 @@ class SessionApp(App):
                     session.tmux_session,
                     session.session_type,
                     None,
+                    # A chat records its conversation from the start, so its
+                    # row can tell it apart from others in the same directory.
+                    session_id=str(uuid.uuid4())
+                    if session.session_type == "chat"
+                    else None,
+                )
+            )
+        elif action == "sa-resume-chat":
+            self._launch(
+                LaunchTarget(
+                    session.project,
+                    session.path,
+                    session.tmux_session,
+                    "chat",
+                    session.claude_session_id,
                 )
             )
         elif action == "sa-resume":
@@ -5189,6 +5687,8 @@ class SessionApp(App):
         elif self._on_log and (self._log_searching or self._log_query):
             # In the log viewer escape drops the search before leaving the view.
             await self._clear_log_search()
+        elif self._on_chat_location and self._chat_filter_query:
+            await self._clear_chat_filter()
         elif self._actions_from_search and not self._on_search:
             # Back out of a result's actions menu into the results it came from.
             await self._show_session_search(restore=True)
@@ -5199,6 +5699,24 @@ class SessionApp(App):
                 await self._show_home()
             except (ConfigError, GitError):
                 self.exit()
+
+
+def _row_prefix(session_type: str) -> str:
+    """Home-row widget id prefix for a non-worktree session.
+
+    >>> _row_prefix("chat"), _row_prefix("direct")
+    ('ch-', 'ds-')
+    """
+    return "ch-" if session_type == "chat" else "ds-"
+
+
+def _chat_location_kind(item_id: str) -> str:
+    """`root`, `temp` or `worktree`, for the debug log (never the name).
+
+    >>> _chat_location_kind("cl-wt-3")
+    'worktree'
+    """
+    return {"cl-root": "root", "cl-temp": "temp"}.get(item_id, "worktree")
 
 
 def _check_prerequisites() -> list[str]:
@@ -5224,7 +5742,60 @@ def _session_branch(working_dir: Path) -> str:
         return ""
 
 
-def _build_system_prompt(session_type: str, project: str, working_dir: Path) -> str:
+def _chat_system_prompt(project: str, working_dir: Path) -> str:
+    """Tell a chat what it is for, where it is, and that work is a decision.
+
+    Soft on purpose: a chat may well end in work, but the user should choose
+    where that happens rather than find it done in a shared directory.
+    """
+    try:
+        root = get_main_worktree_root(working_dir)
+    except GitError:
+        root = None
+    if root is None:
+        where = (
+            "a temporary scratch directory outside any repository, so the "
+            "project's files are not here"
+        )
+    elif root == working_dir:
+        where = "the project root (the main clone), which other sessions may share"
+    else:
+        where = (
+            f"the worktree '{working_dir.name}', which belongs to another "
+            "session's work"
+        )
+    return (
+        f"This is a fujimoto chat session for project '{project}': it is for "
+        "conversation and questions rather than implementation work. It is "
+        f"running in {where}. If work comes up that means changing files, "
+        "don't start it here without asking: make sure the user deliberately "
+        "decides where it should happen (for example a new fujimoto worktree "
+        "session) first."
+    )
+
+
+def _session_parent(
+    session_type: str, working_dir: Path, tmux_name: str, explicit: str | None
+) -> str | None:
+    """The peer address of the session that started this one, if any.
+
+    A worktree keeps it in `meta.json`; everything else — a chat in
+    particular, which may sit in *another* session's worktree — on its record.
+    """
+    if explicit:
+        return explicit
+    if session_type == "worktree":
+        return read_parent_session(working_dir)
+    record = session_state.load_state().get(tmux_name)
+    return record.parent_session if record else None
+
+
+def _build_system_prompt(
+    session_type: str, project: str, working_dir: Path, parent: str | None = None
+) -> str:
+    if session_type == "chat":
+        prompt = _chat_system_prompt(project, working_dir)
+        return f"{prompt} {_parent_system_prompt(parent)}" if parent else prompt
     if session_type == "adhoc":
         return (
             "This is an ad hoc Claude session that is not in a git project. "
@@ -5242,7 +5813,7 @@ def _build_system_prompt(session_type: str, project: str, working_dir: Path) -> 
         parent = read_parent_session(working_dir)
         return f"{prompt} {_parent_system_prompt(parent)}" if parent else prompt
     return (
-        f"You are working in a fujimoto direct session for project '{project}'. "
+        f"You are working in a fujimoto project-root session for project '{project}'. "
         "This is the project's main repository directory, not an isolated worktree. "
         "Be cautious with branch operations — other sessions may share this directory."
     )
@@ -5531,6 +6102,10 @@ def _start_launch(target: LaunchTarget, *, attach: bool = True) -> str | None:
         session_type=session_type,
         resume=resume_id or "none",
     )
+    resolved_name = tmux_name or session_name(project_name, working_dir.name)
+    parent = _session_parent(
+        session_type, working_dir, resolved_name, target.parent_session
+    )
     if fork_id:
         # A fork resumes the parent's conversation but in a new
         # worktree, so it needs the prompt explaining the move.
@@ -5541,14 +6116,17 @@ def _start_launch(target: LaunchTarget, *, attach: bool = True) -> str | None:
             target.forked_from_worktree,
             meta.get("base_branch", "unknown"),
         )
-    elif resume_id:
+    elif resume_id and session_type != "chat":
         # A resumed conversation already carries its original context; only
         # the parent link needs re-stating, since the appended system prompt
         # does not survive into a new claude process.
-        parent = target.parent_session or read_parent_session(working_dir)
         system_prompt = _parent_system_prompt(parent) if parent else None
     else:
-        system_prompt = _build_system_prompt(session_type, project_name, working_dir)
+        # A resumed chat gets its whole prompt again for the same reason: what
+        # it is for is not in the transcript, only in the appended prompt.
+        system_prompt = _build_system_prompt(
+            session_type, project_name, working_dir, parent
+        )
     # The appended system prompt does not survive into a resumed process, so
     # this is added on every launch, not only the first.
     system_prompt = _with_cli_prompt(system_prompt)
@@ -5556,10 +6134,13 @@ def _start_launch(target: LaunchTarget, *, attach: bool = True) -> str | None:
         set_terminal_title(
             _session_terminal_title(project_name, tmux_name, working_dir, session_type)
         )
-    if not _apply_worktree_config(working_dir, interactive=attach):
+    # A chat in a worktree is a guest there: the worktree's own session runs
+    # its copy/link/init setup, and a chat should not re-run `uv sync` on it.
+    if session_type != "chat" and not _apply_worktree_config(
+        working_dir, interactive=attach
+    ):
         debug.log("launch.aborted", reason="project-config")
         return None
-    resolved_name = tmux_name or session_name(project_name, working_dir.name)
     # Record the session as open *before* attaching: if the host
     # goes down while it is attached, the record is what brings the
     # session back.
@@ -5574,6 +6155,8 @@ def _start_launch(target: LaunchTarget, *, attach: bool = True) -> str | None:
         claude_session_id=None
         if target.fork_in_place
         else resume_id or target.session_id,
+        # A worktree keeps its parent in `meta.json` (written by the caller).
+        parent_session=target.parent_session if session_type != "worktree" else None,
     )
     # The default model is added here, after the options are saved, so it is
     # never stored as one of the session's own options.
@@ -5760,6 +6343,116 @@ def _prepare_new_session(
     return None
 
 
+def _chat_fail(message: str) -> NoReturn:
+    _finish_debug_log()
+    print(f"fujimoto: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _pick_worktree(worktrees: Iterable[Path], ref: str) -> Path:
+    """`--in REF`: an exact worktree name, else the one name containing it."""
+    existing = [w for w in worktrees if w.is_dir()]
+    exact = [w for w in existing if w.name == ref]
+    if exact:
+        return exact[0]
+    partial = [w for w in existing if ref in w.name]
+    if len(partial) == 1:
+        return partial[0]
+    if not partial:
+        _chat_fail(f"no worktree matches {ref!r}")
+    names = ", ".join(sorted(w.name for w in partial))
+    _chat_fail(f"{ref!r} matches several worktrees: {names}")
+
+
+def _prepare_chat(
+    args: argparse.Namespace, claude_args: tuple[str, ...] | None
+) -> LaunchTarget | None:
+    """Run `fujimoto chat`: a titled chat session, no worktree created.
+
+    Where it runs is the project root unless `--in` names a worktree or
+    `--in-temp` asks for a scratch directory. The new claude process gets a
+    fresh `--session-id` and, unless the launch options set one, a `--name`
+    of `<project>-<chat name>`, so a caller knows where to `SendMessage`.
+    Returns the target for the TUI loop, or with `--detach` launches here,
+    prints JSON and returns None.
+    """
+    try:
+        scope = session_query.resolve_scope(
+            project=args.project, all_projects=False, cwd=Path.cwd()
+        )
+    except session_query.QueryError as e:
+        _chat_fail(str(e))
+    project = scope.project or ""
+    root = scope.root or Path.cwd()
+    if args.in_temp:
+        cwd = Path(tempfile.mkdtemp(prefix="fujimoto-chat-"))
+        location = TEMP_LOCATION
+    elif args.in_worktree:
+        cwd = _pick_worktree(scope.worktrees, args.in_worktree)
+        location = cwd.name
+    else:
+        cwd, location = root, ROOT_LOCATION
+    taken = (
+        set(list_all_sessions())
+        | set(session_state.load_state())
+        | {session_name(project, w.name) for w in scope.worktrees}
+    )
+    tmux_name = next_session_name(
+        project, args.title, taken, fallback=DEFAULT_CHAT_TITLE
+    )
+    configured = (
+        claude_args
+        if claude_args is not None
+        else launch_options.resolve(cwd, tmux_name, None).args
+    )
+    peer = _peer_name_in(configured)
+    extra: tuple[str, ...] = ()
+    if peer is None:
+        peer = f"{project}-{tmux_name.split('/', 1)[1]}"
+        extra = ("--name", peer)
+    target = LaunchTarget(
+        project,
+        cwd,
+        tmux_name,
+        "chat",
+        claude_args=claude_args,
+        session_id=str(uuid.uuid4()),
+        prompt=args.prompt,
+        extra_args=extra,
+        parent_session=args.parent,
+    )
+    debug.log(
+        "cli.chat",
+        session=debug.rv(tmux_name),
+        location=location if location in (ROOT_LOCATION, TEMP_LOCATION) else "worktree",
+        cwd=debug.rp(cwd),
+        detach=args.detach,
+        prompt_chars=len(args.prompt or ""),
+        parent=debug.rv(args.parent) if args.parent else "none",
+    )
+    if not args.detach:
+        return target
+    with _stdout_to_stderr():
+        _start_launch(target, attach=False)
+    print(
+        json.dumps(
+            {
+                "tmux_session": tmux_name,
+                "working_dir": str(cwd),
+                "location": location,
+                "claude_session_id": target.session_id,
+                "peer_name": peer,
+                "parent_session": args.parent,
+                "session_started": True,
+                "attach_command": f"tmux attach-session -t {shlex.quote(tmux_name)}",
+                "stop_command": f"fujimoto stop {shlex.quote(tmux_name)}",
+            },
+            indent=2,
+        )
+    )
+    return None
+
+
 _NAME_FLAGS = ("--name", "-n")
 
 
@@ -5778,6 +6471,16 @@ def _peer_name_in(args: tuple[str, ...]) -> str | None:
             return args[i + 1]
         if arg.startswith("--name="):
             return arg.split("=", 1)[1]
+    return None
+
+
+def _record_owning(
+    claude_session_id: str, active: set[str]
+) -> tuple[str, session_state.SessionRecord] | None:
+    """The open, not-running record whose conversation this is, if any."""
+    for name, record in session_state.load_state().items():
+        if record.claude_session_id == claude_session_id and name not in active:
+            return name, record
     return None
 
 
@@ -5800,7 +6503,13 @@ def _resume_cli_target(
     """
     active = set(list_all_sessions())
     cwd = session.cwd
-    if location.project is None:
+    owner = None if fork else _record_owning(session.session_id, active)
+    if owner is not None:
+        # A stopped session (a chat, typically) that still has its record:
+        # bring it back as itself, not as a new `session-N`.
+        tmux_name, record = owner
+        project, session_type = record.project, record.session_type
+    elif location.project is None:
         project, session_type = "adhoc", "adhoc"
         tmux_name = get_next_adhoc_session_name(active)
     else:
@@ -6591,8 +7300,56 @@ def _build_parser() -> argparse.ArgumentParser:
             "Start the session without attaching; print its details as JSON and exit"
         ),
     )
+    _add_chat_command(sub)
 
     return parser
+
+
+def _add_chat_command(sub: argparse._SubParsersAction) -> None:
+    chat = sub.add_parser(
+        "chat",
+        help="Start a chat session: for questions and conversation, not work",
+        description=(
+            "Start a chat session in the project root (default), a worktree or "
+            "a temp directory. No worktree is created. Arguments after -- are "
+            "passed to claude."
+        ),
+        usage=(
+            "fujimoto chat [TITLE] [--in WORKTREE | --in-temp] [--project NAME|PATH] "
+            "[--prompt TEXT] [--parent NAME] [--detach] [-- CLAUDE_ARGS...]"
+        ),
+    )
+    chat.add_argument(
+        "title", nargs="?", default="", help="Optional title (default: chat-N)"
+    )
+    where = chat.add_mutually_exclusive_group()
+    where.add_argument(
+        "--in",
+        dest="in_worktree",
+        metavar="WORKTREE",
+        help="Run in this worktree (its name, or a unique part of it)",
+    )
+    where.add_argument(
+        "--in-temp",
+        action="store_true",
+        help="Run in a temporary directory outside the repository",
+    )
+    chat.add_argument(
+        "--project",
+        metavar="NAME|PATH",
+        help="The project to chat about (default: the current repo)",
+    )
+    chat.add_argument("--prompt", metavar="TEXT", help="First message to send")
+    chat.add_argument(
+        "--parent",
+        metavar="NAME",
+        help="Peer address of the Claude session starting this one",
+    )
+    chat.add_argument(
+        "--detach",
+        action="store_true",
+        help="Start without attaching; print its details as JSON and exit",
+    )
 
 
 def main() -> None:
@@ -6600,11 +7357,12 @@ def main() -> None:
     argv, claude_args = _split_claude_args(sys.argv[1:])
     args = parser.parse_args(argv)
     if claude_args is not None and not (
-        args.command in ("new", "resume")
+        args.command in ("new", "resume", "chat")
         or (args.command == "config" and args.config_action == "set")
     ):
         parser.error(
-            "arguments after -- are only accepted by 'new', 'resume' and 'config set'"
+            "arguments after -- are only accepted by 'new', 'resume', 'chat' "
+            "and 'config set'"
         )
     if args.command == "new" and not slugify(args.title):
         parser.error("title must contain at least one letter or digit")
@@ -6633,6 +7391,12 @@ def main() -> None:
         _create_config()
         return
 
+    if args.command == "chat" and args.detach:
+        # Needs no TUI and so no repo under the cwd: `--project` names one.
+        _prepare_chat(args, claude_args)
+        _finish_debug_log()
+        return
+
     try:
         issues = _check_prerequisites()
         debug.log("prerequisites", issues=len(issues))
@@ -6648,8 +7412,12 @@ def main() -> None:
         # `fujimoto new` skips the TUI for its first launch only; detaching
         # then lands on the home screen like any other session.
         initial_target: LaunchTarget | None = None
-        if args.command in ("new", "resume"):
-            prepare = _prepare_new_session if args.command == "new" else _prepare_resume
+        if args.command in ("new", "resume", "chat"):
+            prepare = {
+                "new": _prepare_new_session,
+                "resume": _prepare_resume,
+                "chat": _prepare_chat,
+            }[args.command]
             initial_target = prepare(args, claude_args)
             if initial_target is None:  # --detach: launched, nothing to attach
                 _finish_debug_log()

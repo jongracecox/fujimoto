@@ -100,6 +100,11 @@ class SessionRecord:
     # in `meta.json` instead, which outlives a terminate — see
     # `launch_options`.
     claude_args: list[str] | None = None
+    # Peer address (a Claude Code `SendMessage` name) of the session that
+    # started this one, for sessions with no `meta.json` to keep it in — a
+    # chat, say. Worktrees keep theirs in `meta.json`, which outlives a
+    # terminate.
+    parent_session: str | None = None
 
     @property
     def path(self) -> Path:
@@ -163,6 +168,7 @@ def load_state() -> dict[str, SessionRecord]:
         created = kwargs.get("created")
         kwargs["created"] = created if isinstance(created, str) else ""
         claude_args = raw.get("claude_args")
+        parent = raw.get("parent_session")
         records[name] = SessionRecord(
             **kwargs,
             # `parked` is what a fujimoto from before recovery wrote; honour it
@@ -177,6 +183,7 @@ def load_state() -> dict[str, SessionRecord]:
                 and all(isinstance(a, str) for a in claude_args)
                 else None
             ),
+            parent_session=parent if isinstance(parent, str) and parent else None,
         )
     debug.log_once(
         "session-state-load",
@@ -246,12 +253,15 @@ def mark_open(
     session_type: str,
     branch: str = "",
     claude_session_id: str | None = None,
+    parent_session: str | None = None,
 ) -> None:
     """Record that a session is open. Called on every launch and reconnect.
 
     Launching resets the stop kind: a session you are sitting in has not been
     stopped at all, whatever it was before. Which also means that if this one
-    disappears without fujimoto being told, it reads as recovered.
+    disappears without fujimoto being told, it reads as recovered. A
+    `parent_session` replaces the recorded one (the latest starter is the
+    parent); None keeps it.
     """
     state = load_state()
     existing = state.get(tmux_name)
@@ -280,6 +290,8 @@ def mark_open(
         # Launch options are set separately (`set_claude_args`); a launch on
         # its own must not forget the ones saved earlier.
         claude_args=existing.claude_args if existing is not None else None,
+        parent_session=parent_session
+        or (existing.parent_session if existing is not None else None),
     )
     debug.log(
         "session_state.mark_open",
@@ -291,6 +303,7 @@ def mark_open(
         claude_session=claude_session_id or "none",
         new_record=existing is None,
         created=created,
+        parent=debug.rv(parent_session) if parent_session else "unchanged",
     )
     save_state(state)
 
