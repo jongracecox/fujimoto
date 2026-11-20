@@ -154,8 +154,9 @@ ICON_FORK = "\U0001f374"
 # How a session running in the project root (the main clone) is labelled.
 # Deliberately not the branch: whatever the clone has checked out can change.
 ROOT_LOCATION = "project-root"
-# A chat session in a scratch directory outside the repository.
-TEMP_LOCATION = "temp"
+# A chat session in the project's shared scratch directory, outside the repo.
+# (Called "temp" before it was one persistent directory per project.)
+SCRATCH_LOCATION = "scratch"
 ICON_CHAT = "\U0001f4ac"
 
 
@@ -627,7 +628,7 @@ def _get_claude_sessions(
 ) -> ClaudeData:
     """Fetch Claude sessions for the project root and worktree paths.
 
-    `extra` adds directories that are neither — a chat's temp directory —
+    `extra` adds directories that are neither — a chat's scratch directory —
     whose transcripts the home screen still has rows for.
     """
     path_to_latest: dict[str, ClaudeSession] = {}
@@ -1646,7 +1647,7 @@ class SessionApp(App):
         self._chat_title: str = ""
         self._on_chat_location: bool = False
         # Item id → directory for the location rows on screen; `None` is the
-        # temp-dir row, created only once it is chosen.
+        # scratch-dir row, created only once it is chosen.
         self._chat_locations: dict[str, Path | None] = {}
         # "name" (`/`) filters worktrees by name; "text" (`s`) by what their
         # transcripts say. `_chat_text_matches` is None until a text scan has
@@ -2369,7 +2370,7 @@ class SessionApp(App):
                         Content.assemble(
                             ("+ New chat", "bold"),
                             (
-                                "  (talk, not work — in project-root, temp or a worktree)",
+                                "  (talk, not work — in project-root, scratch or a worktree)",
                                 "dim",
                             ),
                         )
@@ -3363,7 +3364,7 @@ class SessionApp(App):
         return f"{icon} {session.name}{fork}  {detail}{suffix}"
 
     def _location_name(self, session_type: str, path: Path) -> str:
-        """Where a chat or root session runs: project-root, a worktree, or temp.
+        """Where a chat or root session runs: project-root, a worktree, or scratch.
 
         Memoized: it runs per row on every `/` keystroke, and matching a
         worktree resolves paths on disk.
@@ -3379,7 +3380,7 @@ class SessionApp(App):
         elif (worktree := self._matching_worktree(path)) is not None:
             name = worktree.name
         else:
-            name = TEMP_LOCATION if session_type == "chat" else path.name
+            name = SCRATCH_LOCATION if session_type == "chat" else path.name
         self._location_cache[key] = name
         return name
 
@@ -5225,14 +5226,14 @@ class SessionApp(App):
     async def _refresh_chat_locations(self) -> None:
         """Rebuild the location rows for the current filter.
 
-        project-root and temp are always offered; the filter only narrows the
+        project-root and scratch are always offered; the filter only narrows the
         worktrees, which is where there are too many to scan by eye.
         """
         if not self.query("#chat-location-list"):
             return
         listing = self.query_one("#chat-location-list", ListView)
         await listing.clear()
-        self._chat_locations = {"cl-root": self._project_root, "cl-temp": None}
+        self._chat_locations = {"cl-root": self._project_root, "cl-scratch": None}
         items = [
             ListItem(
                 Label(
@@ -5246,7 +5247,7 @@ class SessionApp(App):
             ListItem(
                 Label(
                     Content.assemble(
-                        (TEMP_LOCATION, "bold"),
+                        (SCRATCH_LOCATION, "bold"),
                         (
                             "  (shared scratch directory outside the repo; "
                             "each chat gets a sub-directory)",
@@ -5254,7 +5255,7 @@ class SessionApp(App):
                         ),
                     )
                 ),
-                id="cl-temp",
+                id="cl-scratch",
             ),
         ]
         query = self._chat_filter_query.strip().lower()
@@ -5933,12 +5934,12 @@ def _row_prefix(session_type: str) -> str:
 
 
 def _chat_location_kind(item_id: str) -> str:
-    """`root`, `temp` or `worktree`, for the debug log (never the name).
+    """`root`, `scratch` or `worktree`, for the debug log (never the name).
 
     >>> _chat_location_kind("cl-wt-3")
     'worktree'
     """
-    return {"cl-root": "root", "cl-temp": "temp"}.get(item_id, "worktree")
+    return {"cl-root": "root", "cl-scratch": "scratch"}.get(item_id, "worktree")
 
 
 def _check_prerequisites() -> list[str]:
@@ -6650,7 +6651,7 @@ def _prepare_chat(
     """Run `fujimoto chat`: a titled chat session, no worktree created.
 
     Where it runs is the project root unless `--in` names a worktree or
-    `--in-temp` asks for a scratch directory. The new claude process gets a
+    `--in-scratch` asks for the project's scratch directory. The new claude process gets a
     fresh `--session-id` and, unless the launch options set one, a `--name`
     of `<project>-<chat name>`, so a caller knows where to `SendMessage`.
     Returns the target for the TUI loop, or with `--detach` launches here,
@@ -6664,9 +6665,9 @@ def _prepare_chat(
         _chat_fail(str(e))
     project = scope.project or ""
     root = scope.root or Path.cwd()
-    if args.in_temp:
+    if args.in_scratch:
         cwd = get_chat_scratch_dir(project)
-        location = TEMP_LOCATION
+        location = SCRATCH_LOCATION
     elif args.in_worktree:
         cwd = _pick_worktree(scope.worktrees, args.in_worktree)
         location = cwd.name
@@ -6700,7 +6701,9 @@ def _prepare_chat(
     debug.log(
         "cli.chat",
         session=debug.rv(tmux_name),
-        location=location if location in (ROOT_LOCATION, TEMP_LOCATION) else "worktree",
+        location=location
+        if location in (ROOT_LOCATION, SCRATCH_LOCATION)
+        else "worktree",
         cwd=debug.rp(cwd),
         detach=args.detach,
         prompt_chars=len(args.prompt or ""),
@@ -6710,7 +6713,7 @@ def _prepare_chat(
         return target
     # Claude Code asks to trust a directory outside any trusted repo, and a
     # detached session has nobody to answer: say so rather than hang silently.
-    needs_trust = location == TEMP_LOCATION and trust.is_trusted(cwd) is False
+    needs_trust = location == SCRATCH_LOCATION and trust.is_trusted(cwd) is False
     with _stdout_to_stderr():
         _start_launch(target, attach=False)
     if needs_trust:
@@ -6718,7 +6721,7 @@ def _prepare_chat(
             f"fujimoto: Claude Code has not trusted {cwd} yet, so this chat is "
             "waiting at its trust prompt. Attach once "
             f"(tmux attach-session -t {shlex.quote(tmux_name)}) and accept; "
-            "later temp chats for this project won't ask.",
+            "later scratch chats for this project won't ask.",
             file=sys.stderr,
         )
     print(
@@ -7616,11 +7619,12 @@ def _add_chat_command(sub: argparse._SubParsersAction) -> None:
         help="Start a chat session: for questions and conversation, not work",
         description=(
             "Start a chat session in the project root (default), a worktree or "
-            "a temp directory. No worktree is created. Arguments after -- are "
+            "the project's scratch directory. No worktree is created. Arguments "
+            "after -- are "
             "passed to claude."
         ),
         usage=(
-            "fujimoto chat [TITLE] [--in WORKTREE | --in-temp] [--project NAME|PATH] "
+            "fujimoto chat [TITLE] [--in WORKTREE | --in-scratch] [--project NAME|PATH] "
             "[--prompt TEXT] [--parent NAME] [--detach] [-- CLAUDE_ARGS...]"
         ),
     )
@@ -7635,9 +7639,21 @@ def _add_chat_command(sub: argparse._SubParsersAction) -> None:
         help="Run in this worktree (its name, or a unique part of it)",
     )
     where.add_argument(
-        "--in-temp",
+        "--in-scratch",
+        dest="in_scratch",
         action="store_true",
-        help="Run in a temporary directory outside the repository",
+        help=(
+            "Run in the project's scratch directory outside the repository "
+            "(~/.fujimoto/chats/<project>/)"
+        ),
+    )
+    # The flag's first name, before the directory became a persistent
+    # per-project one. Still accepted; no longer advertised.
+    where.add_argument(
+        "--in-temp",
+        dest="in_scratch",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     chat.add_argument(
         "--project",

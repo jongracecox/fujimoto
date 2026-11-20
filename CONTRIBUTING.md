@@ -309,7 +309,7 @@ https://docs.pypi.org/trusted-publishers/
 1. Run `fujimoto` from a git repo
 2. Create a new worktree — verify the directory and git branch are created
 3. Detach from tmux (`Ctrl+A D`)
-4. Run `fujimoto` again — the worktree should show a green circle, project-root sessions listed as `(project-root ⎇ <branch>)`; start a **New chat** in each location (project-root, temp, a worktree) and check the rows read `(💬 <location>)`, and that `/` and `s` filter the worktree list in the location picker
+4. Run `fujimoto` again — the worktree should show a green circle, project-root sessions listed as `(project-root ⎇ <branch>)`; start a **New chat** in each location (project-root, scratch, a worktree) and check the rows read `(💬 <location>)`, and that `/` and `s` filter the worktree list in the location picker
 5. Select an existing session — should show the actions submenu (Connect/Fork/Launch/Finish)
 6. Test the Finish flow on a worktree with unpushed commits
 7. Test the Fork flow (needs a real `claude` and Claude Code >= 2.1.223):
