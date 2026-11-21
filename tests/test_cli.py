@@ -2971,6 +2971,25 @@ class TestResumeTarget:
                 assert app._launch_target[1] == wt
 
 
+async def _settle(app: SessionApp, pilot, done, timeout: float = 10.0) -> None:  # noqa: ANN001
+    """Wait for a debounced, worker-backed UI update, however slow the machine.
+
+    A fixed pause raced the debounce timer under a loaded full test run: the
+    timer had not fired, so there was no worker yet to wait for.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout
+    while not done():
+        assert time.monotonic() < deadline, "UI never settled"
+        await pilot.pause(0.05)
+        await app.workers.wait_for_complete()
+    # What made `done()` true may have queued a follow-up worker (a list
+    # refresh after a status update); let that finish too.
+    await app.workers.wait_for_complete()
+    await pilot.pause()
+
+
 def _chat_record(cwd: Path | str, **fields: object) -> session_state.SessionRecord:
     return session_state.SessionRecord(
         cwd=str(cwd), project="test-proj", session_type="chat", **fields
@@ -3132,10 +3151,14 @@ class TestNewChat:
                 await self._open_locations(app, pilot)
                 await pilot.press("s")
                 await pilot.press(*"flaky")
-                await pilot.pause(app.SEARCH_DEBOUNCE + 0.2)
-                await app.workers.wait_for_complete()
-                await pilot.pause()
-                await pilot.pause()
+                await _settle(
+                    app,
+                    pilot,
+                    lambda: (
+                        "mention"
+                        in str(app.query_one("#chat-location-status", Static).render())
+                    ),
+                )
                 shown = [app._chat_locations.get(i) for i in self._location_ids(app)]
                 assert b in shown and a not in shown
                 status = app.query_one("#chat-location-status", Static)
@@ -3159,7 +3182,14 @@ class TestNewChat:
                 await self._open_locations(app, pilot)
                 await pilot.press("s")
                 await pilot.press("x")
-                await pilot.pause(app.SEARCH_DEBOUNCE + 0.2)
+                await _settle(
+                    app,
+                    pilot,
+                    lambda: (
+                        "at least"
+                        in str(app.query_one("#chat-location-status", Static).render())
+                    ),
+                )
                 status = app.query_one("#chat-location-status", Static)
                 assert "at least" in str(status.render())
 
@@ -3722,8 +3752,7 @@ class TestPreviousChats:
             async with app.run_test() as pilot:
                 await pilot.press("s")
                 await pilot.press(*"hello")
-                await pilot.pause(app.SEARCH_DEBOUNCE + 0.2)
-                await app.workers.wait_for_complete()
+                await _settle(app, pilot, lambda: logs.called)
                 assert scratch in logs.call_args.args[1]
 
 

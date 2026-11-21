@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import json
 import os
@@ -1712,6 +1713,7 @@ class SessionApp(App):
         self._chat_text_matches: set[Path] | None = None
         self._chat_search_token: int = 0
         self._chat_debounce: Timer | None = None
+        self._chat_refresh_lock = asyncio.Lock()
         # Which result row the actions menu was opened from, so backing out
         # lands the highlight there instead of at the top of the list.
         self._search_selected_index: int | None = None
@@ -5317,12 +5319,28 @@ class SessionApp(App):
         self.query_one("#chat-location-list", ListView).focus()
         self.refresh_bindings()
 
+    def _queue_chat_refresh(self) -> None:
+        """Rebuild the location rows soon, after any rebuild already running.
+
+        Not `exclusive=True`: that cancels a running rebuild, which can stop
+        it between clearing the list and appending its rows, or part-way
+        through appending — leaving a half-built list, or rows whose ids the
+        next rebuild then mounts again. Each rebuild reads the current
+        filter, so running them in turn is always right.
+        """
+        self.run_worker(self._refresh_chat_locations(), group="chat-loc")
+
     async def _refresh_chat_locations(self) -> None:
         """Rebuild the location rows for the current filter.
 
         project-root and scratch are always offered; the filter only narrows the
         worktrees, which is where there are too many to scan by eye.
+        Serialised by `_chat_refresh_lock` (see `_queue_chat_refresh`).
         """
+        async with self._chat_refresh_lock:
+            await self._rebuild_chat_locations()
+
+    async def _rebuild_chat_locations(self) -> None:
         if not self.query("#chat-location-list"):
             return
         listing = self.query_one("#chat-location-list", ListView)
@@ -5417,9 +5435,7 @@ class SessionApp(App):
             return
         self._chat_filter_query = event.value
         if self._chat_filter_mode == "name":
-            self.run_worker(
-                self._refresh_chat_locations(), exclusive=True, group="chat-loc"
-            )
+            self._queue_chat_refresh()
             return
         if self._chat_debounce is not None:
             self._chat_debounce.stop()
@@ -5446,9 +5462,7 @@ class SessionApp(App):
             elif query:
                 status = f"type at least {self.SEARCH_MIN_QUERY} characters"
         self._set_chat_status(status)
-        self.run_worker(
-            self._refresh_chat_locations(), exclusive=True, group="chat-loc"
-        )
+        self._queue_chat_refresh()
 
     def _set_chat_status(self, text: str) -> None:
         if self.query("#chat-location-status"):
@@ -5497,9 +5511,7 @@ class SessionApp(App):
             logs=scanned,
             worktrees=len(matched),
         )
-        self.run_worker(
-            self._refresh_chat_locations(), exclusive=True, group="chat-loc"
-        )
+        self._queue_chat_refresh()
 
     async def _clear_chat_filter(self) -> None:
         self._chat_filter_query = ""
