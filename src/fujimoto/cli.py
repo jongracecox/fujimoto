@@ -7423,7 +7423,7 @@ def _add_broadcast_command(sub: argparse._SubParsersAction) -> None:
         help="Sign and send a broadcast",
         usage=(
             "fujimoto broadcast send (TEXT | --signed FILE) "
-            "[--project NAME | --all-projects] [--ttl 1h] [--key KEY] "
+            "[--project NAME | --all-projects | --session REF] [--ttl 1h] [--key KEY] "
             "[--wait SECS] [--json]"
         ),
     )
@@ -7437,6 +7437,14 @@ def _add_broadcast_command(sub: argparse._SubParsersAction) -> None:
     scope.add_argument("--project", metavar="NAME", help="Only this project's sessions")
     scope.add_argument(
         "--all-projects", action="store_true", help="Every listening session"
+    )
+    scope.add_argument(
+        "--session",
+        metavar="REF",
+        help=(
+            "Only one session: its tmux name, peer name or session-id prefix, "
+            "as listed by `broadcast show`"
+        ),
     )
     send.add_argument(
         "--ttl", default="1h", help="How long it stays valid (default 1h)"
@@ -7537,9 +7545,10 @@ def _run_broadcast_command(args: argparse.Namespace) -> None:
             if bool(args.text) == bool(args.signed):
                 raise broadcast.BroadcastError("give either TEXT or --signed FILE")
             if args.signed:
-                if args.project or args.all_projects:
+                if args.project or args.all_projects or args.session:
                     raise broadcast.BroadcastError(
-                        "--signed payloads carry their own scope; drop --project/--all-projects"
+                        "--signed payloads carry their own scope; "
+                        "drop --project/--all-projects/--session"
                     )
                 payload_path = Path(args.signed)
                 result = broadcast.submit(
@@ -7548,7 +7557,7 @@ def _run_broadcast_command(args: argparse.Namespace) -> None:
                     wait=args.wait,
                 )
             else:
-                if args.all_projects:
+                if args.all_projects or args.session:
                     project: str | None = None
                 elif args.project:
                     project = args.project
@@ -7565,6 +7574,7 @@ def _run_broadcast_command(args: argparse.Namespace) -> None:
                     ttl=broadcast.parse_ttl(args.ttl),
                     key=args.key,
                     wait=args.wait,
+                    session=args.session,
                 )
             print(
                 json.dumps(broadcast.send_json(result), indent=2)

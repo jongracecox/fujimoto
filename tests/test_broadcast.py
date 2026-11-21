@@ -1199,3 +1199,186 @@ class TestConfig:
         assert broadcast.load_config() == BroadcastSettings()
         with pytest.raises(BroadcastError):
             broadcast.load_config(strict=True)
+
+
+# ---------------------------------------------------------------------------
+# Single-session target
+# ---------------------------------------------------------------------------
+
+SID_A = "9938a857-65f1-47cc-9562-0b987d9654f4"
+SID_B = "9938ffff-0000-4000-8000-000000000000"
+
+
+def _listen(lock: str, session_id: str, project: str = "p") -> None:
+    broadcast.ensure_dirs()
+    (broadcast.state_dir() / f"{lock}.lock").write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "session_id": session_id,
+                "project": project,
+                "cwd": "/c",
+            }
+        )
+    )
+
+
+class TestSessionTarget:
+    @pytest.fixture(autouse=True)
+    def _names(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            broadcast,
+            "_registry_names",
+            lambda: {
+                SID_A: ("fujimoto/smoke", "fujimoto-smoke"),
+                SID_B: ("other/thing", None),
+            },
+        )
+
+    def test_payload_session_roundtrip_and_bytes(self) -> None:
+        plain = broadcast.new_payload("m", "p", now=NOW)
+        assert b"session" not in plain.to_bytes()  # old payload bytes unchanged
+        targeted = broadcast.new_payload("m", None, now=NOW, session=SID_A)
+        assert Payload.from_bytes(targeted.to_bytes()) == targeted
+        assert targeted.scope_label == "session 9938a857"
+
+    @pytest.mark.parametrize("bad", ['"short"', "3", '"has space!!"'])
+    def test_bad_session_rejected(self, bad: str) -> None:
+        raw = json.loads(broadcast.new_payload("m", None, now=NOW).to_bytes())
+        raw["v"] = 2
+        data = json.dumps(raw).replace('"v":', f'"session": {bad}, "v":', 1)
+        with pytest.raises(BroadcastError, match="bad session"):
+            Payload.from_bytes(data.encode())
+
+    def test_covers_requires_the_exact_session(self) -> None:
+        p = broadcast.new_payload("m", None, now=NOW, session=SID_A)
+        assert p.covers("any", SID_A)
+        assert not p.covers("any", SID_B) and not p.covers("any", None)
+
+    def test_waiter_delivers_only_to_its_target(
+        self, alice: tuple[Path, Signer]
+    ) -> None:
+        signers = [alice[1]]
+        mine = dict(HOOK, session_id=SID_A)
+        # Arm the target first: a waiter doesn't replay what came before it.
+        assert broadcast.wait(
+            mine, signers, "p", sleep=lambda _: None, max_polls=1, claude_pid=1234
+        ) == (0, "")
+        msg = _signed(
+            alice[0], signers, broadcast.new_payload("just you", None, session=SID_A)
+        )
+        other = dict(HOOK, session_id=SID_B)
+        assert _wait_posting(signers, "p", [msg], hook=other) == (0, "")
+        assert broadcast.status()[0].receipts == []  # silently out of scope
+        code, text = broadcast.wait(
+            mine, signers, "p", sleep=lambda _: None, max_polls=1, claude_pid=1234
+        )
+        assert code == 2 and "just you" in text
+
+    @pytest.mark.parametrize(
+        "ref", ["fujimoto/smoke", "fujimoto-smoke", SID_A, "9938a8"]
+    )
+    def test_resolve_target(self, ref: str) -> None:
+        _listen("1", SID_A)
+        _listen("2", SID_B)
+        target = broadcast.resolve_target(ref)
+        assert target.session_id == SID_A and target.tmux_session == "fujimoto/smoke"
+
+    @pytest.mark.parametrize(
+        ("ref", "match"),
+        [
+            ("9938", "matches 2 sessions"),
+            ("nope", "no listening session"),
+            ("993", "no listening session"),
+        ],
+    )
+    def test_resolve_target_errors(self, ref: str, match: str) -> None:
+        _listen("1", SID_A)
+        _listen("2", SID_B)
+        with pytest.raises(BroadcastError, match=match) as exc:
+            broadcast.resolve_target(ref)
+        assert "fujimoto/smoke" in str(exc.value) and "other/thing" in str(exc.value)
+
+    def test_resolve_with_nobody_listening(self) -> None:
+        with pytest.raises(BroadcastError, match="listening: none"):
+            broadcast.resolve_target("x")
+
+    def test_send_to_one_session(self, alice: tuple[Path, Signer]) -> None:
+        _listen("1", SID_A, "p")
+        _listen("2", SID_B, "p")
+        config = BroadcastSettings(
+            enabled=True, signers=[alice[1]], signing_key=str(alice[0])
+        )
+        result = broadcast.send(
+            "hi", "p", session="fujimoto/smoke", wait=0.2, config=config
+        )
+        assert result.payload.session == SID_A and result.payload.project is None
+        assert [li.session_id for li in result.listeners] == [SID_A]
+        assert broadcast.send_json(result)["session"] == SID_A
+        assert "to session 9938a857" in broadcast.format_send(result)
+        assert broadcast.status_json(broadcast.status())[0]["session"] == SID_A
+
+    def test_show_lists_names(self) -> None:
+        _listen("1", SID_A)
+        assert "fujimoto/smoke" in broadcast.format_show(BroadcastSettings())
+        assert (
+            broadcast.show_json(BroadcastSettings())["listening"][0]["tmux_session"]
+            == "fujimoto/smoke"
+        )
+
+    def test_cli_send_session(
+        self,
+        alice: tuple[Path, Signer],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _listen("1", SID_A)
+        _cli(monkeypatch, "add-signer", "alice", alice[1].public_key)
+        capsys.readouterr()
+        _cli(
+            monkeypatch,
+            "send",
+            "hi",
+            "--session",
+            "fujimoto-smoke",
+            "--key",
+            str(alice[0]),
+            "--wait",
+            "0",
+        )
+        assert "to session 9938a857" in capsys.readouterr().out
+        with pytest.raises(SystemExit):
+            _cli(monkeypatch, "send", "--signed", "f", "--session", "x")
+        assert "drop --project/--all-projects/--session" in capsys.readouterr().err
+
+
+def test_registry_names_reads_live_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fujimoto.claude import live
+
+    monkeypatch.setattr(
+        live,
+        "list_live_sessions",
+        lambda: [live.LiveSession(1, SID_A, None, "peer", "idle", "t/s")],
+    )
+    assert broadcast._registry_names() == {SID_A: ("t/s", "peer")}
+
+    def boom() -> list:
+        raise OSError
+
+    monkeypatch.setattr(live, "list_live_sessions", boom)
+    assert broadcast._registry_names() == {}
+
+
+def test_targeted_payload_is_version_2_and_old_waiters_reject_it() -> None:
+    targeted = json.loads(
+        broadcast.new_payload("m", None, now=NOW, session=SID_A).to_bytes()
+    )
+    assert targeted["v"] == 2
+    assert json.loads(broadcast.new_payload("m", None, now=NOW).to_bytes())["v"] == 1
+    # v1 with a session, or v2 without one, is malformed.
+    for raw in (
+        {**targeted, "v": 1},
+        {k: v for k, v in targeted.items() if k != "session"},
+    ):
+        with pytest.raises(BroadcastError, match="version 2"):
+            Payload.from_bytes(json.dumps(raw).encode())

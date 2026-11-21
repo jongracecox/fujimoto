@@ -721,9 +721,16 @@ sessions launched afterwards).
 fujimoto broadcast send "…"                    # sessions of the current project
 fujimoto broadcast send "…" --project website  # one named project
 fujimoto broadcast send "…" --all-projects     # every listening session
+fujimoto broadcast send "…" --session myproject/20261120-fix-flaky-test  # one session
 fujimoto broadcast send "…" --ttl 4h           # valid for 4h (default 1h, max 24h)
 fujimoto broadcast status [ID]                 # who received what
 ```
+
+`--session` takes a session's tmux name, its peer name or a prefix of its
+Claude session id — `fujimoto broadcast show` lists all three for every
+listening session. It is resolved when you send (it must match exactly one
+listening session) and the message is signed for that session's exact id, so
+it can never reach a different session that later takes the same name.
 
 `send` waits up to `--wait` seconds (default 5) for receipts and lists them;
 `--json` gives the same as JSON. A session that was not listening yet simply
@@ -756,6 +763,10 @@ fujimoto broadcast send --signed msg.json   # reads msg.json.sig alongside
 
 `project` is a project name or `null` for all; `id` is letters, digits and
 `-`; the lifetime is at most 24h. The bytes are verified exactly as signed.
+To target one session, use `"v":2` and add `"session": "<full Claude session
+id>"` (with `"project": null`) — version 2 makes older fujimoto builds reject
+the message rather than deliver it to everyone; `fujimoto broadcast show --json` lists the listening
+sessions' ids alongside their tmux and peer names.
 
 #### Opting a project out
 

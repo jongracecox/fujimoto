@@ -603,9 +603,26 @@ lazily).
   instead, for the CLI), and a signer whose name or key does not validate is
   dropped (`broadcast.config_signer_skipped`), never trusted.
 - **Payload** (`Payload`): `v`, `id`, `project` (`None` = all), `created`,
-  `expires`, `message`, serialized with sorted keys. `check_time` rejects
+  `expires`, `message`, and optional `session` (a full Claude session id,
+  omitted from the bytes when unset so pre-existing payloads still verify;
+  a targeted payload is `v: 2`, because a waiter that predates `session` ignores
+  the field and, with `project: null`, would deliver it to every session —
+  `v: 2` is what it rejects instead; `from_bytes` requires `session` iff `v: 2`),
+  serialized with sorted keys. `check_time` rejects
   expired, future-dated (beyond `CLOCK_SKEW`) and over-`MAX_TTL` (24h)
-  payloads; `covers(project)` is the scope test.
+  payloads; `covers(project, session_id)` is the scope test: a `session` must equal the
+  waiter's own session id, and then the project scope must also cover it.
+- **Single-session target** (`send(session=REF)`, `--session`):
+  `resolve_target` matches REF against the *current* listeners — tmux name or
+  peer name exactly, else a 4+ character session-id prefix — and must find
+  exactly one; the payload then carries that listener's full id and no
+  project. Resolving on the sending side and signing the exact id (rather
+  than signing the name) is deliberate: a tmux or peer name can be reused by
+  a different session before the message expires. `list_listeners` fills
+  each `Listener`'s `tmux_session`/`peer_name` from `claude.live` by session
+  id (`_registry_names`). A session is not a listener while it is handling a
+  broadcast (its waiter has exited and the `Stop` hook has not re-armed yet),
+  so `--session` can briefly fail with "no listening session".
 - **Signing**: `ssh-keygen -Y sign`/`-Y find-principals`/`-Y verify` in the
   `fujimoto-broadcast` namespace, with an `allowed_signers` file written to a
   temp dir per call and every line restricted to that namespace.
