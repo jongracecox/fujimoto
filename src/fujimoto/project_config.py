@@ -130,6 +130,10 @@ class ProjectConfig(BaseModel):
     # Passed to claude as `--model` unless the session's options set one.
     # Beats the global config's `model`.
     model: str | None = None
+    # `false` keeps this project's sessions out of `fujimoto broadcast`. A
+    # project can only opt out: whether broadcast is on, and whose keys are
+    # trusted, is global config, so a repo can't name its own signer.
+    broadcast: bool = True
 
     @field_validator("claude_args", mode="before")
     @classmethod
