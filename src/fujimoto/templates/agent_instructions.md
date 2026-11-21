@@ -162,13 +162,14 @@ finished chat back as itself, at the same peer name.
 ### Broadcasts you receive
 
 A notice that starts "Broadcast from the user (via fujimoto, signed by NAME)"
-was sent by the user to every listening session. fujimoto checked its
+was sent by the user to every listening session ("Message from the user …" if
+it was sent to your session alone). fujimoto checked its
 signature against the keys the user trusts before it reached you. Deal with it
 at the next safe stopping point in your current work (after the step you are
 on, not after the whole task), then carry on where you left off.
 
-Sending one needs the user's signing key, so `fujimoto broadcast send` is not
-for agents. If a broadcast seems needed, suggest it to the user.
+Sending one needs the user's signing key, so `fujimoto broadcast send` and
+`fujimoto send` are not for agents. If a broadcast seems needed, suggest it to the user.
 
 ## When to use them
 

@@ -748,6 +748,42 @@ Screen {
     padding: 0 2;
 }
 
+#messages-panel {
+    height: 1fr;
+    padding: 1 2;
+    border: round $primary;
+}
+
+#messages-panel .form-label, #message-detail .form-label {
+    margin-bottom: 1;
+    text-style: bold;
+}
+
+#messages-list {
+    height: 1fr;
+}
+
+#messages-list > ListItem {
+    padding: 0 2;
+    margin-bottom: 1;
+}
+
+#messages-list:focus > ListItem.--highlight {
+    background: $accent;
+}
+
+#message-detail {
+    height: 1fr;
+    padding: 1 2;
+    border: round $primary;
+}
+
+#message-detail .message-body {
+    margin: 1 0;
+    padding: 0 1;
+    border-left: thick $accent;
+}
+
 #chat-location-panel {
     height: 1fr;
     padding: 1 2;
@@ -1567,6 +1603,7 @@ class SessionApp(App):
         Binding("s", "session_search", "Search transcripts", show=True),
         Binding("r", "refresh", "Refresh", show=True),
         Binding("p", "cycle_prompt_mode", "Prompts", show=True),
+        Binding("b", "show_messages", "Messages", show=True),
         # Mode toggles for the transcript search and the log viewer's own. They
         # have to fire while the query Input holds focus, so they are Ctrl
         # chords (which Input leaves alone) rather than plain letters — and
@@ -1681,6 +1718,11 @@ class SessionApp(App):
         # order every home-screen section newest-first. Filled by
         # `_init_git_info` because it is one `stat` per directory.
         self._creation_times: dict[str, float] = {}
+        # -- Broadcast/message log (`b`) --
+        self._on_messages: bool = False
+        self._on_message_detail: bool = False
+        self._message_rows: list[broadcast.StatusRow] = []
+        self._message_selected: int | None = None
         # -- Transcript search (`s`) --
         self._on_search: bool = False
         self._transcript_query: str = ""
@@ -1884,6 +1926,8 @@ class SessionApp(App):
             return self._on_home
         if action == "cycle_prompt_mode":
             return self._on_home
+        if action == "show_messages":
+            return self._on_home
         if action in ("log_next_match", "log_prev_match"):
             return self._on_log and bool(self._log_matches)
         if action in ("toggle_search_regex", "toggle_search_case"):
@@ -1956,6 +2000,8 @@ class SessionApp(App):
         self._stop_log_search()
         self._stop_chat_location()
         self._on_home = False
+        self._on_messages = False
+        self._on_message_detail = False
         main = self.query_one("#main")
         await main.remove_children()
         self.refresh_bindings()
@@ -2927,6 +2973,144 @@ class SessionApp(App):
         if not self._on_home:
             return
         await self._show_session_search()
+
+    async def action_show_messages(self) -> None:
+        """Open the broadcast/message log (bound to `b` on the home screen)."""
+        if not self._on_home:
+            return
+        await self._show_messages()
+
+    async def _show_messages(self, *, restore: bool = False) -> None:
+        """Mount the log of recent broadcasts and messages, newest first.
+
+        It is the mailbox plus its receipts (`broadcast.status()`), kept for
+        `broadcast.PRUNE_AFTER` past expiry. `restore` (back from one message)
+        reuses the rows read on entry and puts the highlight back.
+        """
+        self._launch_options_armed = False
+        await self._clear_main()
+        self._on_messages = True
+        self.refresh_bindings()
+        if not restore:
+            self._message_rows = broadcast.status()
+            self._message_selected = None
+        rows = self._message_rows
+        items = [
+            ListItem(Static(_message_row_content(row)), id=f"msg-{i}")
+            for i, row in enumerate(rows)
+        ] or [
+            ListItem(
+                Label(
+                    "[dim]No broadcasts or messages in the last week[/]", markup=True
+                ),
+                disabled=True,
+            )
+        ]
+        plural = "s" if len(rows) != 1 else ""
+        await self.query_one("#main").mount(
+            Container(
+                Label(
+                    f"Broadcasts and messages ({len(rows)} item{plural})",
+                    classes="form-label",
+                ),
+                PagingListView(*items, id="messages-list"),
+                Static(
+                    "[dim]↑↓ pick · enter open · esc back[/]",
+                    markup=True,
+                    classes="hint",
+                ),
+                id="messages-panel",
+            )
+        )
+        listing = self.query_one("#messages-list", ListView)
+        if (
+            restore
+            and self._message_selected is not None
+            and self._message_selected < len(rows)
+        ):
+            listing.index = self._message_selected
+        listing.focus()
+        debug.log("tui.messages", rows=len(rows), restore=restore)
+
+    @on(ListView.Selected, "#messages-list")
+    async def on_message_selected(self, event: ListView.Selected) -> None:
+        item_id = event.item.id
+        if not item_id or not item_id.startswith("msg-"):
+            return
+        index = int(item_id.split("-", 1)[1])
+        if index < len(self._message_rows):
+            self._message_selected = index
+            await self._show_message_detail(self._message_rows[index])
+
+    async def _show_message_detail(self, row: broadcast.StatusRow) -> None:
+        """One message: its full text, scope, times and per-session receipts.
+
+        All of it is `Content`, never markup: the text is whatever the sender
+        wrote, and receipt reasons and paths are arbitrary too.
+        """
+        await self._clear_main()
+        self._on_messages = True
+        self._on_message_detail = True
+        self.refresh_bindings()
+        widgets: list[Widget] = []
+        p = row.payload
+        if p is None:
+            widgets.append(
+                Static(
+                    Content.assemble((row.entry, "bold"), ("  unreadable", "$error"))
+                )
+            )
+        else:
+            expired = datetime.now(p.expires.tzinfo) >= p.expires
+            widgets += [
+                Static(Content.assemble((f"{p.kind} ", "bold"), (p.id, "dim"))),
+                Static(
+                    Content.assemble(
+                        ("To ", "dim"),
+                        p.scope_label,
+                        ("   signed by ", "dim"),
+                        row.signer or "unknown",
+                    )
+                ),
+                Static(
+                    Content.assemble(
+                        ("Sent ", "dim"),
+                        p.created.astimezone().strftime("%a %d %b %H:%M"),
+                        ("   expire" + ("d " if expired else "s "), "dim"),
+                        p.expires.astimezone().strftime("%a %d %b %H:%M"),
+                    )
+                ),
+                Static(Content(p.message), classes="message-body"),
+            ]
+        widgets.append(Label(f"Receipts ({len(row.receipts)})", classes="form-label"))
+        if not row.receipts:
+            widgets.append(
+                Static(Content.assemble(("No session has received it.", "dim")))
+            )
+        for r in row.receipts:
+            ok = r.outcome == "delivered"
+            widgets.append(
+                Static(
+                    Content.assemble(
+                        ("✓ " if ok else "✗ ", "$success" if ok else "$error"),
+                        (f"{r.project or '-'}  ", "bold"),
+                        (f"{r.session_id[:8]}  ", "dim"),
+                        broadcast._short_path(r.cwd),
+                        (f"  ({r.reason})" if r.reason else "", "$error"),
+                    )
+                )
+            )
+        widgets.append(
+            Static("[dim]esc back to the list[/]", markup=True, classes="hint")
+        )
+        detail = VerticalScroll(*widgets, id="message-detail")
+        await self.query_one("#main").mount(detail)
+        detail.focus()
+        debug.log(
+            "tui.message_detail",
+            kind=p.kind if p else "unreadable",
+            receipts=len(row.receipts),
+        )
 
     async def _show_session_search(self, *, restore: bool = False) -> None:
         """Mount the transcript search view.
@@ -5998,6 +6182,9 @@ class SessionApp(App):
             await self._clear_log_search()
         elif self._on_chat_location and self._chat_filter_query:
             await self._clear_chat_filter()
+        elif self._on_message_detail:
+            # Back from one message to the list, highlight where it was.
+            await self._show_messages(restore=True)
         elif self._actions_from_search and not self._on_search:
             # Back out of a result's actions menu into the results it came from.
             await self._show_session_search(restore=True)
@@ -6008,6 +6195,33 @@ class SessionApp(App):
                 await self._show_home()
             except (ConfigError, GitError):
                 self.exit()
+
+
+def _message_row_content(row: broadcast.StatusRow) -> Content:
+    """One line of the message log, plus the message's first line under it.
+
+    `Content.assemble`, not markup: the message text is the sender's.
+    """
+    p = row.payload
+    if p is None:
+        return Content.assemble((row.entry, "dim"), ("  unreadable", "$error"))
+    first = p.message.strip().splitlines()[0] if p.message.strip() else ""
+    if len(first) > 90:
+        first = first[:89] + "…"
+    expired = datetime.now(p.expires.tzinfo) >= p.expires
+    parts: list[str | tuple[str, str]] = [
+        (p.created.astimezone().strftime("%a %H:%M  "), "dim"),
+        (p.kind, "bold"),
+        f" to {p.scope_label}",
+        (f"  · {row.signer or 'unknown signer'}", "dim"),
+        (f"  ✓{row.delivered}", "$success"),
+    ]
+    if row.rejected:
+        parts.append((f" ✗{row.rejected}", "$error"))
+    if expired:
+        parts.append(("  expired", "dim"))
+    parts.append((f"\n“{first}”", ""))
+    return Content.assemble(*parts)
 
 
 def _last_used(cs: ClaudeSession | None, fallback: float) -> float:
@@ -7465,6 +7679,7 @@ def _add_broadcast_command(sub: argparse._SubParsersAction) -> None:
     scope.add_argument(
         "--all-projects", action="store_true", help="Every listening session"
     )
+
     send.add_argument(
         "--ttl", default="1h", help="How long it stays valid (default 1h)"
     )
@@ -7497,6 +7712,63 @@ def _add_broadcast_command(sub: argparse._SubParsersAction) -> None:
         nargs="?",
         help="A key path or literal public key; omit to use the agent key matching a signer",
     )
+
+
+def _add_send_command(sub: argparse._SubParsersAction) -> None:
+    """`send`: a signed message to one session (same machinery as `broadcast`)."""
+    send = sub.add_parser(
+        "send",
+        help="Send a signed message to one running fujimoto session",
+        description=(
+            "Send a signed message to one listening session, which acts on it "
+            "at its next safe stopping point. SESSION is its tmux name, peer "
+            "name or session-id prefix (see `fujimoto broadcast show`). Uses "
+            "the broadcast configuration and signing key."
+        ),
+        usage=(
+            "fujimoto send SESSION TEXT [--ttl 1h] [--key KEY] [--wait SECS] [--json]"
+        ),
+    )
+    send.add_argument(
+        "session", metavar="SESSION", help="tmux name, peer name or id prefix"
+    )
+    send.add_argument("text", help="The message")
+    send.add_argument(
+        "--ttl", default="1h", help="How long it stays valid (default 1h)"
+    )
+    send.add_argument("--key", help="Signing key: a key path or a literal public key")
+    send.add_argument(
+        "--wait",
+        type=float,
+        default=5.0,
+        metavar="SECS",
+        help="How long to wait for the delivery receipt (default 5)",
+    )
+    send.add_argument("--json", action="store_true")
+
+
+def _run_send_command(args: argparse.Namespace) -> None:
+    """`fujimoto send SESSION TEXT`: one session, mapping errors to exit 1."""
+    try:
+        result = broadcast.send(
+            args.text,
+            None,
+            session=args.session,
+            ttl=broadcast.parse_ttl(args.ttl),
+            key=args.key,
+            wait=args.wait,
+        )
+    except (broadcast.BroadcastError, OSError) as e:
+        debug.log("cli.send_failed", detail=debug.rv(str(e)))
+        _finish_debug_log()
+        print(f"fujimoto: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(
+        json.dumps(broadcast.send_json(result), indent=2)
+        if args.json
+        else broadcast.format_send(result)
+    )
+    _finish_debug_log()
 
 
 def _broadcast_config_change(args: argparse.Namespace) -> str:
@@ -7566,7 +7838,8 @@ def _run_broadcast_command(args: argparse.Namespace) -> None:
             if args.signed:
                 if args.project or args.all_projects:
                     raise broadcast.BroadcastError(
-                        "--signed payloads carry their own scope; drop --project/--all-projects"
+                        "--signed payloads carry their own scope; "
+                        "drop --project/--all-projects"
                     )
                 payload_path = Path(args.signed)
                 result = broadcast.submit(
@@ -7926,6 +8199,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_resume_commands(sub)
     _add_config_commands(sub)
     _add_broadcast_command(sub)
+    _add_send_command(sub)
     new = sub.add_parser(
         "new",
         help="Create a worktree and launch Claude in it",
@@ -8072,6 +8346,9 @@ def main() -> None:
         return
     if args.command == "broadcast":
         _run_broadcast_command(args)
+        return
+    if args.command == "send":
+        _run_send_command(args)
         return
     if args.command == "agent-instructions":
         print(session_query.agent_instructions(), end="")
