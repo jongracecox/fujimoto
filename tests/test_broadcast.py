@@ -413,7 +413,7 @@ class TestMailbox:
         receipt_dir.mkdir(parents=True)
         (receipt_dir / "s.json").write_text("{}")
         assert broadcast.prune(datetime.now(timezone.utc)) == 0
-        later = datetime.now(timezone.utc) + timedelta(days=3)
+        later = datetime.now(timezone.utc) + timedelta(days=9)
         assert broadcast.prune(later) == 1
         assert broadcast.list_entries() == []
         assert not receipt_dir.exists()
@@ -422,7 +422,7 @@ class TestMailbox:
         broadcast.ensure_dirs()
         bad = broadcast.messages_dir() / "1-bad.json"
         bad.write_text("garbage")
-        old = time.time() - 3 * 86400
+        old = time.time() - 9 * 86400
         os.utime(bad, (old, old))
         assert broadcast.prune() == 1
 
@@ -1199,3 +1199,297 @@ class TestConfig:
         assert broadcast.load_config() == BroadcastSettings()
         with pytest.raises(BroadcastError):
             broadcast.load_config(strict=True)
+
+
+# ---------------------------------------------------------------------------
+# Single-session target
+# ---------------------------------------------------------------------------
+
+SID_A = "9938a857-65f1-47cc-9562-0b987d9654f4"
+SID_B = "9938ffff-0000-4000-8000-000000000000"
+
+
+def _listen(lock: str, session_id: str, project: str = "p") -> None:
+    broadcast.ensure_dirs()
+    (broadcast.state_dir() / f"{lock}.lock").write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "session_id": session_id,
+                "project": project,
+                "cwd": "/c",
+            }
+        )
+    )
+
+
+class TestSessionTarget:
+    @pytest.fixture(autouse=True)
+    def _names(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            broadcast,
+            "_registry_names",
+            lambda: {
+                SID_A: ("fujimoto/smoke", "fujimoto-smoke"),
+                SID_B: ("other/thing", None),
+            },
+        )
+
+    def test_payload_session_roundtrip_and_bytes(self) -> None:
+        plain = broadcast.new_payload("m", "p", now=NOW)
+        assert b"session" not in plain.to_bytes()  # old payload bytes unchanged
+        targeted = broadcast.new_payload("m", None, now=NOW, session=SID_A)
+        assert Payload.from_bytes(targeted.to_bytes()) == targeted
+        assert targeted.scope_label == "session 9938a857"
+
+    @pytest.mark.parametrize("bad", ['"short"', "3", '"has space!!"'])
+    def test_bad_session_rejected(self, bad: str) -> None:
+        raw = json.loads(broadcast.new_payload("m", None, now=NOW).to_bytes())
+        raw["v"] = 2
+        data = json.dumps(raw).replace('"v":', f'"session": {bad}, "v":', 1)
+        with pytest.raises(BroadcastError, match="bad session"):
+            Payload.from_bytes(data.encode())
+
+    def test_covers_requires_the_exact_session(self) -> None:
+        p = broadcast.new_payload("m", None, now=NOW, session=SID_A)
+        assert p.covers("any", SID_A)
+        assert not p.covers("any", SID_B) and not p.covers("any", None)
+
+    def test_waiter_delivers_only_to_its_target(
+        self, alice: tuple[Path, Signer]
+    ) -> None:
+        signers = [alice[1]]
+        mine = dict(HOOK, session_id=SID_A)
+        # Arm the target first: a waiter doesn't replay what came before it.
+        assert broadcast.wait(
+            mine, signers, "p", sleep=lambda _: None, max_polls=1, claude_pid=1234
+        ) == (0, "")
+        msg = _signed(
+            alice[0], signers, broadcast.new_payload("just you", None, session=SID_A)
+        )
+        other = dict(HOOK, session_id=SID_B)
+        assert _wait_posting(signers, "p", [msg], hook=other) == (0, "")
+        assert broadcast.status()[0].receipts == []  # silently out of scope
+        code, text = broadcast.wait(
+            mine, signers, "p", sleep=lambda _: None, max_polls=1, claude_pid=1234
+        )
+        assert code == 2 and "just you" in text
+
+    @pytest.mark.parametrize(
+        "ref", ["fujimoto/smoke", "fujimoto-smoke", SID_A, "9938a8"]
+    )
+    def test_resolve_target(self, ref: str) -> None:
+        _listen("1", SID_A)
+        _listen("2", SID_B)
+        target = broadcast.resolve_target(ref)
+        assert target.session_id == SID_A and target.tmux_session == "fujimoto/smoke"
+
+    @pytest.mark.parametrize(
+        ("ref", "match"),
+        [
+            ("9938", "matches 2 sessions"),
+            ("nope", "no listening session"),
+            ("993", "no listening session"),
+        ],
+    )
+    def test_resolve_target_errors(self, ref: str, match: str) -> None:
+        _listen("1", SID_A)
+        _listen("2", SID_B)
+        with pytest.raises(BroadcastError, match=match) as exc:
+            broadcast.resolve_target(ref)
+        assert "fujimoto/smoke" in str(exc.value) and "other/thing" in str(exc.value)
+
+    def test_resolve_with_nobody_listening(self) -> None:
+        with pytest.raises(BroadcastError, match="listening: none"):
+            broadcast.resolve_target("x")
+
+    def test_send_to_one_session(self, alice: tuple[Path, Signer]) -> None:
+        _listen("1", SID_A, "p")
+        _listen("2", SID_B, "p")
+        config = BroadcastSettings(
+            enabled=True, signers=[alice[1]], signing_key=str(alice[0])
+        )
+        result = broadcast.send(
+            "hi", "p", session="fujimoto/smoke", wait=0.2, config=config
+        )
+        assert result.payload.session == SID_A and result.payload.project is None
+        assert [li.session_id for li in result.listeners] == [SID_A]
+        assert broadcast.send_json(result)["session"] == SID_A
+        assert "to session 9938a857" in broadcast.format_send(result)
+        assert broadcast.status_json(broadcast.status())[0]["session"] == SID_A
+
+    def test_show_lists_names(self) -> None:
+        _listen("1", SID_A)
+        assert "fujimoto/smoke" in broadcast.format_show(BroadcastSettings())
+        assert (
+            broadcast.show_json(BroadcastSettings())["listening"][0]["tmux_session"]
+            == "fujimoto/smoke"
+        )
+
+    def test_cli_send_session(
+        self,
+        alice: tuple[Path, Signer],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _listen("1", SID_A)
+        _cli(monkeypatch, "add-signer", "alice", alice[1].public_key)
+        capsys.readouterr()
+        from fujimoto import cli
+
+        def run(*argv: str) -> None:
+            monkeypatch.setattr(sys, "argv", ["fujimoto", *argv])
+            cli.main()
+
+        run("send", "fujimoto-smoke", "hi", "--key", str(alice[0]), "--wait", "0")
+        assert "Message" in capsys.readouterr().out
+        run("send", "9938a8", "hi", "--json", "--key", str(alice[0]), "--wait", "0")
+        assert json.loads(capsys.readouterr().out)["session"] == SID_A
+        with pytest.raises(SystemExit) as exc:
+            run("send", "nobody", "hi")
+        assert exc.value.code == 1 and "no listening session" in capsys.readouterr().err
+        with pytest.raises(SystemExit):  # the old flag is gone from broadcast send
+            _cli(monkeypatch, "send", "hi", "--session", "x")
+
+
+def test_registry_names_reads_live_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fujimoto.claude import live
+
+    monkeypatch.setattr(
+        live,
+        "list_live_sessions",
+        lambda: [live.LiveSession(1, SID_A, None, "peer", "idle", "t/s")],
+    )
+    assert broadcast._registry_names() == {SID_A: ("t/s", "peer")}
+
+    def boom() -> list:
+        raise OSError
+
+    monkeypatch.setattr(live, "list_live_sessions", boom)
+    assert broadcast._registry_names() == {}
+
+
+def test_targeted_payload_is_version_2_and_old_waiters_reject_it() -> None:
+    targeted = json.loads(
+        broadcast.new_payload("m", None, now=NOW, session=SID_A).to_bytes()
+    )
+    assert targeted["v"] == 2
+    assert json.loads(broadcast.new_payload("m", None, now=NOW).to_bytes())["v"] == 1
+    # v1 with a session, or v2 without one, is malformed.
+    for raw in (
+        {**targeted, "v": 1},
+        {k: v for k, v in targeted.items() if k != "session"},
+    ):
+        with pytest.raises(BroadcastError, match="version 2"):
+            Payload.from_bytes(json.dumps(raw).encode())
+
+
+def test_targeted_message_reads_as_a_message(alice: tuple[Path, Signer]) -> None:
+    signers = [alice[1]]
+    mine = dict(HOOK, session_id=SID_A)
+    broadcast.wait(mine, signers, "p", sleep=lambda _: None, max_polls=1, claude_pid=99)
+    broadcast.post(
+        *_signed(alice[0], signers, broadcast.new_payload("hi", None, session=SID_A))
+    )
+    _, text = broadcast.wait(
+        mine, signers, "p", sleep=lambda _: None, max_polls=1, claude_pid=99
+    )
+    assert text.startswith("Message from the user (via fujimoto, signed by alice).")
+    (row,) = broadcast.status()
+    assert row.signer == "alice" and row.delivered == 1 and row.rejected == 0
+
+
+def test_prune_keeps_a_week(alice: tuple[Path, Signer]) -> None:
+    broadcast.post(*_signed(alice[0], [alice[1]], _payload()))
+    assert broadcast.prune(datetime.now(timezone.utc) + timedelta(days=5)) == 0
+    assert broadcast.prune(datetime.now(timezone.utc) + timedelta(days=9)) == 1
+
+
+# ---------------------------------------------------------------------------
+# TUI: the `b` message log
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_b_opens_the_message_log_and_a_message(
+    alice: tuple[Path, Signer],
+) -> None:
+    from textual.widgets import ListView, Static
+
+    from fujimoto.cli import SessionApp
+    from tests.test_cli import _patch_git_info
+
+    signers = [alice[1]]
+    msg = broadcast.post(
+        *_signed(
+            alice[0], signers, _payload("[bold]not markup[/] line one\nline two", "p")
+        )
+    )
+    broadcast._write_receipt(
+        broadcast.Receipt(msg.name, SID_A, "p", "/w", "delivered", None, "t", "alice")
+    )
+    broadcast._write_receipt(
+        broadcast.Receipt(msg.name, SID_B, "p", "/v", "rejected", "expired", "t")
+    )
+    old = Payload("old-1", None, NOW, NOW + timedelta(hours=1), "earlier")
+    broadcast.post(*_signed(alice[0], signers, old))
+    (broadcast.messages_dir() / f"{time.time_ns():020d}-junk.json").write_text("junk")
+
+    with _patch_git_info():
+        app = SessionApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.check_action("show_messages", ()) is True
+            await pilot.press("b")
+            await pilot.pause()
+            assert app._on_messages and not app._on_home
+            assert app.check_action("show_messages", ()) is False
+            listing = app.query_one("#messages-list", ListView)
+            rows = [str(item.query_one(Static).render()) for item in listing.children]
+            assert len(rows) == 3 and "unreadable" in rows[0]
+            assert "Broadcast to project p" in rows[2] and "alice" in rows[2]
+            assert "✓1" in rows[2] and "✗1" in rows[2]
+            assert "[bold]not markup[/] line one" in rows[2]  # shown literally
+            assert "expired" in rows[1]
+            listing.index = 2
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._on_message_detail
+            text = " ".join(
+                str(s.render()) for s in app.query("#message-detail Static")
+            )
+            assert "line two" in text and "signed by alice" in text
+            assert "(expired)" in text and "/v" in text
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app._on_messages and not app._on_message_detail
+            assert app.query_one("#messages-list", ListView).index == 2
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app._on_home
+
+
+@pytest.mark.asyncio
+async def test_message_log_empty_and_unreadable_detail() -> None:
+
+    from fujimoto.cli import SessionApp
+    from tests.test_cli import _patch_git_info
+
+    with _patch_git_info():
+        app = SessionApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("b")
+            await pilot.pause()
+            labels = " ".join(
+                str(lb.render()) for lb in app.query("#messages-panel Label")
+            )
+            assert "No broadcasts or messages" in labels and "(0 items)" in labels
+            await app._show_message_detail(broadcast.StatusRow("1-x", None, []))
+            await pilot.pause()
+            text = " ".join(
+                str(s.render()) for s in app.query("#message-detail Static")
+            )
+            assert "unreadable" in text and "No session has received it" in text
+            await app.action_show_messages()  # off the home screen: ignored
+            assert app._on_message_detail

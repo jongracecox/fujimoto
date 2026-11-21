@@ -764,6 +764,31 @@ A message that expires before a session sees it is rejected (and shows as
 `✗ … (expired)` in `status`), so a late-night message is not acted on the
 next morning.
 
+#### Messaging one session — `fujimoto send`
+
+```sh
+fujimoto send myproject/20261120-fix-flaky-test "Reply with your status."
+fujimoto send 8f0e2c1a "…" --ttl 30m --json
+```
+
+The same signed delivery to a single session; it arrives as *"Message from
+the user (via fujimoto, signed by …)"*. `SESSION` is the session's tmux name,
+its peer name or a prefix of its Claude session id — `fujimoto broadcast show`
+lists all three for every listening session. It is resolved when you send (it
+must match exactly one listening session) and the message is signed for that
+session's exact id, so it can never reach a different session that later takes
+the same name. It uses the broadcast configuration and signing key, and takes
+the same `--ttl`, `--key`, `--wait` and `--json`.
+
+#### Reading the log — `b`
+
+Press `b` on the home screen for the broadcasts and messages of the last week,
+newest first: when, to whom, who signed it, how many sessions received or
+rejected it, and the first line. Enter opens one — the full text and a receipt
+per session (with the reason for any rejection); Escape goes back.
+`fujimoto broadcast status [ID]` is the command-line version. Messages and
+receipts are kept for seven days after they expire.
+
 #### Sending from somewhere else
 
 A broadcast can be signed anywhere and handed to fujimoto on this machine,
@@ -788,6 +813,10 @@ fujimoto broadcast send --signed msg.json   # reads msg.json.sig alongside
 
 `project` is a project name or `null` for all; `id` is letters, digits and
 `-`; the lifetime is at most 24h. The bytes are verified exactly as signed.
+To target one session, use `"v":2` and add `"session": "<full Claude session
+id>"` (with `"project": null`) — version 2 makes older fujimoto builds reject
+the message rather than deliver it to everyone; `fujimoto broadcast show --json` lists the listening
+sessions' ids alongside their tmux and peer names.
 
 #### Opting a project out
 
@@ -1189,6 +1218,7 @@ These options are set per-session and don't affect your global tmux config.
 | `s` | Search inside session transcripts (home screen) |
 | `r` | Refresh the session list (home screen) |
 | `p` | Cycle the first-prompt line: first line → full → off (home screen) |
+| `b` | Broadcasts and messages of the last week (home screen) |
 | `n` / `N` | Next / previous match (session log viewer) |
 | `Escape` | Back (or quit from home; clears an active filter first) |
 | `q` | Quit |
@@ -1197,7 +1227,7 @@ These options are set per-session and don't affect your global tmux config.
 | `Home` / `End` | Jump to the first / last row |
 
 The footer only lists the keys that do something in the view you are in — `s`,
-`r` and `p` disappear once you leave the home screen, the `Ctrl+R`/`Ctrl+T`/`Ctrl+I` mode
+`r`, `p` and `b` disappear once you leave the home screen, the `Ctrl+R`/`Ctrl+T`/`Ctrl+I` mode
 toggles appear only while you are searching, `n`/`N` only when a log search has
 matches to step through, and `/` is labelled *Filter* on the home screen but
 *Search* while you are reading a session log.

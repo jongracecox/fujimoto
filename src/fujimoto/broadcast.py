@@ -48,7 +48,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -57,6 +57,10 @@ from fujimoto import debug
 
 NAMESPACE = "fujimoto-broadcast"
 PAYLOAD_VERSION = 1
+# A session-targeted payload is version 2. A waiter that predates `session`
+# would ignore the field and — since a targeted payload has no project —
+# deliver it to every session; version 2 is what it rejects instead.
+TARGETED_PAYLOAD_VERSION = 2
 DEFAULT_TTL = timedelta(hours=1)
 # Bounds how long a signed message can be replayed into a session.
 MAX_TTL = timedelta(hours=24)
@@ -71,11 +75,12 @@ POLL_INTERVAL = 1.0
 # re-arms a waiter, which delivers it — but it is late, so keep this long.
 HOOK_TIMEOUT = 7 * 24 * 3600
 EXIT_DELIVER = 2
-# Mailbox/receipt entries are pruned this long after they expire.
-PRUNE_AFTER = timedelta(days=1)
+# Mailbox/receipt entries are pruned this long after they expire. They are
+# also the message log the TUI's `b` view shows, so keep a week of history.
+PRUNE_AFTER = timedelta(days=7)
 
 PREAMBLE = (
-    "Broadcast from the user (via fujimoto, signed by {signer}). "
+    "{kind} from the user (via fujimoto, signed by {signer}). "
     "Deal with this at the next safe stopping point in your current work."
 )
 
@@ -89,6 +94,8 @@ _KEY_TYPES = (
     "sk-ecdsa-sha2-nistp256@openssh.com",
     "ssh-rsa",
 )
+# A Claude session id: a UUID in practice; any id-shaped token is accepted.
+_SESSION_ID = re.compile(r"[A-Za-z0-9-]{8,64}")
 _TTL = re.compile(r"^(\d+)\s*([smhd])$")
 _TTL_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
@@ -270,24 +277,35 @@ def _iso(dt: datetime) -> str:
 
 @dataclass(frozen=True)
 class Payload:
-    """What is signed. `project` is `None` for every project."""
+    """What is signed. `project` is `None` for every project.
+
+    `session` targets one Claude session by its full id (resolved by the
+    sender from the sessions listening at the time), so a message can never
+    land in a different session that later takes the same tmux or peer name.
+    It is optional and omitted from the bytes when unset, so payloads written
+    before it existed still verify and parse.
+    """
 
     id: str
     project: str | None
     created: datetime
     expires: datetime
     message: str
+    session: str | None = None
 
     def to_bytes(self) -> bytes:
+        body: dict[str, object] = {
+            "v": PAYLOAD_VERSION if self.session is None else TARGETED_PAYLOAD_VERSION,
+            "id": self.id,
+            "project": self.project,
+            "created": _iso(self.created),
+            "expires": _iso(self.expires),
+            "message": self.message,
+        }
+        if self.session is not None:
+            body["session"] = self.session
         return json.dumps(
-            {
-                "v": PAYLOAD_VERSION,
-                "id": self.id,
-                "project": self.project,
-                "created": _iso(self.created),
-                "expires": _iso(self.expires),
-                "message": self.message,
-            },
+            body,
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
@@ -298,7 +316,10 @@ class Payload:
             raw = json.loads(data)
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             raise BroadcastError(f"payload is not JSON: {e}") from e
-        if not isinstance(raw, dict) or raw.get("v") != PAYLOAD_VERSION:
+        if not isinstance(raw, dict) or raw.get("v") not in (
+            PAYLOAD_VERSION,
+            TARGETED_PAYLOAD_VERSION,
+        ):
             raise BroadcastError("unsupported payload version")
         msg_id, project, message = raw.get("id"), raw.get("project"), raw.get("message")
         if not isinstance(msg_id, str) or not re.fullmatch(
@@ -307,6 +328,13 @@ class Payload:
             raise BroadcastError("bad id")
         if project is not None and not isinstance(project, str):
             raise BroadcastError("bad project")
+        session = raw.get("session")
+        if (session is None) != (raw["v"] == PAYLOAD_VERSION):
+            raise BroadcastError("session target requires payload version 2")
+        if session is not None and (
+            not isinstance(session, str) or not _SESSION_ID.fullmatch(session)
+        ):
+            raise BroadcastError("bad session")
         if not isinstance(message, str) or not message.strip():
             raise BroadcastError("empty message")
         if len(message) > MAX_MESSAGE_CHARS:
@@ -318,7 +346,7 @@ class Payload:
             raise BroadcastError("bad timestamps") from e
         if created.tzinfo is None or expires.tzinfo is None:
             raise BroadcastError("timestamps must carry a timezone")
-        return cls(msg_id, project, created, expires, message)
+        return cls(msg_id, project, created, expires, message, session)
 
     def check_time(self, now: datetime) -> None:
         """Raise unless the payload is current and its lifetime is within bounds."""
@@ -329,11 +357,21 @@ class Payload:
         if now >= self.expires:
             raise BroadcastError("expired")
 
-    def covers(self, project: str | None) -> bool:
+    def covers(self, project: str | None, session_id: str | None = None) -> bool:
+        """Whether a session in `project` with id `session_id` is a recipient."""
+        if self.session is not None and self.session != session_id:
+            return False
         return self.project is None or self.project == project
 
     @property
+    def kind(self) -> str:
+        """`Message` for one session, `Broadcast` for a project or everyone."""
+        return "Message" if self.session is not None else "Broadcast"
+
+    @property
     def scope_label(self) -> str:
+        if self.session is not None:
+            return f"session {self.session[:8]}"
         return "all projects" if self.project is None else f"project {self.project}"
 
 
@@ -357,6 +395,7 @@ def new_payload(
     project: str | None,
     ttl: timedelta = DEFAULT_TTL,
     now: datetime | None = None,
+    session: str | None = None,
 ) -> Payload:
     message = message.strip()
     if not message:
@@ -365,7 +404,7 @@ def new_payload(
         raise BroadcastError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
     created = (now or _now()).replace(microsecond=0)
     msg_id = f"{created.strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(4)}"
-    return Payload(msg_id, project, created, created + ttl, message)
+    return Payload(msg_id, project, created, created + ttl, message, session)
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +690,9 @@ class Receipt:
     outcome: str  # "delivered" | "rejected"
     reason: str | None
     at: str
+    # Who signed it, from verification. Absent on rejections and on receipts
+    # written before this field existed.
+    signer: str | None = None
 
 
 def _write_receipt(receipt: Receipt) -> None:
@@ -677,12 +719,19 @@ def read_receipts(entry_name: str) -> list[Receipt]:
 
 @dataclass(frozen=True)
 class Listener:
-    """A live waiter: one Claude session that will receive broadcasts."""
+    """A live waiter: one Claude session that will receive broadcasts.
+
+    `tmux_session` and `peer_name` come from Claude Code's process registry
+    (matched by session id), for naming a `--session` target; either can be
+    missing.
+    """
 
     pid: int
     session_id: str
     project: str | None
     cwd: str | None
+    tmux_session: str | None = None
+    peer_name: str | None = None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -695,8 +744,22 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _registry_names() -> dict[str, tuple[str | None, str | None]]:
+    """session id → (tmux session, peer name) for running Claude processes."""
+    from fujimoto.claude.live import list_live_sessions
+
+    try:
+        return {
+            s.session_id: (s.tmux_session, s.peer_name) for s in list_live_sessions()
+        }
+    except OSError:
+        return {}
+
+
 def list_listeners() -> list[Listener]:
-    """Waiters that are running now, from their lock files."""
+    """Waiters that are running now, from their lock files, with the names
+    Claude's registry knows them by."""
+    names = _registry_names()
     out = []
     for p in sorted(state_dir().glob("*.lock")):
         try:
@@ -710,8 +773,46 @@ def list_listeners() -> list[Listener]:
         except (OSError, ValueError, KeyError, TypeError):
             continue
         if _pid_alive(listener.pid):
-            out.append(listener)
+            tmux_session, peer_name = names.get(listener.session_id, (None, None))
+            out.append(
+                replace(listener, tmux_session=tmux_session, peer_name=peer_name)
+            )
     return out
+
+
+def resolve_target(ref: str) -> Listener:
+    """The one listening session `ref` names: its tmux session, its peer
+    name, or a prefix (4+ characters) of its Claude session id.
+
+    Resolved against the sessions listening *now*, so the signed payload can
+    carry the exact session id. No match or several matches is an error that
+    lists what is listening.
+    """
+    ref = ref.strip()
+    listeners = list_listeners()
+    exact = [
+        li for li in listeners if ref in (li.tmux_session, li.peer_name, li.session_id)
+    ]
+    matches = exact or (
+        [li for li in listeners if len(ref) >= 4 and li.session_id.startswith(ref)]
+    )
+    debug.log(
+        "broadcast.resolve_target", listeners=len(listeners), matches=len(matches)
+    )
+    if len(matches) == 1:
+        return matches[0]
+    available = ", ".join(_listener_name(li) for li in listeners) or "none"
+    if not matches:
+        raise BroadcastError(
+            f"no listening session matches {ref!r} (listening: {available}). "
+            "A session listens only if launched with broadcast enabled, and not "
+            "while it is handling a broadcast."
+        )
+    raise BroadcastError(f"{ref!r} matches {len(matches)} sessions: {available}")
+
+
+def _listener_name(li: Listener) -> str:
+    return li.tmux_session or li.peer_name or li.session_id[:8]
 
 
 # ---------------------------------------------------------------------------
@@ -752,14 +853,24 @@ def send(
     key: str | None = None,
     wait: float = 5.0,
     config: BroadcastSettings | None = None,
+    session: str | None = None,
 ) -> SendResult:
-    """Build, sign, self-verify and post a broadcast, then collect receipts."""
+    """Build, sign, self-verify and post a broadcast, then collect receipts.
+
+    `session` (a tmux name, peer name or id prefix) targets one listening
+    session; it is resolved first and the payload names its exact id, with
+    no project scope.
+    """
     config = config or load_config()
     if not config.signers:
         raise BroadcastError(
             "no signers configured: add your key with `fujimoto broadcast add-signer`"
         )
-    payload = new_payload(message, project, ttl)
+    if session is not None:
+        target = resolve_target(session)
+        payload = new_payload(message, None, ttl, session=target.session_id)
+    else:
+        payload = new_payload(message, project, ttl)
     data = payload.to_bytes()
     signature = sign(data, key or config.signing_key, config.signers)
     # Fail here, not silently in every session: a key that isn't a configured
@@ -788,7 +899,9 @@ def _post_and_collect(
 ) -> SendResult:
     prune()
     entry = post(data, signature)
-    listeners = [li for li in list_listeners() if payload.covers(li.project)]
+    listeners = [
+        li for li in list_listeners() if payload.covers(li.project, li.session_id)
+    ]
     receipts = (
         _await_receipts(entry, len(listeners), wait)
         if listeners and wait > 0
@@ -809,6 +922,19 @@ class StatusRow:
     entry: str
     payload: Payload | None
     receipts: list[Receipt]
+
+    @property
+    def signer(self) -> str | None:
+        """Who signed it, as the receiving sessions verified it."""
+        return next((r.signer for r in self.receipts if r.signer), None)
+
+    @property
+    def delivered(self) -> int:
+        return sum(r.outcome == "delivered" for r in self.receipts)
+
+    @property
+    def rejected(self) -> int:
+        return sum(r.outcome == "rejected" for r in self.receipts)
 
 
 def status(ref: str | None = None) -> list[StatusRow]:
@@ -854,7 +980,7 @@ def _receipt_line(r: Receipt) -> str:
 def format_send(result: SendResult) -> str:
     p = result.payload
     lines = [
-        f"Broadcast {p.id} to {p.scope_label}, signed by {result.signer}, "
+        f"{p.kind} {p.id} to {p.scope_label}, signed by {result.signer}, "
         f"expires {_local(p.expires)}."
     ]
     if not result.listeners:
@@ -882,6 +1008,7 @@ def send_json(result: SendResult) -> dict[str, object]:
         "id": p.id,
         "entry": result.entry.name,
         "project": p.project,
+        "session": p.session,
         "signer": result.signer,
         "expires": _iso(p.expires),
         "listening": len(result.listeners),
@@ -915,6 +1042,7 @@ def status_json(rows: Sequence[StatusRow]) -> list[dict[str, object]]:
             "entry": row.entry,
             "id": row.payload.id if row.payload else None,
             "project": row.payload.project if row.payload else None,
+            "session": row.payload.session if row.payload else None,
             "expires": _iso(row.payload.expires) if row.payload else None,
             "message": row.payload.message if row.payload else None,
             "receipts": [r.__dict__ for r in row.receipts],
@@ -947,7 +1075,8 @@ def format_show(config: BroadcastSettings) -> str:
     listeners = list_listeners()
     lines.append(f"Listening sessions: {len(listeners)}")
     lines.extend(
-        f"  {li.project or '-'}  {li.session_id[:8]}  {_short_path(li.cwd)}"
+        f"  {li.project or '-'}  {li.session_id[:8]}  "
+        f"{li.tmux_session or li.peer_name or '-'}  {_short_path(li.cwd)}"
         for li in listeners
     )
     return "\n".join(lines)
@@ -1166,7 +1295,11 @@ class _Checked:
 
 
 def check_entry(
-    entry: Entry, signers: Sequence[Signer], project: str | None, now: datetime
+    entry: Entry,
+    signers: Sequence[Signer],
+    project: str | None,
+    now: datetime,
+    session_id: str | None = None,
 ) -> _Checked:
     """Decide what a waiter does with one mailbox entry."""
     try:
@@ -1175,7 +1308,7 @@ def check_entry(
         payload = Payload.from_bytes(data)
     except (OSError, BroadcastError) as e:
         return _Checked(entry, None, None, f"unreadable: {e}")
-    if not payload.covers(project):
+    if not payload.covers(project, session_id):
         return _Checked(entry, payload, None, "out-of-scope")
     try:
         payload.check_time(now)
@@ -1189,7 +1322,8 @@ def render(delivered: Sequence[_Checked]) -> str:
     parts = []
     for c in delivered:
         assert c.payload is not None
-        parts.append(f"{PREAMBLE.format(signer=c.signer)}\n\n{c.payload.message}")
+        preamble = PREAMBLE.format(kind=c.payload.kind, signer=c.signer)
+        parts.append(f"{preamble}\n\n{c.payload.message}")
     return "\n\n---\n\n".join(parts)
 
 
@@ -1245,7 +1379,7 @@ def wait(
             delivered: list[_Checked] = []
             for entry in fresh:
                 checked = check_entry(
-                    entry, signers, project, datetime.now(timezone.utc)
+                    entry, signers, project, datetime.now(timezone.utc), session_id
                 )
                 state.mark = entry.name
                 if checked.reason == "out-of-scope":
@@ -1271,6 +1405,7 @@ def wait(
                         "delivered" if checked.reason is None else "rejected",
                         checked.reason,
                         _iso(_now()),
+                        checked.signer,
                     )
                 )
             if fresh:
