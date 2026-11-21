@@ -10168,6 +10168,7 @@ class TestContextAwareBindings:
                     "Search transcripts",
                     "Refresh",
                     "Prompts",
+                    "Messages",
                     "Launch with options",
                 }
 
