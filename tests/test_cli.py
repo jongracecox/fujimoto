@@ -40,6 +40,7 @@ from fujimoto.cli import (
     LaunchOptionsDialog,
     LaunchTarget,
     PagingListView,
+    PromptMode,
     SessionApp,
     SessionInfo,
     _build_fork_system_prompt,
@@ -60,6 +61,7 @@ from fujimoto.cli import (
     _render_snippet,
     _pair_results,
     _prepare_chat,
+    _prompt_text,
     _tool_run_title,
     _tool_summary,
     main,
@@ -2195,6 +2197,272 @@ class TestHomeRefresh:
                 with patch("fujimoto.cli.get_project_name") as get_name:
                     await app.action_refresh()
                     assert not get_name.called
+
+
+class TestPromptText:
+    """What a home row's prompt line shows in each `p` mode."""
+
+    def test_modes_cycle_off_line_full(self) -> None:
+        assert PromptMode.OFF.next() is PromptMode.LINE
+        assert PromptMode.LINE.next() is PromptMode.FULL
+        assert PromptMode.FULL.next() is PromptMode.OFF
+
+    def test_off_shows_nothing(self) -> None:
+        assert _prompt_text("Fix the bug", PromptMode.OFF) is None
+
+    @pytest.mark.parametrize("prompt", [None, "", "  \n \n"])
+    def test_no_prompt_shows_nothing(self, prompt: str | None) -> None:
+        assert _prompt_text(prompt, PromptMode.LINE) is None
+        assert _prompt_text(prompt, PromptMode.FULL) is None
+
+    def test_line_is_the_first_non_blank_line(self) -> None:
+        prompt = "\n  Fix the bug  \nin the parser\n"
+        assert _prompt_text(prompt, PromptMode.LINE) == "Fix the bug"
+
+    def test_full_is_the_whole_prompt(self) -> None:
+        prompt = "\nFix the bug\nin the parser\n"
+        assert _prompt_text(prompt, PromptMode.FULL) == "Fix the bug\nin the parser"
+
+
+class TestHomePromptToggle:
+    """`p` cycles a first-prompt line under each session row."""
+
+    PROMPT = "Fix the [bold] bug\nin the parser"
+
+    def _sessions(self, prompt: str | None = PROMPT):
+        cs = replace(_make_claude_session(), first_prompt=prompt)
+        return lambda _path: [cs]
+
+    @staticmethod
+    def _prompt_lines(app: SessionApp, item_id: str) -> list[str]:
+        item = app.query_one(f"#{item_id}")
+        return [str(w.render()) for w in item.query(".session-prompt")]
+
+    @pytest.mark.asyncio
+    async def test_cycles_off_line_full_off(self) -> None:
+        row = "ds-test-proj--direct-1"
+        with _patch_git_info(
+            sessions=["test-proj/direct-1"], claude_sessions_fn=self._sessions()
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                assert self._prompt_lines(app, row) == []
+                await pilot.press("p")
+                await pilot.pause()
+                # Transcript text is Content, so `[bold]` is literal.
+                assert self._prompt_lines(app, row) == ["Fix the [bold] bug"]
+                assert app.query_one("#home-list").has_class("prompt-line")
+                await pilot.press("p")
+                await pilot.pause()
+                assert self._prompt_lines(app, row) == [self.PROMPT]
+                assert app.query_one("#home-list").has_class("prompt-full")
+                assert not app.query_one("#home-list").has_class("prompt-line")
+                await pilot.press("p")
+                await pilot.pause()
+                assert self._prompt_lines(app, row) == []
+                assert app._prompt_mode is PromptMode.OFF
+
+    @pytest.mark.asyncio
+    async def test_line_mode_is_one_row_high(self) -> None:
+        row = "ds-test-proj--direct-1"
+        long_line = "word " * 100
+        with _patch_git_info(
+            sessions=["test-proj/direct-1"],
+            claude_sessions_fn=self._sessions(long_line),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("p")
+                await pilot.pause()
+                prompt = app.query_one(f"#{row} .session-prompt")
+                assert prompt.size.height == 1
+                await pilot.press("p")
+                await pilot.pause()
+                prompt = app.query_one(f"#{row} .session-prompt")
+                assert prompt.size.height > 1
+
+    @pytest.mark.asyncio
+    async def test_row_without_a_prompt_gets_no_line(self) -> None:
+        row = "ds-test-proj--direct-1"
+        with _patch_git_info(
+            sessions=["test-proj/direct-1"],
+            claude_sessions_fn=self._sessions(None),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("p")
+                await pilot.pause()
+                assert self._prompt_lines(app, row) == []
+
+    @pytest.mark.asyncio
+    async def test_inactive_worktree_and_previous_rows_get_a_line(
+        self, tmp_path: Path
+    ) -> None:
+        wt = tmp_path / "20260309-fix-tests"
+
+        def sessions(path: Path) -> list[ClaudeSession]:
+            # A distinct id per directory, so the root's isn't claimed by the
+            # worktree row and is listed under previous sessions.
+            cs = _make_claude_session(session_id=f"id-{path.name}", cwd=path)
+            return [replace(cs, first_prompt=self.PROMPT)]
+
+        with _patch_git_info(worktrees=[wt], claude_sessions_fn=sessions):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("p")
+                await pilot.pause()
+                assert self._prompt_lines(app, f"wt-{wt.name}") == [
+                    "Fix the [bold] bug"
+                ]
+                previous = [i for i in app._session_map if i.startswith("cs-")]
+                assert previous
+                assert self._prompt_lines(app, previous[0]) == ["Fix the [bold] bug"]
+
+    @pytest.mark.asyncio
+    async def test_keeps_the_highlighted_row(self, tmp_path: Path) -> None:
+        wt1 = tmp_path / "20260309-fix-tests"
+        wt2 = tmp_path / "20260308-add-logging"
+        with _patch_git_info(worktrees=[wt1, wt2]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                home_list = app.query_one("#home-list", ListView)
+                target = "wt-20260308-add-logging"
+                for index, item in enumerate(home_list.children):
+                    if item.id == target:
+                        home_list.index = index
+                await pilot.pause()
+                await pilot.press("p")
+                await pilot.pause()
+                highlighted = home_list.highlighted_child
+                assert highlighted is not None
+                assert highlighted.id == target
+
+    @pytest.mark.asyncio
+    async def test_inert_off_the_home_screen(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await app._show_session_search()
+                await pilot.pause()
+                assert app.check_action("cycle_prompt_mode", ()) is False
+                await app.action_cycle_prompt_mode()
+                assert app._prompt_mode is PromptMode.OFF
+
+    @pytest.mark.asyncio
+    async def test_resets_with_each_app(self) -> None:
+        with _patch_git_info():
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("p")
+                await pilot.pause()
+                assert app._prompt_mode is PromptMode.LINE
+            assert SessionApp()._prompt_mode is PromptMode.OFF
+
+    @pytest.mark.asyncio
+    async def test_sessions_sharing_a_directory_show_their_own_prompts(
+        self,
+    ) -> None:
+        """Each row's prompt is its own conversation's, not the directory's latest."""
+        newest = replace(_make_claude_session("aaaa"), first_prompt="Newest task")
+        older = replace(_make_claude_session("bbbb"), first_prompt="Older task")
+        records = {
+            name: session_state.SessionRecord(
+                cwd="/fake/repo",
+                project="test-proj",
+                session_type="direct",
+                claude_session_id=cs_id,
+            )
+            for name, cs_id in (("test-proj/one", "aaaa"), ("test-proj/two", "bbbb"))
+        }
+        with _patch_git_info(
+            sessions=list(records),
+            session_paths={name: Path("/fake/repo") for name in records},
+            open_sessions=records,
+            claude_sessions_fn=lambda _p: [newest, older],
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("p")
+                await pilot.pause()
+                assert self._prompt_lines(app, "ds-test-proj--one") == ["Newest task"]
+                assert self._prompt_lines(app, "ds-test-proj--two") == ["Older task"]
+
+    @pytest.mark.asyncio
+    async def test_closed_chat_shows_its_own_prompt(self) -> None:
+        from fujimoto import chats
+
+        chat_cs = replace(_make_claude_session("chat-c"), first_prompt="Chat question")
+        root_cs = replace(_make_claude_session("root-c"), first_prompt="Root task")
+        chats.record_open(
+            "test-proj/ask",
+            project="test-proj",
+            cwd=Path("/fake/repo"),
+            claude_session_id="chat-c",
+        )
+        chats.mark_closed("test-proj/ask", "test-proj", None)
+        with (
+            patch("fujimoto.cli.chats.prune", side_effect=chats.list_chats),
+            _patch_git_info(claude_sessions_fn=lambda _p: [root_cs, chat_cs]),
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("p")
+                await pilot.pause()
+                assert self._prompt_lines(app, "ch-test-proj--ask") == ["Chat question"]
+                assert self._prompt_lines(app, "cs-root-c") == ["Root task"]
+
+    @pytest.mark.asyncio
+    async def test_poll_follows_a_new_conversation(self) -> None:
+        row = "ds-test-proj--direct-1"
+        current = [
+            replace(
+                _make_claude_session(state=SessionState.WORKING),
+                first_prompt="First task",
+            )
+        ]
+        with _patch_git_info(
+            sessions=["test-proj/direct-1"],
+            claude_sessions_fn=lambda _path: current,
+        ):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.press("p")
+                await pilot.pause()
+                assert self._prompt_lines(app, row) == ["First task"]
+
+                current[:] = [
+                    replace(
+                        _make_claude_session(
+                            session_id="new", state=SessionState.WAITING_FOR_USER
+                        ),
+                        first_prompt="Second task",
+                    )
+                ]
+                await app._poll_session_states()
+                await pilot.pause()
+                assert self._prompt_lines(app, row) == ["Second task"]
+
+                current[:] = [
+                    replace(
+                        _make_claude_session(session_id="x", state=SessionState.IDLE),
+                        first_prompt=None,
+                    )
+                ]
+                await app._poll_session_states()
+                await pilot.pause()
+                assert self._prompt_lines(app, row) == []
+
+                current[:] = [
+                    replace(
+                        _make_claude_session(
+                            session_id="y", state=SessionState.WORKING
+                        ),
+                        first_prompt="Third task",
+                    )
+                ]
+                await app._poll_session_states()
+                await pilot.pause()
+                assert self._prompt_lines(app, row) == ["Third task"]
 
 
 class TestSessionAppDirectSession:
@@ -9870,6 +10138,7 @@ class TestContextAwareBindings:
                     "Filter",
                     "Search transcripts",
                     "Refresh",
+                    "Prompts",
                     "Launch with options",
                 }
 

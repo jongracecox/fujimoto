@@ -710,6 +710,19 @@ worktrees on disk, the open-session store and every transcript. Use it after
 creating a worktree or starting a session from another window. The current
 filter and the highlighted row are kept.
 
+#### Showing each session's first prompt — `p`
+
+A worktree name — or an untitled `chat-N` — doesn't always say what the session
+was for. Press `p` to add a line under each session row with the first prompt
+of that session's Claude conversation. Each press moves to the next mode:
+
+1. **First line** — the prompt's first line, clipped to one row with `…`.
+2. **Full** — the whole prompt, wrapped.
+3. **Off** — back to one row per session.
+
+Rows with no conversation (or none with a typed prompt) get no extra line. The
+mode starts at off each time the home screen reappears, e.g. after you detach.
+
 #### Searching inside conversations — `s`
 
 `/` matches session *names*. Press `s` to search what was actually *said and
@@ -951,6 +964,7 @@ These options are set per-session and don't affect your global tmux config.
 | `/` | Filter sessions by name (home screen) |
 | `s` | Search inside session transcripts (home screen) |
 | `r` | Refresh the session list (home screen) |
+| `p` | Cycle the first-prompt line: first line → full → off (home screen) |
 | `n` / `N` | Next / previous match (session log viewer) |
 | `Escape` | Back (or quit from home; clears an active filter first) |
 | `q` | Quit |
@@ -958,8 +972,8 @@ These options are set per-session and don't affect your global tmux config.
 | `PgUp` / `PgDn` | Move the highlight a page at a time |
 | `Home` / `End` | Jump to the first / last row |
 
-The footer only lists the keys that do something in the view you are in — `s`
-and `r` disappear once you leave the home screen, the `Ctrl+R`/`Ctrl+T`/`Ctrl+I` mode
+The footer only lists the keys that do something in the view you are in — `s`,
+`r` and `p` disappear once you leave the home screen, the `Ctrl+R`/`Ctrl+T`/`Ctrl+I` mode
 toggles appear only while you are searching, `n`/`N` only when a log search has
 matches to step through, and `/` is labelled *Filter* on the home screen but
 *Search* while you are reading a session log.

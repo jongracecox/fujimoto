@@ -753,6 +753,23 @@ responsible for running it off the event loop.
   the rebuild (appending rows moves the highlight) and re-applied after; the
   `/` filter is preserved because `_refresh_home_list` re-applies
   `_search_query`. Guarded on `_on_home`, so `r` is inert in other views.
+- Home screen first-prompt line (`p`): `action_cycle_prompt_mode` steps
+  `_prompt_mode` (`PromptMode` OFF → LINE → FULL → OFF) and rebuilds the rows
+  via `_rebuild_home_rows_keeping_highlight` (shared with `r`). Every session row
+  is built by `_session_row(label, id, prompt)`, which adds a
+  `.session-prompt` `Static` under the `Label` when `_prompt_text` returns
+  something — the first non-blank line, or the whole stripped prompt — taken
+  from the `first_prompt` of the row's own conversation: `_claude_for` for
+  running and open rows (so two sessions sharing a directory show their own
+  prompts), `by_id` for closed chats, the directory's latest for an inactive
+  worktree. The prompt is transcript
+  text, so it is `Content`, never markup. LINE clipping is CSS, not code:
+  `#home-list` carries a `prompt-<mode>` class and `.prompt-line .session-prompt`
+  is `text-wrap: nowrap; text-overflow: ellipsis`, since the width is only known
+  at render time. The poller's in-place update calls `_update_row_prompt`, which
+  adds, updates or removes the line, because a changed id is a different
+  conversation. The mode is deliberately per `SessionApp` (starts OFF on every
+  TUI appearance), not persisted. Logged as `tui.prompt_mode`.
 - Home screen sections: actions ("New worktree session", "New project-root session (⎇ <root branch>)" — `_root_branch`, the main clone's branch, not the cwd's, "New chat"), recovered 🔄 (only when there are any — see Session Status), sessions — running 🟢, parked 🅿️ and stopped 🟠 together, since the icon carries the distinction (with Claude state indicators on the running ones), previous sessions (⚫ inactive worktrees, closed chats and up to 5 project-root conversations no row claims — one section, most recently used first, built in one pass of `_build_home_items` with `_last_used`), switch project
 - Worktree create flow: title → branch select (default w/ fetch & rebase, current branch, another branch → picker) → create
 - Session actions submenu (in order): for active sessions, Connect → Fork session → Resume previous session; for inactive worktrees, Resume previous session → Fork session → Launch (resume is the more common action when picking an idle worktree). Then: View session log (whenever the path has a previous Claude session), Open terminal, Open in VS Code, Rename, Park session and Stop session (active only), Terminate session (active or stopped), Finish (worktree only), Cancel. Park, Stop and Terminate are separate menu items rather than one item plus a prompt — a menu is already a choice — but all route into the single `_end_session(session, terminate=..., park=...)` handler, which is also what the `Ctrl-A x` prompt calls. Claude-session items show just "Resume" + View session log + Open terminal/VS Code + Launch options + Cancel. "Launch options" sits after Rename for every session that has somewhere to save them (see the launch-options design decision). "Fork session" is always inserted at index 1 (`items.insert(1, ...)`) so its position holds across both layouts.

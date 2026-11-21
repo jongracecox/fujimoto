@@ -15,6 +15,7 @@ import uuid
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple, NoReturn
 
@@ -782,6 +783,18 @@ Screen {
     height: 1;
 }
 
+/* The first prompt under a home-screen row (`p`). Indented past the status
+   icon so it reads as belonging to the row above. */
+.session-prompt {
+    color: $text-muted;
+    padding-left: 3;
+}
+
+#home-list.prompt-line .session-prompt {
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
 #create-panel {
     height: auto;
     padding: 1 2;
@@ -1413,6 +1426,44 @@ class LaunchOptionsDialog(ModalScreen["tuple[str, ...] | None"]):
         self.app.open_url(CLAUDE_CLI_FLAGS_URL)
 
 
+class PromptMode(StrEnum):
+    """How much of each session's first prompt the home screen shows (`p`)."""
+
+    OFF = "off"
+    LINE = "line"
+    FULL = "full"
+
+    def next(self) -> "PromptMode":
+        """The mode `p` moves to: off → first line → full → off."""
+        modes = list(PromptMode)
+        return modes[(modes.index(self) + 1) % len(modes)]
+
+
+def _prompt_text(prompt: str | None, mode: PromptMode) -> str | None:
+    """The part of `prompt` a home row shows in `mode`, or `None` for no line.
+
+    `LINE` is the first non-blank line; the row's CSS clips it to one screen
+    line with an ellipsis, since the width is only known at render time.
+    """
+    if mode is PromptMode.OFF or not prompt or not prompt.strip():
+        return None
+    if mode is PromptMode.LINE:
+        return next(line.strip() for line in prompt.splitlines() if line.strip())
+    return prompt.strip()
+
+
+def _session_row(label_text: str, item_id: str, prompt: str | None) -> ListItem:
+    """A home-screen session row: its label, plus the prompt line if any.
+
+    The prompt is transcript text, so it reaches the widget as `Content` —
+    never markup (see the `Content.assemble` gotcha in CLAUDE.md).
+    """
+    children: list[Widget] = [Label(label_text, markup=True)]
+    if prompt is not None:
+        children.append(Static(Content(prompt), classes="session-prompt"))
+    return ListItem(*children, id=item_id)
+
+
 @dataclass
 class SessionInfo:
     name: str
@@ -1513,6 +1564,7 @@ class SessionApp(App):
         Binding("slash", "log_search", "Search", show=True),
         Binding("s", "session_search", "Search transcripts", show=True),
         Binding("r", "refresh", "Refresh", show=True),
+        Binding("p", "cycle_prompt_mode", "Prompts", show=True),
         # Mode toggles for the transcript search and the log viewer's own. They
         # have to fire while the query Input holds focus, so they are Ctrl
         # chords (which Input leaves alone) rather than plain letters — and
@@ -1603,6 +1655,9 @@ class SessionApp(App):
         self._fork_parent_path: Path | None = None
         self._update_banner_version: str | None = None
         self._on_home: bool = False
+        # How much of each session's first prompt the home rows show (`p`).
+        # Deliberately not persisted: every TUI appearance starts at OFF.
+        self._prompt_mode: PromptMode = PromptMode.OFF
         # Home-screen search. `_searching` is whether the search box is armed
         # (visible/focused); `_search_query` is the live filter, which stays
         # applied after Enter hands focus back to the list.
@@ -1824,6 +1879,8 @@ class SessionApp(App):
             # `action_refresh` already no-ops off the home screen; this is so
             # the footer stops offering it there.
             return self._on_home
+        if action == "cycle_prompt_mode":
+            return self._on_home
         if action in ("log_next_match", "log_prev_match"):
             return self._on_log and bool(self._log_matches)
         if action in ("toggle_search_regex", "toggle_search_case"):
@@ -2036,7 +2093,11 @@ class SessionApp(App):
         await main.mount(
             Container(
                 search,
-                PagingListView(*self._build_home_items(), id="home-list"),
+                PagingListView(
+                    *self._build_home_items(),
+                    id="home-list",
+                    classes=f"prompt-{self._prompt_mode}",
+                ),
                 id="home-panel",
             )
         )
@@ -2334,6 +2395,35 @@ class SessionApp(App):
             return True
         return any(query in field.lower() for field in fields if field)
 
+    def _row_prompt(self, cs: ClaudeSession | None) -> str | None:
+        """The prompt line for a row backed by `cs`, in the current mode."""
+        return _prompt_text(cs.first_prompt if cs else None, self._prompt_mode)
+
+    async def action_cycle_prompt_mode(self) -> None:
+        """Cycle the home rows' first-prompt line: off → line → full (`p`)."""
+        if not self._on_home or not self.query("#home-list"):
+            return
+        self._prompt_mode = self._prompt_mode.next()
+        debug.log("tui.prompt_mode", mode=self._prompt_mode)
+        home_list = self.query_one("#home-list", ListView)
+        home_list.set_classes(f"prompt-{self._prompt_mode}")
+        await self._rebuild_home_rows_keeping_highlight()
+
+    async def _rebuild_home_rows_keeping_highlight(self) -> None:
+        """`_refresh_home_list`, then put the highlight back on the same row.
+
+        Appending rows moves the highlight, so the row id is captured first.
+        """
+        home_list = self.query_one("#home-list", ListView)
+        highlighted = home_list.highlighted_child
+        target = highlighted.id if highlighted is not None else None
+        await self._refresh_home_list()
+        if target is not None:
+            for index, item in enumerate(home_list.children):
+                if item.id == target and not item.disabled:
+                    home_list.index = index
+                    break
+
     def _build_home_items(self) -> list[ListItem]:
         """Build the home screen rows, honouring the current search query.
 
@@ -2445,11 +2535,10 @@ class SessionApp(App):
             running.append(
                 (
                     self._order_key(name=sname, record=self._open_sessions.get(sname)),
-                    ListItem(
-                        Label(
-                            self._build_session_label(info, state_suffix), markup=True
-                        ),
-                        id=item_id,
+                    _session_row(
+                        self._build_session_label(info, state_suffix),
+                        item_id,
+                        self._row_prompt(cs),
                     ),
                 )
             )
@@ -2485,7 +2574,7 @@ class SessionApp(App):
             running.append(
                 (
                     self._order_key_for_path(wt),
-                    ListItem(Label(label_text, markup=True), id=item_id),
+                    _session_row(label_text, item_id, self._row_prompt(cs)),
                 )
             )
 
@@ -2545,7 +2634,7 @@ class SessionApp(App):
             )
             self._session_map[item_id] = info
             label_text = self._build_session_label(info, "")
-            row = ListItem(Label(label_text, markup=True), id=item_id)
+            row = _session_row(label_text, item_id, self._row_prompt(cs))
             if rec.stop_kind is StopKind.RECOVERED:
                 recovered_items.append(row)
             elif rec.stop_kind is StopKind.PARKED:
@@ -2620,7 +2709,7 @@ class SessionApp(App):
             label_text = self._build_session_label(info, "")
             used = _last_used(cs, self._creation_times.get(str(wt), 0.0))
             previous.append(
-                (used, ListItem(Label(label_text, markup=True), id=item_id))
+                (used, _session_row(label_text, item_id, self._row_prompt(cs)))
             )
 
         for meta in self._previous_chats():
@@ -2646,7 +2735,7 @@ class SessionApp(App):
             label_text = self._build_session_label(info, "")
             used = _last_used(cs, _iso_timestamp(meta.closed or meta.created))
             previous.append(
-                (used, ListItem(Label(label_text, markup=True), id=item_id))
+                (used, _session_row(label_text, item_id, self._row_prompt(cs)))
             )
 
         # Project-root conversations no row claims, capped: there can be
@@ -2676,7 +2765,7 @@ class SessionApp(App):
             previous.append(
                 (
                     _last_used(cs, 0.0),
-                    ListItem(Label(label_text, markup=True), id=item_id),
+                    _session_row(label_text, item_id, self._row_prompt(cs)),
                 )
             )
 
@@ -2785,10 +2874,6 @@ class SessionApp(App):
         """
         if not self._on_home or not self.query("#home-list"):
             return
-        home_list = self.query_one("#home-list", ListView)
-        # Captured before the rebuild: appending rows moves the highlight.
-        highlighted = home_list.highlighted_child
-        target = highlighted.id if highlighted is not None else None
         self._init_git_info()
         debug.log(
             "tui.refresh",
@@ -2798,12 +2883,7 @@ class SessionApp(App):
             open_records=len(self._open_sessions),
             filtered=bool(self._search_query),
         )
-        await self._refresh_home_list()
-        if target is not None:
-            for index, item in enumerate(home_list.children):
-                if item.id == target and not item.disabled:
-                    home_list.index = index
-                    break
+        await self._rebuild_home_rows_keeping_highlight()
 
     @on(Input.Changed, "#home-search")
     async def on_home_search_changed(self, event: Input.Changed) -> None:
@@ -3332,7 +3412,21 @@ class SessionApp(App):
                 label = item.query_one(Label)
                 label.update(label_text)
             except Exception:  # pragma: no cover
-                pass
+                continue
+            # A changed id is a different conversation, with its own first
+            # prompt.
+            await self._update_row_prompt(item, self._row_prompt(new_cs))
+
+    @staticmethod
+    async def _update_row_prompt(item: Widget, prompt: str | None) -> None:
+        """Make `item`'s prompt line show `prompt`, adding or removing it."""
+        existing = item.query(".session-prompt")
+        if prompt is None:
+            await existing.remove()
+        elif existing:
+            existing.first(Static).update(Content(prompt))
+        else:
+            await item.mount(Static(Content(prompt), classes="session-prompt"))
 
     def _build_session_label(self, session: SessionInfo, state_suffix: str) -> str:
         """Build the display label for a session item.
