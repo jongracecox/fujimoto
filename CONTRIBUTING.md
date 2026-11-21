@@ -49,7 +49,7 @@ src/fujimoto/
     └── log_parser.py    # Parse Claude JSONL session logs
 ```
 
-See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation.
+See [docs/README.md](docs/README.md) for detailed architecture documentation.
 
 ## Testing
 
@@ -209,8 +209,8 @@ a `_build_*_items()` helper at all. The shape:
 `~/.fujimoto/logs/` — see the Troubleshooting section of the README for what it
 captures and how redaction reads.
 
-**New features must be instrumented in the same change** — CLAUDE.md's
-Diagnostic Logging section is the normative list of what needs logging and how
+**New features must be instrumented in the same change** —
+[docs/dev/diagnostic-logging.md](docs/dev/diagnostic-logging.md) is the normative list of what needs logging and how
 redaction works. In short, when adding code that touches the environment, a
 subprocess, discovery logic, or that can silently skip an item, instrument it:
 
