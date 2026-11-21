@@ -36,7 +36,7 @@ from pathlib import Path
 
 from fujimoto import debug
 
-from . import session_state
+from . import filelock, session_state
 from .config import (
     ConfigError,
     has_session_meta,
@@ -148,21 +148,21 @@ def _load_cache() -> dict[str, list[str]]:
 def _save_cache(cache: dict[str, list[str]]) -> None:
     path = _cache_path()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(cache, indent=2))
+        filelock.atomic_write(path, json.dumps(cache, indent=2))
     except OSError as exc:
         debug.log("launch_options.cache_save", error=type(exc).__name__)
 
 
 def remember_for_conversation(claude_session_id: str, args: Args | None) -> None:
     """Key options by Claude conversation id, so a resume finds them again."""
-    cache = _load_cache()
-    if args is None:
-        if cache.pop(claude_session_id, None) is None:
-            return
-    else:
-        cache[claude_session_id] = list(args)
-    _save_cache(cache)
+    with filelock.locked(_cache_path()):
+        cache = _load_cache()
+        if args is None:
+            if cache.pop(claude_session_id, None) is None:
+                return
+        else:
+            cache[claude_session_id] = list(args)
+        _save_cache(cache)
     debug.log(
         "launch_options.remember",
         claude_session=claude_session_id,

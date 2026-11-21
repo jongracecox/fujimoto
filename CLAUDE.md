@@ -116,6 +116,7 @@ src/fujimoto/
 ├── config_command.py  # `fujimoto config` list/get/set/unset (UI-free) + key registry
 ├── yaml_edit.py       # change one top-level YAML key, keeping every other line
 ├── session_state.py   # which sessions the user still considers open
+├── filelock.py        # cross-process lock + atomic write for the shared JSON stores
 ├── chats.py           # one metadata file per chat, kept after Terminate (~/.cache/fujimoto/chats/)
 ├── debug.py      # --debug / --debug-redacted diagnostic logging + redaction
 ├── project_config.py  # optional per-project .fujimoto.yaml (copy/link/init worktree setup, claude_args)
@@ -420,6 +421,12 @@ state, never an error):
   re-label something shelved on purpose as a crash.
 - Keyed by **tmux session name**, so worktree, direct and ad hoc sessions are
   covered uniformly and a record outlives its worktree directory.
+- **Every writer holds `filelock.locked(_state_path())` around its
+  load-change-save**, and `save_state` writes through
+  `filelock.atomic_write` (temp file + `os.replace`). Several fujimoto
+  processes (the TUI, agents' `fujimoto chat`/`new`/`stop`) write this one
+  file; before the lock, 4 processes × 25 `mark_open`s kept 57 of 100 records.
+  Readers never lock: the rename means they see a whole old or new file.
 - `load_state()` / `save_state()`, `mark_open(...)` (every launch and
   reconnect; a reconnect passing no id keeps the id recorded at first launch),
   `mark_closed(name)`, `mark_stopped(name, claude_session_id=None, *,
@@ -432,6 +439,21 @@ state, never an error):
   nothing to age out. `prune()` drops records whose `cwd` is gone (deleted
   worktree, ad hoc temp dir cleared by a reboot) and is called once per
   `_init_git_info`, not per render.
+
+**`filelock.py`** — Locking for the shared JSON stores (`sessions.json`,
+`launch_options.json`):
+- `locked(path, *, timeout=2.0)` — `fcntl.flock` on a sidecar `<file>.lock`,
+  yielding whether the lock was taken. The kernel drops it when the holder
+  exits, so a crash cannot leave a stale lock. While held, the lock file holds
+  `{"pid", "command", "since"}` — for diagnosis only (`read_holder`); it is
+  cleared on release. **A timeout is not an error**: the block runs unlocked
+  (the old behaviour) and `filelock.timeout` logs the holder, because
+  bookkeeping must never freeze the TUI. `filelock.waited` logs any wait.
+- `atomic_write(path, text)` — temp file in the same directory, then
+  `os.replace`; the temp file never survives a failure.
+- `tests/test_filelock.py::test_concurrent_writers_lose_nothing` runs real
+  processes against both stores. Keep it: it is the only test that fails
+  when locking is missing.
 
 **`project_config.py`** — Optional per-project `.fujimoto.yaml` (validated with
 pydantic):
@@ -579,7 +601,7 @@ session:
   known) the conversation cache. **An `args` equal to the project default
   clears the override instead**, so a session that never asked for anything
   different keeps following `.fujimoto.yaml` as it changes.
-- `remember_for_conversation(id, args)` — the conversation cache; called by
+- `remember_for_conversation(id, args)` — the conversation cache (read-change-write under `filelock.locked`, written atomically, like `sessions.json`); called by
   `SessionApp._keep_launch_options` on terminate, because terminate deletes
   the record that held a direct session's options.
 - `parse(text)` / `render(args)` — `shlex.split` / `shlex.join`;

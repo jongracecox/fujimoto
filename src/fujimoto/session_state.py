@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 
-from fujimoto import debug
+from fujimoto import debug, filelock
 
 
 def _state_path() -> Path:
@@ -201,9 +201,11 @@ def save_state(state: dict[str, SessionRecord]) -> None:
     """Persist the open-session records, swallowing filesystem errors."""
     path = _state_path()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps({name: asdict(rec) for name, rec in state.items()}, indent=2)
+        # A rename, so a reader (which never locks) sees the old file or the
+        # new one. Writers hold `filelock.locked` around read-change-write.
+        filelock.atomic_write(
+            path,
+            json.dumps({name: asdict(rec) for name, rec in state.items()}, indent=2),
         )
     except OSError as exc:
         debug.log("session_state.save", path=debug.rp(path), error=type(exc).__name__)
@@ -263,58 +265,62 @@ def mark_open(
     `parent_session` replaces the recorded one (the latest starter is the
     parent); None keeps it.
     """
-    state = load_state()
-    existing = state.get(tmux_name)
-    # A reconnect knows nothing new about the conversation, so don't let it
-    # blank out an id recorded when the session was first launched.
-    if claude_session_id is None and existing is not None:
-        claude_session_id = existing.claude_session_id
-    # A reconnect is not a creation: keep the original stamp so a long-lived
-    # session doesn't jump to the top of the list every time it is reopened,
-    # and estimate one for a record written before the field existed rather
-    # than claiming it was created now.
-    if existing is None:
-        created = _now()
-    elif existing.created:
-        created = existing.created
-    else:
-        created = _backfill_created(existing, cwd, session_type)
-    state[tmux_name] = SessionRecord(
-        cwd=str(cwd),
-        project=project,
-        session_type=session_type,
-        branch=branch,
-        claude_session_id=claude_session_id,
-        created=created,
-        last_seen=_now(),
-        # Launch options are set separately (`set_claude_args`); a launch on
-        # its own must not forget the ones saved earlier.
-        claude_args=existing.claude_args if existing is not None else None,
-        parent_session=parent_session
-        or (existing.parent_session if existing is not None else None),
-    )
-    debug.log(
-        "session_state.mark_open",
-        session=debug.rv(tmux_name),
-        cwd=debug.rp(cwd),
-        project=debug.rv(project),
-        session_type=session_type,
-        branch=debug.rref(branch),
-        claude_session=claude_session_id or "none",
-        new_record=existing is None,
-        created=created,
-        parent=debug.rv(parent_session) if parent_session else "unchanged",
-    )
-    save_state(state)
+    with filelock.locked(_state_path()):
+        state = load_state()
+        existing = state.get(tmux_name)
+        # A reconnect knows nothing new about the conversation, so don't let it
+        # blank out an id recorded when the session was first launched.
+        if claude_session_id is None and existing is not None:
+            claude_session_id = existing.claude_session_id
+        # A reconnect is not a creation: keep the original stamp so a long-lived
+        # session doesn't jump to the top of the list every time it is reopened,
+        # and estimate one for a record written before the field existed rather
+        # than claiming it was created now.
+        if existing is None:
+            created = _now()
+        elif existing.created:
+            created = existing.created
+        else:
+            created = _backfill_created(existing, cwd, session_type)
+        state[tmux_name] = SessionRecord(
+            cwd=str(cwd),
+            project=project,
+            session_type=session_type,
+            branch=branch,
+            claude_session_id=claude_session_id,
+            created=created,
+            last_seen=_now(),
+            # Launch options are set separately (`set_claude_args`); a launch on
+            # its own must not forget the ones saved earlier.
+            claude_args=existing.claude_args if existing is not None else None,
+            parent_session=parent_session
+            or (existing.parent_session if existing is not None else None),
+        )
+        debug.log(
+            "session_state.mark_open",
+            session=debug.rv(tmux_name),
+            cwd=debug.rp(cwd),
+            project=debug.rv(project),
+            session_type=session_type,
+            branch=debug.rref(branch),
+            claude_session=claude_session_id or "none",
+            new_record=existing is None,
+            created=created,
+            parent=debug.rv(parent_session) if parent_session else "unchanged",
+        )
+        save_state(state)
 
 
 def mark_closed(tmux_name: str) -> None:
     """Forget a session. The only path by which a session stops being open."""
-    state = load_state()
-    removed = state.pop(tmux_name, None) is not None
-    debug.log("session_state.mark_closed", session=debug.rv(tmux_name), removed=removed)
-    if removed:
-        save_state(state)
+    with filelock.locked(_state_path()):
+        state = load_state()
+        removed = state.pop(tmux_name, None) is not None
+        debug.log(
+            "session_state.mark_closed", session=debug.rv(tmux_name), removed=removed
+        )
+        if removed:
+            save_state(state)
 
 
 def mark_stopped(
@@ -330,57 +336,60 @@ def mark_stopped(
     overwrites, so a park followed by a stop reads as stopped — the record
     should say what the user last decided.
     """
-    state = load_state()
-    record = state.get(tmux_name)
-    if record is None:
+    with filelock.locked(_state_path()):
+        state = load_state()
+        record = state.get(tmux_name)
+        if record is None:
+            debug.log(
+                "session_state.mark_stopped", session=debug.rv(tmux_name), found=False
+            )
+            return
         debug.log(
-            "session_state.mark_stopped", session=debug.rv(tmux_name), found=False
+            "session_state.mark_stopped",
+            session=debug.rv(tmux_name),
+            found=True,
+            claude_session=claude_session_id or "unchanged",
+            kind=kind.value,
         )
-        return
-    debug.log(
-        "session_state.mark_stopped",
-        session=debug.rv(tmux_name),
-        found=True,
-        claude_session=claude_session_id or "unchanged",
-        kind=kind.value,
-    )
-    record.last_seen = _now()
-    if claude_session_id is not None:
-        record.claude_session_id = claude_session_id
-    record.stop_kind = kind
-    save_state(state)
+        record.last_seen = _now()
+        if claude_session_id is not None:
+            record.claude_session_id = claude_session_id
+        record.stop_kind = kind
+        save_state(state)
 
 
 def set_claude_args(tmux_name: str, args: list[str] | None) -> None:
     """Save (or, with None, clear) the launch options of an open session."""
-    state = load_state()
-    record = state.get(tmux_name)
-    debug.log(
-        "session_state.set_claude_args",
-        session=debug.rv(tmux_name),
-        found=record is not None,
-        cleared=args is None,
-    )
-    if record is None:
-        return
-    record.claude_args = args
-    save_state(state)
+    with filelock.locked(_state_path()):
+        state = load_state()
+        record = state.get(tmux_name)
+        debug.log(
+            "session_state.set_claude_args",
+            session=debug.rv(tmux_name),
+            found=record is not None,
+            cleared=args is None,
+        )
+        if record is None:
+            return
+        record.claude_args = args
+        save_state(state)
 
 
 def rename(old_name: str, new_name: str) -> None:
     """Follow a tmux session rename so its record isn't orphaned."""
-    state = load_state()
-    record = state.pop(old_name, None)
-    debug.log(
-        "session_state.rename",
-        old=debug.rv(old_name),
-        new=debug.rv(new_name),
-        found=record is not None,
-    )
-    if record is None:
-        return
-    state[new_name] = record
-    save_state(state)
+    with filelock.locked(_state_path()):
+        state = load_state()
+        record = state.pop(old_name, None)
+        debug.log(
+            "session_state.rename",
+            old=debug.rv(old_name),
+            new=debug.rv(new_name),
+            found=record is not None,
+        )
+        if record is None:
+            return
+        state[new_name] = record
+        save_state(state)
 
 
 def prune() -> dict[str, SessionRecord]:
@@ -389,23 +398,24 @@ def prune() -> dict[str, SessionRecord]:
     A deleted worktree (or an ad hoc temp dir cleared by a reboot) can never be
     resumed, so its record is dead weight.
     """
-    state = load_state()
-    live = {name: rec for name, rec in state.items() if rec.path.exists()}
-    dropped = [name for name in state if name not in live]
-    for name in dropped:
-        # The usual cause of a session vanishing from the home screen.
-        debug.log(
-            "session_state.pruned",
-            session=debug.rv(name),
-            cwd=debug.rp(state[name].cwd),
+    with filelock.locked(_state_path()):
+        state = load_state()
+        live = {name: rec for name, rec in state.items() if rec.path.exists()}
+        dropped = [name for name in state if name not in live]
+        for name in dropped:
+            # The usual cause of a session vanishing from the home screen.
+            debug.log(
+                "session_state.pruned",
+                session=debug.rv(name),
+                cwd=debug.rp(state[name].cwd),
+            )
+        debug.log_once(
+            "session-state-prune",
+            "session_state.prune",
+            records=len(state),
+            live=len(live),
+            dropped=len(dropped),
         )
-    debug.log_once(
-        "session-state-prune",
-        "session_state.prune",
-        records=len(state),
-        live=len(live),
-        dropped=len(dropped),
-    )
-    if len(live) != len(state):
-        save_state(live)
-    return live
+        if len(live) != len(state):
+            save_state(live)
+        return live
