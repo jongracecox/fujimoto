@@ -43,6 +43,7 @@ src/fujimoto/
 ├── config_command.py  # `fujimoto config` list/get/set/unset, key registry
 ├── yaml_edit.py       # Change one top-level YAML key, keeping comments
 ├── settings.py        # TUI preferences (stored in the global config; migrates settings.json)
+├── broadcast.py       # Signed broadcasts: sign/verify, mailbox, per-session waiter hook
 ├── templates/    # Packaged scaffolds (fujimoto.yaml.template)
 └── claude/
     ├── __init__.py      # Re-exports public API
