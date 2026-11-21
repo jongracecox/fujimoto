@@ -1,0 +1,15 @@
+# `config.py`
+
+**`config.py`** — Pure functions, no side effects except directory creation:
+- `get_worktree_root(project_root=None, *, create=True)` — returns `FUJIMOTO_WORKTREE_ROOT` if set, else falls back to `<project_root>/.fujimoto/worktrees/` (ensures `.fujimoto/.gitignore` exists). Raises `ConfigError` only if both are missing.
+- `get_git_projects_root()` — reads `FUJIMOTO_GIT_ROOT`, returns `None` if unset
+- `list_projects()` — scans git root for directories containing `.git`
+- `slugify(title)` — lowercase, replace non-alphanumeric with hyphens, strip/collapse
+- `build_worktree_path(project, title, project_root=None)` — with env var: `{root}/{project}/{YYYYMMDD}-{slug}`; with fallback: `<project_root>/.fujimoto/worktrees/{YYYYMMDD}-{slug}`
+- `get_project_worktrees_dir(project, project_root=None, *, create=True)` — with env var: `{root}/{project}`; with fallback: `<project_root>/.fujimoto/worktrees/`
+- `store_session_meta(path, base_branch, source_root=None, forked_from_session_id=None, forked_from_worktree=None)` / `read_session_meta(path)` — JSON metadata. `source_root` records the main repo the worktree was created from, so `project_config` can resolve copy/link sources on later launches (older worktrees without it fall back to deriving the root via `git.get_main_worktree_root`). The two `forked_from_*` keys record that the worktree was created by forking another session and where that session was running; keeping both in the worktree means a fork stays identifiable even if the source Claude transcript is deleted. All optional keys are omitted when `None`.
+- `read_parent_session(path)` / `write_parent_session(path, name)` — the peer address (Claude Code `SendMessage` name, *not* a session id) of the session that ran `fujimoto new --parent`, stored as `parent_session` in `meta.json`. Same rules as `write_claude_args`: it only updates an existing `meta.json`, and the latest writer wins.
+- `has_session_meta(path)` / `read_claude_args(path)` / `write_claude_args(path, args)` — a worktree's saved launch options, stored as a `claude_args` list in `meta.json`. `read_claude_args` returns `None` for "no override" (distinct from `[]`, an explicit "no options"); `write_claude_args(None)` removes the key, and the writer only ever updates an existing `meta.json`, so it cannot plant one in a directory fujimoto did not create as a worktree.
+- `config_once_applied(path)` / `mark_config_once_applied(path)` — presence-of-marker-file flag (`.fujimoto/config_once_applied`) recording that `once` project-config actions have run for the worktree.
+- `next_session_name(project, title, taken, *, fallback)` — `{project}/{slug}`, numbered `-2`, `-3`… when taken; a blank (or unsluggable) title becomes `{project}/{fallback}-N`. `DEFAULT_SESSION_TITLE` (`session`) is the fallback for project-root sessions and for a resume whose worktree name is busy. The TUI's `taken` set is `_taken_session_names()`: running sessions, open records (a stopped session still owns its name) and every worktree's name
+- `get_next_adhoc_session_name(sessions)` — computes `adhoc-N`

@@ -1457,7 +1457,7 @@ def _session_row(label_text: str, item_id: str, prompt: str | None) -> ListItem:
     """A home-screen session row: its label, plus the prompt line if any.
 
     The prompt is transcript text, so it reaches the widget as `Content` —
-    never markup (see the `Content.assemble` gotcha in CLAUDE.md).
+    never markup (see the `Content.assemble` gotcha in docs/dev/gotchas.md).
     """
     children: list[Widget] = [Label(label_text, markup=True)]
     if prompt is not None:

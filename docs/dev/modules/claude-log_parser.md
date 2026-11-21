@@ -1,0 +1,15 @@
+# `claude/log_parser.py`
+
+**`claude/log_parser.py`** — Parse Claude Code's JSONL session logs:
+- `ClaudeLogError` — raised on empty/unreadable logs
+- `EntryType` / `StopReason` / `SessionState` — StrEnums with lenient `from_raw()` parsing (returns `None` for unrecognized values)
+- `ClaudeSession` — frozen dataclass: session_id, state, cwd, git_branch, last_activity, etc.
+- `encode_project_path(path)` — replaces `/` **and `.`** with `-`, matching Claude's directory encoding (see the encoding gotcha in [gotchas.md](../gotchas.md))
+- `get_claude_projects_dir()` — `$CLAUDE_CONFIG_DIR/projects` if that env var is set, else `~/.claude/projects`
+- `recorded_cwds_under(base)` — every working directory at or below `base` with transcripts, whether or not it still exists (encoded-prefix candidates, confirmed by `_first_cwd`). Used by `fujimoto search` to find deleted worktrees; logs `claude.recorded_cwds` with `candidates`/`found`/`rejected`.
+- `session_dirs_for_path(project_path)` — the transcript directories for a working directory, and the single place that mapping lives (`get_sessions_for_path` and `search.list_session_logs` both go through it). Tries the encoded name for the path as given and as `resolve()`d (Claude records the *physical* cwd, so a symlinked worktree root would never match otherwise), then falls back to `_cwd_index()` — a `cwd → dirs` map built from the `cwd` each transcript records. The encoding is a guess at what another program does with a path, so the fallback is what stops a future encoding change from silently reporting "no previous sessions". The index is built only when the encoded lookup misses and memoized per `(projects dir, mtime_ns)`, so it rebuilds when a session directory appears.
+- `parse_session(jsonl_path)` — reads JSONL, tracks last meaningful (non-sidechain) entry, derives state. Skips lines that parse to a non-dict (a bare list or string is valid JSON but has no entry type), which previously raised `AttributeError` out of `get_sessions_for_path` and into the home screen.
+- `get_sessions_for_path(project_path)` — encodes path, globs `*.jsonl`, returns sorted sessions
+- `TranscriptMessage` — frozen dataclass: `role`, `text`, `timestamp`, `tool_id`. `role` is one of `user`, `assistant`, `thinking`, `tool_use`, `tool_result` — the last three come from *content blocks*, not entry types. `tool_id` carries a `tool_use`'s `id` and a `tool_result`'s `tool_use_id`, so the viewer can pair a call with its own reply
+- `read_raw_transcript(jsonl_path)` — the log's lines as written (blank lines dropped, each clipped to `_MAX_RAW_LINE_CHARS`), for the viewer's fallback when `read_transcript` meets an entry shape it doesn't know. Raises `ClaudeLogError` only when the file itself cannot be read
+- `read_transcript(jsonl_path)` — reads a log into an ordered `list[TranscriptMessage]` for the read-only viewer. Skips sidechain (sub-agent), meta and unrecognized entries; clips tool inputs/results to 20 lines / 2000 chars (`_clip`) since whole-file payloads are unreadable in a TUI
