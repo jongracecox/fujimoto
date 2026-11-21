@@ -101,6 +101,12 @@ Preferences that apply to every project live in
 ```yaml
 model: opus            # default Claude model for every session
 quick_terminal: true   # the global quick-terminal binding (see below)
+broadcast:             # `fujimoto broadcast` (managed by its own commands)
+  enabled: true
+  signers:
+    - name: laptop
+      public_key: ssh-ed25519 AAAA…
+  signing_key: null
 ```
 
 **Default model.** Claude Code remembers the last model chosen with `/model`
@@ -189,6 +195,10 @@ init:
 # Extra claude CLI arguments for every session in this project (a list, or a
 # string split like a shell would). A session's own saved launch options win.
 claude_args: [--plugin-dir, ./plugins]
+
+# Keep this project's sessions out of `fujimoto broadcast` (on by default once
+# broadcast is enabled globally).
+broadcast: false
 ```
 
 Notes:
@@ -206,6 +216,8 @@ Notes:
 - **`claude_args`** applies to worktree, project-root and chat sessions alike
   (a chat in the scratch directory is outside the repo, so it doesn't see them). See [Launch options](#launch-options) for how it
   interacts with options saved per session.
+- **`broadcast: false`** opts the project out of
+  [broadcasts](#broadcasting-to-every-session). It can only opt out.
 - fujimoto itself never creates a `.venv` — that's `uv` (or your tooling)
   running inside the worktree. Use an `init: [uv sync]` entry to set one up.
 
@@ -637,6 +649,186 @@ fujimoto stop myproject/20261013-fix-flaky-test
 
 A resumed session runs with its usual launch options and nobody watching. If
 it stops for a permission prompt, it waits until someone attaches.
+
+### Broadcasting to every session
+
+`fujimoto broadcast send` delivers one message to every running fujimoto
+session, or to every session of one project, and each Claude acts on it at
+its next safe stopping point. For example, before shutting down for the
+night:
+
+```sh
+fujimoto broadcast send --all-projects \
+  "Send me a summary of this session's state and any outstanding actions or decisions in Slack."
+```
+
+```text
+Broadcast 20261120T220102-3f9a1c2e to all projects, signed by laptop, expires 23:01.
+Delivered to 3 of 3 listening sessions:
+  ✓ myproject  8f0e2c1a  ~/git/worktrees/myproject/20261120-fix-flaky-test
+  ✓ myproject  2b77d0e4  ~/git/worktrees/myproject/20261119-new-api
+  ✓ website    c41a9e07  ~/git/website
+```
+
+Each session receives:
+
+> Broadcast from the user (via fujimoto, signed by laptop). Deal with this at
+> the next safe stopping point in your current work.
+>
+> Send me a summary of this session's state and any outstanding actions or
+> decisions in Slack.
+
+- **Idle** sessions wake up and act straight away.
+- **Busy** sessions pick it up when the current step (a command, an edit)
+  finishes, not at the end of the whole task. They then carry on.
+- A session **waiting on a permission prompt** keeps the message queued; the
+  prompt is never answered for you. It is handled after you respond.
+- A broadcast **never bypasses permissions**: a tool call it leads to is
+  approved (or auto-approved) exactly as it would be for anything else.
+
+#### Setting it up
+
+Broadcast is off until you enable it and trust at least one key. Messages
+are signed with an SSH key and checked against the keys you list, so writing
+a file into the mailbox is not enough to send one (see
+[Security](#security-model) below).
+
+1. **Pick a signing key.** Any SSH key works. fujimoto only ever stores the
+   *public* half and signs with `ssh-keygen -Y sign` (OpenSSH 8.1+), so the
+   private key can live wherever you keep keys: a password manager's SSH
+   agent (e.g. 1Password), the system `ssh-agent`, a hardware key, or a key
+   file. A dedicated key is cleanest:
+
+   ```sh
+   ssh-keygen -t ed25519 -C "fujimoto broadcast" -f ~/.ssh/fujimoto_broadcast
+   ```
+
+   Or create the key in your password manager and use its public key.
+
+2. **Trust it** (give it a name — it is shown to every session as "signed by
+   NAME"):
+
+   ```sh
+   fujimoto broadcast add-signer laptop ~/.ssh/fujimoto_broadcast.pub
+   # or a literal key: fujimoto broadcast add-signer laptop "ssh-ed25519 AAAA…"
+   ```
+
+3. **Say which key `send` signs with** — optional. Without this, fujimoto
+   uses the first key in your SSH agent that is a trusted signer, which is
+   what you want with a password-manager agent.
+
+   ```sh
+   fujimoto broadcast set-key ~/.ssh/fujimoto_broadcast   # a private key file
+   fujimoto broadcast set-key ~/.ssh/fujimoto_broadcast.pub  # sign via the agent
+   ```
+
+4. **Enable it:**
+
+   ```sh
+   fujimoto broadcast enable
+   ```
+
+5. **Relaunch your sessions.** Only sessions *launched after* step 4 listen;
+   running ones keep the configuration they started with. Stop and resume them
+   (`Ctrl-A s`, then Enter on the row).
+
+6. **Check:**
+
+   ```sh
+   fujimoto broadcast show                  # config + which sessions are listening
+   fujimoto broadcast send "Reply with OK." # this project only, as a test
+   fujimoto broadcast status                # recent broadcasts and receipts
+   ```
+
+Everything lives under `broadcast:` in the global config
+(`~/.config/fujimoto/config.yaml`, see [Global config](#global-config-and-default-model));
+the commands edit only that key and keep the rest of the file, comments
+included.
+`fujimoto broadcast disable` and `remove-signer NAME` undo it (again for
+sessions launched afterwards).
+
+#### Sending
+
+```sh
+fujimoto broadcast send "…"                    # sessions of the current project
+fujimoto broadcast send "…" --project website  # one named project
+fujimoto broadcast send "…" --all-projects     # every listening session
+fujimoto broadcast send "…" --ttl 4h           # valid for 4h (default 1h, max 24h)
+fujimoto broadcast status [ID]                 # who received what
+```
+
+`send` waits up to `--wait` seconds (default 5) for receipts and lists them;
+`--json` gives the same as JSON. A session that was not listening yet simply
+does not receive it — broadcasts are not replayed to sessions started later.
+A message that expires before a session sees it is rejected (and shows as
+`✗ … (expired)` in `status`), so a late-night message is not acted on the
+next morning.
+
+#### Sending from somewhere else
+
+A broadcast can be signed anywhere and handed to fujimoto on this machine,
+for example by an always-on agent with its own key. Trust that key with
+`add-signer`, then on the sending side write the payload and sign it in the
+`fujimoto-broadcast` namespace:
+
+```sh
+cat > msg.json <<'EOF'
+{"v":1,"id":"agent-20261120-2200","project":null,
+ "created":"2026-11-20T22:00:00+00:00","expires":"2026-11-20T23:00:00+00:00",
+ "message":"Send me a summary of this session's state in Slack."}
+EOF
+ssh-keygen -Y sign -f agent_key -n fujimoto-broadcast msg.json   # writes msg.json.sig
+```
+
+and get both files onto this machine and post them:
+
+```sh
+fujimoto broadcast send --signed msg.json   # reads msg.json.sig alongside
+```
+
+`project` is a project name or `null` for all; `id` is letters, digits and
+`-`; the lifetime is at most 24h. The bytes are verified exactly as signed.
+
+#### Opting a project out
+
+Add `broadcast: false` to a project's `.fujimoto.yaml`. A project can only opt
+*out*: whether broadcast is on, and which keys are trusted, are global settings
+— otherwise a repository could ship a config that trusts its own key.
+
+#### Security model
+
+- **What it protects against.** Anything running as you — including another
+  Claude session that has been prompt-injected — can write files in the
+  mailbox (`~/.cache/fujimoto/broadcast/`). It cannot make a session act on
+  them: each session checks the signature against the keys it was launched
+  with, and drops anything else (`fujimoto broadcast status` shows the
+  rejection). The signer's name comes from the signature, not from the
+  message, so a message cannot claim to be from someone else.
+- **Fixed at launch.** A session's trusted keys are written into its hook
+  command when it starts, so editing settings afterwards does not change who
+  a running session trusts.
+- **Bounded replay.** Every message carries its scope and an expiry (24h at
+  most) inside the signed part; a session delivers each message once.
+- **What it does not protect against.** Anything running as you can still
+  change fujimoto's settings for *future* launches (e.g. `add-signer`), or
+  add hooks of its own to Claude Code's settings — broadcast does not create
+  that ability and cannot remove it. And a signature is only as strong as the
+  key's custody: if your SSH agent remembers an approval (1Password did in
+  testing: a second signature needed no fingerprint), a process running in the same session can sign until the
+  approval lapses. A hardware key that asks for a touch on every use closes
+  that gap.
+
+#### How it works
+
+Each fujimoto-launched session gets two Claude Code hooks (via `claude
+--settings`, merged into any `--settings` already in its launch options):
+`SessionStart` and `Stop`, both `async` with `asyncRewake`. The hook runs a
+small waiter that sleeps until a new message appears in the mailbox,
+verifies it, and exits with code 2, which Claude Code documents as waking the
+session even when it is idle; the text becomes a notice in the conversation.
+The `Stop` hook re-arms a waiter after every turn, and a lock keeps it to one
+per Claude process. Nothing types into the terminal, and nothing talks to
+Claude Code's internal messaging sockets.
 
 ### Home Screen
 

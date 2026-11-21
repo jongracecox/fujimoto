@@ -1,7 +1,7 @@
 """The user's global fujimoto config, `~/.config/fujimoto/config.yaml`.
 
-Holds preferences that apply to every project: the default Claude model and
-the quick-terminal toggle. `$XDG_CONFIG_HOME` moves it. Same contract as
+Holds preferences that apply to every project: the default Claude model, the
+quick-terminal toggle and `fujimoto broadcast`'s settings. `$XDG_CONFIG_HOME` moves it. Same contract as
 `.fujimoto.yaml`: optional, YAML, validated with pydantic, and a malformed file
 raises `ConfigError` so it can be shown rather than silently ignored.
 
@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from fujimoto import debug
 
@@ -23,6 +23,33 @@ from .config import ConfigError
 from .yaml_edit import update_key
 
 XDG_CONFIG_HOME_ENV = "XDG_CONFIG_HOME"
+
+
+class SignerConfig(BaseModel):
+    """A key trusted to sign broadcasts (see `broadcast.py`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    # OpenSSH `<type> <base64>`, without a comment.
+    public_key: str
+
+
+class BroadcastConfig(BaseModel):
+    """`fujimoto broadcast`: off unless enabled, and only with a signer.
+
+    Managed by the `fujimoto broadcast` subcommands rather than `fujimoto
+    config`, which only handles scalar keys. Global only: a project can opt
+    out in `.fujimoto.yaml` but never name a signer.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    signers: list[SignerConfig] = Field(default_factory=list)
+    # What `broadcast send` signs with: a key path or a literal public key.
+    # None means "the SSH agent key that matches a signer".
+    signing_key: str | None = None
 
 
 class GlobalConfig(BaseModel):
@@ -33,6 +60,7 @@ class GlobalConfig(BaseModel):
     # Whether the server-global quick-terminal key binding is installed.
     # None means the first-launch prompt has not been answered yet.
     quick_terminal: bool | None = None
+    broadcast: BroadcastConfig = Field(default_factory=BroadcastConfig)
 
 
 def global_config_path() -> Path:

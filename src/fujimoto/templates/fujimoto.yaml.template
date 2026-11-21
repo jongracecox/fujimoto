@@ -105,3 +105,11 @@
 # was last picked with /model in *any* session.
 # Set it with: fujimoto config set model opus --project
 # model: opus
+
+# ---------------------------------------------------------------------------
+# broadcast: let `fujimoto broadcast` reach this project's sessions
+# ---------------------------------------------------------------------------
+# Broadcast is switched on globally (`fujimoto broadcast enable`); this key can
+# only opt a project OUT. Who may send is global config, never set here.
+# Takes effect for sessions launched after the change.
+# broadcast: false

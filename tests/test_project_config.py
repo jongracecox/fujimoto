@@ -526,3 +526,9 @@ def test_template_documents_claude_args() -> None:
     from fujimoto.project_config import template_text
 
     assert "claude_args" in template_text()
+
+
+def test_broadcast_defaults_on_and_can_opt_out(tmp_path: Path) -> None:
+    assert load_project_config(tmp_path).broadcast is True
+    _write_config(tmp_path, "broadcast: false\n")
+    assert load_project_config(tmp_path).broadcast is False
