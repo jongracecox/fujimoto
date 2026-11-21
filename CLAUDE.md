@@ -122,6 +122,7 @@ src/fujimoto/
 ├── project_config.py  # optional per-project .fujimoto.yaml (copy/link/init worktree setup, claude_args)
 ├── launch_options.py  # extra claude CLI args per session (resolve / save / replay)
 ├── session_query.py   # `fujimoto search` / `fujimoto log`: scope, location, liveness, output
+├── broadcast.py       # `fujimoto broadcast`: signed messages, mailbox, per-session waiter hook
 ├── templates/
 │   ├── __init__.py
 │   ├── fujimoto.yaml.template  # commented scaffold written by `fujimoto --create-config`
@@ -151,6 +152,7 @@ src/fujimoto/
 - `fujimoto config [list|get KEY|set KEY VALUE|unset KEY] [--global|--project] [--json]` (`_run_config_command`, logic in `config_command.py`) runs before the prerequisite check. Bare `config` is `list`. `set`/`unset` *require* a scope flag (argparse mutually-exclusive group, `required=True`); `get` without one prints the effective value and exits 1 when unset, like `git config`. `config set` is the third command allowed a `--` remainder (after `new`/`resume`): `config set claude_args --project -- --verbose` passes a value argparse would otherwise read as a flag, joined back with `shlex.join`. Giving the value both before and after `--` is an error.
 - **Every launch's system prompt ends with `FUJIMOTO_CLI_PROMPT`** (`_with_cli_prompt` in `_start_launch`, covering new, fork and resume — a resume otherwise gets only the parent link, since an appended system prompt does not survive into a new process). It points the session at `fujimoto agent-instructions` and names `fujimoto config`; without it, a session asked to "show the fujimoto config" read the YAML files instead. Keep it one sentence: it is paid on every launch.
 - `fujimoto chat [TITLE] [--in WORKTREE | --in-scratch] [--project NAME|PATH] [--prompt T] [--parent NAME] [--detach] [-- claude args…]` (`_prepare_chat`) starts a chat session (see Session Types) without creating a worktree. The project comes from `session_query.resolve_scope` (cwd, or `--project` path/name), so it shares `search`'s rules. Location: the project root by default; `--in` via `_pick_worktree` (exact name, else the one name containing the text; none/several → exit 1 listing them); `--in-scratch` (hidden alias `--in-temp`, its first name) the project's scratch directory, reporting `needs_trust` (JSON) plus a stderr hint when `claude.trust.is_trusted` says Claude Code has not trusted it yet. The name is `next_session_name(..., fallback="chat")` against every tmux session, every record and every worktree name. A fresh `--session-id`, `--prompt`, and — unless the launch options already set one (`_peer_name_in`) — an unsaved `--name <project>-<chat name>` in `extra_args`, so the JSON's `peer_name` is a real address before the process registers. `--parent` goes onto the *record* (`mark_open(parent_session=…)`), since a chat has no `meta.json`. `chat --detach` is dispatched before `_check_prerequisites`, so with `--project` it works from outside any repo; attached, it is the launch loop's `initial_target` like `new`.
+- `fujimoto broadcast <send|status|show|enable|disable|add-signer|remove-signer|set-key>` (`_run_broadcast_command`) runs before the prerequisite check, like the query commands, mapping `BroadcastError`/`OSError` to exit 1. Logic and text output live in `broadcast.py`; the config subcommands go through `_broadcast_config_change`, which reads `broadcast.load_config(strict=True)` and writes `broadcast.save_config` (the global config's `broadcast` key, via `update_global_key`). `send` with no scope flag targets the cwd's project (`get_project_name`), outside a repo it is an error. `_start_launch` calls `broadcast.launch_args(project, working_dir, claude_args)` **after** `_launch_claude_args`, so the hooks are never saved as a session's launch options.
 - `fujimoto agent-instructions` prints `templates/agent_instructions.md` (`session_query.agent_instructions()`, via `importlib.resources`) — a slim guide for agents to the session commands and when to use them. **Keep it in step with the CLI**: `TestAgentInstructions.test_every_example_parses` runs every `fujimoto …` line in it through `_build_parser()` (the parser, extracted from `main()` for exactly this), and `test_stays_generic` checks the only ticket key in this shipped file is the `ABC-123` placeholder. Examples must stay synthetic (`ABC-123`, `8f0e2c1a`).
 - `fujimoto pane <vscode|terminal> --session <name>` dispatches to `_run_pane_command`, used by the in-session tmux key table (`Ctrl-A v` / `Ctrl-A w`). Resolves the session's working directory via `tmux display-message -p '#{session_path}'` and calls the existing `open_vscode` / `open_terminal` helpers; errors are surfaced via `tmux display-message` so they appear in the session's status bar.
 
@@ -372,7 +374,9 @@ longer creates them; `fujimoto resume` still uses one for a transcript whose
 
 **`global_config.py`** — `~/.config/fujimoto/config.yaml` (`$XDG_CONFIG_HOME`
 moves it; `global_config_path()`). Pydantic `GlobalConfig(extra="forbid")` with
-`model` and `quick_terminal`. `load_global_config()` has the same contract as
+`model`, `quick_terminal` and `broadcast` (`BroadcastConfig`: `enabled`,
+`signers: list[SignerConfig(name, public_key)]`, `signing_key`; managed by
+`fujimoto broadcast`, not the `config` registry). `load_global_config()` has the same contract as
 `load_project_config`: missing file → empty, malformed → `ConfigError`.
 `update_global_key(key, value, remove=)` writes through `yaml_edit`. Runtime
 state stays in `~/.cache/fujimoto/`; only user choices belong here.
@@ -472,7 +476,9 @@ pydantic):
   failure. `model` (optional) is the project's default model (see
   `launch_options.default_model`). `claude_args` (default `[]`) is the
   project's default launch options; a single string is `shlex.split` by a `field_validator`, so both
-  `claude_args: [--a, b]` and `claude_args: --a b` work.
+  `claude_args: [--a, b]` and `claude_args: --a b` work. `broadcast` (default
+  `True`) can only opt a project *out* of `fujimoto broadcast` — trust (the
+  signers) is global config so a repo cannot name its own key.
 - `load_project_config(project_root)` — returns an empty config if the file is
   absent; raises `ConfigError` (reusing `config.ConfigError`) on malformed YAML
   or validation failure (config errors are surfaced, not swallowed).
@@ -584,6 +590,71 @@ holds `pid`, `sessionId`, `cwd`, `name` (the peer address), `status`
 every field defensively, skips files without an int `pid` and a `sessionId`,
 and drops entries whose pid is gone (`pid_alive`; `PermissionError` counts as
 alive) — a crashed process leaves its file behind.
+
+**`broadcast.py`** — `fujimoto broadcast`: one signed message to every
+listening session (or one project's), delivered by documented Claude Code
+hooks. Imported by the per-session waiter, so it keeps to stdlib + `debug`
+at module scope (`global_config`, `claude.live`, `git`, `project_config`
+lazily).
+- **Config** (`load_config` / `save_config`): the `broadcast` section of the
+  global config (`BroadcastConfig` in `global_config.py`) as
+  `BroadcastSettings(enabled, signers: list[Signer], signing_key)`. Fails
+  closed: an invalid config file reads as disabled (`strict=True` raises
+  instead, for the CLI), and a signer whose name or key does not validate is
+  dropped (`broadcast.config_signer_skipped`), never trusted.
+- **Payload** (`Payload`): `v`, `id`, `project` (`None` = all), `created`,
+  `expires`, `message`, serialized with sorted keys. `check_time` rejects
+  expired, future-dated (beyond `CLOCK_SKEW`) and over-`MAX_TTL` (24h)
+  payloads; `covers(project)` is the scope test.
+- **Signing**: `ssh-keygen -Y sign`/`-Y find-principals`/`-Y verify` in the
+  `fujimoto-broadcast` namespace, with an `allowed_signers` file written to a
+  temp dir per call and every line restricted to that namespace.
+  `resolve_signing_key` takes a key path (public → agent signs, private →
+  file signs) or a literal public key, or with neither picks the first
+  `ssh-add -L` key that is a configured signer. `verify` returns the signer
+  *name* from `find-principals`, never from the payload. `send` verifies its
+  own signature before posting, so a key that isn't a signer fails at the
+  sender instead of in every session. `submit` posts a payload signed
+  elsewhere (`send --signed FILE`, signature at `FILE.sig`).
+- **Mailbox** `~/.cache/fujimoto/broadcast/` (`messages/`, `receipts/`,
+  `state/`, all 0700): entries are `<arrival-ns>-<payload id>.json` + `.sig`,
+  written signature-first via temp + `os.replace` so a waiter never sees half
+  a pair. Reads go through `_read_private_file` (O_NOFOLLOW, owner, size).
+  `prune` drops entries and receipts `PRUNE_AFTER` (1 day) past expiry.
+- **Waiter** (`python -m fujimoto.broadcast wait --signers TOKEN [--project
+  P] [--debug|--debug-redacted]`, `main` → `wait`): the hook command, built by
+  `hook_command` with `sys.executable`. The signers are base64 JSON *in the
+  command line* (`encode_signers`), so a running session's trust can't be
+  changed by editing a file. It takes an exclusive lock
+  `state/<claude pid>.lock` (`_take_lock`; a dead holder's lock is taken
+  over), keyed by `find_claude_pid` — the nearest ancestor with a Claude
+  registry file — so `/clear` (new session id, same process) cannot give a
+  process two waiters. State `state/<key>.json` holds the high-water `mark`
+  (mailbox entry name) and the delivered payload ids; a `SessionStart` with
+  `source: startup` resets the mark to "now", so new sessions don't replay old
+  broadcasts. Each poll (`POLL_INTERVAL` 1s) runs `check_entry` on entries past
+  the mark: out-of-scope is skipped silently, a delivery or rejection writes a
+  `Receipt` (`receipts/<entry>/<session id>.json`). Delivery exits
+  `EXIT_DELIVER` (2) with `render()`'s text on stderr. Lock files double as
+  the listener list (`list_listeners`), which `send` uses to know how many
+  receipts to wait for.
+- **Launch** (`launch_args`): adds `--settings` with `hook_settings` (the
+  waiter as `SessionStart` and `Stop` hooks, `async` + `asyncRewake`,
+  `timeout=HOOK_TIMEOUT` 7 days) when the global config's `broadcast.enabled`, there is
+  at least one signer, and the project's `.fujimoto.yaml` doesn't say
+  `broadcast: false`. `merge_settings_args` merges into an existing
+  `--settings` (inline JSON, `--settings=`, or a file relative to the
+  working dir) — see the gotcha below. It never raises: a failure is logged
+  (`broadcast.launch included=False reason=…`) and printed, and the session
+  launches without broadcast.
+- Output: `format_send`/`send_json`, `format_status`/`status_json`,
+  `format_show`/`show_json`.
+- Instrumented as `broadcast.ssh_keygen` (op, rc), `broadcast.signing_key`
+  (`via=path|literal|agent`), `broadcast.posted`, `broadcast.sent`,
+  `broadcast.pruned`, `broadcast.launch`, `broadcast.wait` (`armed`,
+  `already-armed`, `error`) and `broadcast.wait_entry` (outcome + reason). The
+  waiter only logs when the launching fujimoto ran with `--debug`, which
+  `launch_args` passes through to the hook command.
 
 **`launch_options.py`** — Extra `claude` CLI arguments ("launch options") per
 session:
@@ -1423,6 +1494,37 @@ Things discovered during development that are easy to forget:
   why the launch-options binding is `shift+enter,o`: `o` is the fallback that
   works everywhere a list has focus (an `Input` types it instead).
 - **OSC escape writes during a Textual run must go to `sys.__stdout__`, not `sys.stdout`.** Textual replaces `sys.stdout` with an internal capture while the app runs, so an OSC sequence (e.g. the `set_terminal_title` iTerm2/window-title escape) written to `sys.stdout` from inside a running app — such as `_init_git_info` updating the title on project switch — never reaches the terminal. `sys.__stdout__` stays connected to the real tty, so writing there works both before and during `app.run()`. This is why the session-manager title set at `main()` (pre-run) worked but the in-app update initially did not.
+
+## Broadcast gotchas
+
+Verified with live sessions while building `fujimoto broadcast` (Claude Code
+2.1.329):
+
+- **`asyncRewake` + exit 2 wakes an idle session**, as documented; a busy one
+  queues it (`queue-operation` … `absorbed_mid_turn`) and handles it after the
+  current tool call, not at the end of the task; a session on a permission
+  prompt queues it without answering the prompt. A broadcast never bypasses
+  tool permissions.
+- **Claude Code enforces `timeout` on an `asyncRewake` hook, and the kill is
+  silent** (SIGKILL: no `finally`, a stale lock, nothing in the session). The
+  message isn't lost — the next `Stop` re-arms a waiter, which delivers from
+  its saved mark — but it is late. Hence the 7-day timeout and the dead-lock
+  takeover. A timeout above the 600s default is honoured (checked at 12.5 min).
+- **The delivered text is framed as `[SYSTEM NOTIFICATION - NOT USER INPUT]
+  … Stop hook blocking error from command "Stop": …`** (even for the
+  `SessionStart` hook). Sessions still act on it; the "signed by" preamble is
+  what earns that, and the signature is what makes it true.
+- **Wording matters.** "Reply with X and nothing else" made a busy session drop
+  the answer to the question it was working on. The preamble says "at the next
+  safe stopping point in your current work" — "finish your current work first"
+  would mean hours on a long task.
+- **`claude` keeps only the last `--settings`.** Two flags each adding a
+  `SessionStart` hook ran only the second. Hence `merge_settings_args`.
+- **Hooks don't run until the folder's trust dialog is accepted.**
+- **An SSH agent may remember an approval.** 1Password asked for a fingerprint
+  on the first `-Y sign` and not on the second (0.11s), so a process in the
+  same session can sign until the approval lapses. Documented in the README's
+  security model; a hardware key with touch-per-use closes it.
 
 ## Releases
 

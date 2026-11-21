@@ -113,6 +113,7 @@ from fujimoto.vscode import open_vscode
 from fujimoto.global_config import load_global_config
 from fujimoto.settings import Settings, load_settings, save_settings
 from fujimoto import chats, config_command, session_query, session_state
+from fujimoto import broadcast
 from fujimoto.session_query import relative_time as _relative_time
 from fujimoto.session_state import StopKind
 from fujimoto.tmux import (
@@ -6551,6 +6552,9 @@ def _start_launch(target: LaunchTarget, *, attach: bool = True) -> str | None:
         # the same one however it was started or resumed. Not saved as a
         # launch option, so renaming the chat renames the address too.
         claude_args += ("--name", _chat_peer_name(project_name, resolved_name))
+    # Broadcast hooks are added here too, after the options were saved, so
+    # they are never stored as one of the session's own options.
+    claude_args = broadcast.launch_args(project_name, working_dir, claude_args)
     launch_claude_in_tmux(
         project_name,
         working_dir,
@@ -7402,6 +7406,195 @@ def _non_negative(value: str) -> int:
     return number
 
 
+def _add_broadcast_command(sub: argparse._SubParsersAction) -> None:
+    """`broadcast`: signed messages to every listening session (`broadcast.py`)."""
+    bc = sub.add_parser(
+        "broadcast",
+        help="Send a signed message to running fujimoto sessions",
+        description=(
+            "Send a signed message that every listening fujimoto session (or "
+            "one project's) acts on at its next safe stopping point. Off until "
+            "`fujimoto broadcast enable` and at least one `add-signer`."
+        ),
+    )
+    bsub = bc.add_subparsers(dest="broadcast_command", required=True)
+    send = bsub.add_parser(
+        "send",
+        help="Sign and send a broadcast",
+        usage=(
+            "fujimoto broadcast send (TEXT | --signed FILE) "
+            "[--project NAME | --all-projects] [--ttl 1h] [--key KEY] "
+            "[--wait SECS] [--json]"
+        ),
+    )
+    send.add_argument("text", nargs="?", help="The message")
+    send.add_argument(
+        "--signed",
+        metavar="FILE",
+        help="Send a payload signed elsewhere; its signature is FILE.sig",
+    )
+    scope = send.add_mutually_exclusive_group()
+    scope.add_argument("--project", metavar="NAME", help="Only this project's sessions")
+    scope.add_argument(
+        "--all-projects", action="store_true", help="Every listening session"
+    )
+    send.add_argument(
+        "--ttl", default="1h", help="How long it stays valid (default 1h)"
+    )
+    send.add_argument("--key", help="Signing key: a key path or a literal public key")
+    send.add_argument(
+        "--wait",
+        type=float,
+        default=5.0,
+        metavar="SECS",
+        help="How long to wait for delivery receipts (default 5)",
+    )
+    send.add_argument("--json", action="store_true")
+    status = bsub.add_parser("status", help="Recent broadcasts and who received them")
+    status.add_argument("id", nargs="?", help="A broadcast id (or part of one)")
+    status.add_argument("--json", action="store_true")
+    show = bsub.add_parser("show", help="Configuration and listening sessions")
+    show.add_argument("--json", action="store_true")
+    bsub.add_parser(
+        "enable", help="Give sessions launched from now on the broadcast hooks"
+    )
+    bsub.add_parser("disable", help="Stop giving new sessions the broadcast hooks")
+    add = bsub.add_parser("add-signer", help="Trust a public key to sign broadcasts")
+    add.add_argument("name", help="A label, e.g. laptop or remote-agent")
+    add.add_argument("key", help="A literal public key or a path to a .pub file")
+    rm = bsub.add_parser("remove-signer", help="Stop trusting a signer")
+    rm.add_argument("name")
+    setkey = bsub.add_parser("set-key", help="The key `send` signs with")
+    setkey.add_argument(
+        "key",
+        nargs="?",
+        help="A key path or literal public key; omit to use the agent key matching a signer",
+    )
+
+
+def _broadcast_config_change(args: argparse.Namespace) -> str:
+    """Apply an enable/disable/add-signer/remove-signer/set-key; return the message."""
+    config = broadcast.load_config(strict=True)
+    cmd = args.broadcast_command
+    note = "Applies to sessions launched from now on."
+    if cmd == "enable":
+        config.enabled = True
+        msg = "Broadcast enabled. " + note
+        if not config.signers:
+            msg += (
+                "\nNo signers yet: add your key with `fujimoto broadcast add-signer`."
+            )
+    elif cmd == "disable":
+        config.enabled = False
+        msg = (
+            "Broadcast disabled. "
+            + note
+            + " Running sessions keep listening until relaunched."
+        )
+    elif cmd == "add-signer":
+        name = broadcast.validate_signer_name(args.name)
+        key = broadcast.normalize_public_key(args.key)
+        if any(s.name == name for s in config.signers):
+            raise broadcast.BroadcastError(f"a signer called {name} already exists")
+        config.signers.append(broadcast.Signer(name, key))
+        msg = f"Added signer {name}. " + note
+    elif cmd == "remove-signer":
+        before = len(config.signers)
+        config.signers = [s for s in config.signers if s.name != args.name]
+        if len(config.signers) == before:
+            raise broadcast.BroadcastError(f"no signer called {args.name}")
+        msg = (
+            f"Removed signer {args.name}. Sessions already running still trust "
+            "it until relaunched."
+        )
+    else:  # set-key
+        if args.key:
+            path = Path(args.key).expanduser()
+            config.signing_key = (
+                str(path)
+                if path.is_file()
+                else broadcast.normalize_public_key(args.key)
+            )
+            msg = f"`broadcast send` will sign with {config.signing_key}."
+        else:
+            config.signing_key = None
+            msg = "`broadcast send` will sign with the agent key matching a signer."
+    broadcast.save_config(config)
+    debug.log(
+        "cli.broadcast_config",
+        command=cmd,
+        enabled=config.enabled,
+        signers=len(config.signers),
+    )
+    return msg
+
+
+def _run_broadcast_command(args: argparse.Namespace) -> None:
+    """`fujimoto broadcast …`: dispatch, mapping `BroadcastError` to exit 1."""
+    cmd = args.broadcast_command
+    try:
+        if cmd == "send":
+            if bool(args.text) == bool(args.signed):
+                raise broadcast.BroadcastError("give either TEXT or --signed FILE")
+            if args.signed:
+                if args.project or args.all_projects:
+                    raise broadcast.BroadcastError(
+                        "--signed payloads carry their own scope; drop --project/--all-projects"
+                    )
+                payload_path = Path(args.signed)
+                result = broadcast.submit(
+                    payload_path.read_bytes(),
+                    Path(f"{args.signed}.sig").read_bytes(),
+                    wait=args.wait,
+                )
+            else:
+                if args.all_projects:
+                    project: str | None = None
+                elif args.project:
+                    project = args.project
+                else:
+                    try:
+                        project = get_project_name()
+                    except GitError as e:
+                        raise broadcast.BroadcastError(
+                            "not in a git repo: pass --project NAME or --all-projects"
+                        ) from e
+                result = broadcast.send(
+                    args.text,
+                    project,
+                    ttl=broadcast.parse_ttl(args.ttl),
+                    key=args.key,
+                    wait=args.wait,
+                )
+            print(
+                json.dumps(broadcast.send_json(result), indent=2)
+                if args.json
+                else broadcast.format_send(result)
+            )
+        elif cmd == "status":
+            rows = broadcast.status(args.id)
+            print(
+                json.dumps(broadcast.status_json(rows), indent=2)
+                if args.json
+                else broadcast.format_status(rows)
+            )
+        elif cmd == "show":
+            config = broadcast.load_config(strict=True)
+            print(
+                json.dumps(broadcast.show_json(config), indent=2)
+                if args.json
+                else broadcast.format_show(config)
+            )
+        else:
+            print(_broadcast_config_change(args))
+    except (broadcast.BroadcastError, OSError) as e:
+        debug.log("cli.broadcast_failed", command=cmd, detail=debug.rv(str(e)))
+        _finish_debug_log()
+        print(f"fujimoto: {e}", file=sys.stderr)
+        sys.exit(1)
+    _finish_debug_log()
+
+
 def _add_resume_commands(sub: argparse._SubParsersAction) -> None:
     """`resume` (start or reconnect a session by id) and `stop`."""
     resume = sub.add_parser(
@@ -7669,6 +7862,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_query_commands(sub)
     _add_resume_commands(sub)
     _add_config_commands(sub)
+    _add_broadcast_command(sub)
     new = sub.add_parser(
         "new",
         help="Create a worktree and launch Claude in it",
@@ -7809,6 +8003,9 @@ def main() -> None:
         return
     if args.command == "config":
         _run_config_command(args, claude_args)
+        return
+    if args.command == "broadcast":
+        _run_broadcast_command(args)
         return
     if args.command == "agent-instructions":
         print(session_query.agent_instructions(), end="")
