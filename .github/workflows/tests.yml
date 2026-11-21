@@ -36,7 +36,7 @@ jobs:
         run: |
           COVERAGE=$(uv run python -c "import json; print(int(json.load(open('coverage.json'))['totals']['percent_covered_display']))")
           uvx anybadge --value="$COVERAGE" --suffix="%" --file=coverage.svg --label=coverage \
-            --overwrite 50=red 60=orange 70=yellow 80=green 90=brightgreen
+            --overwrite 50=red 60=orange 70=yellow 80=yellow_green 90=green
 
       - name: Publish badge
         if: github.ref == 'refs/heads/main' && matrix.python-version == '3.13'
