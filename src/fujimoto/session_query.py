@@ -41,6 +41,7 @@ from fujimoto import debug, session_state
 from fujimoto.claude import live
 from fujimoto.claude import search as claude_search
 from fujimoto.claude.log_parser import (
+    INJECTED_PREFIXES,
     ClaudeLogError,
     ClaudeSession,
     TranscriptMessage,
@@ -59,6 +60,7 @@ from fujimoto.claude.search import (
     Snippet,
 )
 from fujimoto.config import (
+    META_DIR,
     ConfigError,
     get_chat_scratch_dir,
     get_git_projects_root,
@@ -91,13 +93,6 @@ TRANSCRIPT_ROLES = (
     INJECTED,
 )
 DEFAULT_ROLES = tuple(r for r in TRANSCRIPT_ROLES if r != INJECTED)
-_INJECTED_PREFIXES = (
-    "<task-notification>",
-    "<system-reminder>",
-    "<local-command-stdout>",
-    "<local-command-stderr>",
-    "<local-command-caveat>",
-)
 
 # Set by Claude Code in every shell it runs: the session issuing the command.
 CALLING_SESSION_ENV = "CLAUDE_CODE_SESSION_ID"
@@ -160,9 +155,14 @@ class Scope:
     # Other directories whose transcripts belong to the project: its chats'
     # shared scratch directory. Searched, but not worktrees.
     extra_dirs: tuple[Path, ...] = ()
+    # All projects because the command ran outside any repo with no scope
+    # flag, rather than because `--all-projects` asked for it.
+    outside_repo: bool = False
 
     def describe(self) -> str:
-        return "all projects" if self.all_projects else f"project {self.project}"
+        if not self.all_projects:
+            return f"project {self.project}"
+        return "all projects (not in a repo)" if self.outside_repo else "all projects"
 
 
 def _project_scope(root: Path) -> Scope:
@@ -208,7 +208,11 @@ def _project_scope(root: Path) -> Scope:
 
 
 def resolve_scope(
-    *, project: str | None, all_projects: bool, cwd: Path | None = None
+    *,
+    project: str | None,
+    all_projects: bool,
+    cwd: Path | None = None,
+    outside_repo_all: bool = False,
 ) -> Scope:
     """The search scope from `--project`, `--all-projects` or the cwd.
 
@@ -216,6 +220,10 @@ def resolve_scope(
     worktrees) or a project name under `$FUJIMOTO_GIT_ROOT`. Either way the
     project is the *main* clone, so searching from a worktree covers its
     siblings too.
+
+    With no flag and a cwd outside any repo there is no current project:
+    `outside_repo_all` (`search`, `list`) makes that every project, otherwise
+    (`chat`, which needs one project) it is a `QueryError`.
     """
     if all_projects:
         debug.log("query.scope", via="all")
@@ -245,6 +253,9 @@ def resolve_scope(
     try:
         root = get_main_worktree_root(path)
     except GitError as e:
+        if via == "cwd" and outside_repo_all:
+            debug.log("query.scope", via="all-outside-repo", path=debug.rp(path))
+            return Scope(all_projects=True, outside_repo=True)
         debug.log("query.scope", via=via, path=debug.rp(path), error="not-a-repo")
         if via == "cwd":
             raise QueryError(
@@ -290,8 +301,9 @@ class Locator:
 
     Within a project scope the answer comes from the scope itself, which also
     covers a worktree that has since been deleted. Across all projects it is
-    asked of git, which only works while the directory exists — so a deleted
-    worktree there has no project.
+    asked of git while the directory exists; for a deleted one, and for a
+    chat's scratch directory (not a repo), it is read from fujimoto's own
+    directory layout by `_layout_location`.
     """
 
     def __init__(self, scope: Scope) -> None:
@@ -314,22 +326,89 @@ class Locator:
             return Location(scope.project, scope.root, None)
 
         if not cwd.is_dir():
-            return Location(None, None, None)
+            location = _layout_location(cwd)
+            debug.log_capped(
+                "query.locate.layout",
+                "query.locate",
+                dedupe_key=str(cwd),
+                limit=5,
+                cwd=debug.rp(cwd),
+                outcome="deleted-layout" if location.project else "deleted-unknown",
+            )
+            return location
         try:
             root = get_main_worktree_root(cwd)
             top = get_repo_root(cwd)
         except GitError:
+            location = _layout_location(cwd)
             debug.log_capped(
                 "query.locate.failed",
                 "query.locate",
                 dedupe_key=str(cwd),
                 limit=5,
                 cwd=debug.rp(cwd),
-                outcome="not-a-repo",
+                outcome="layout" if location.project else "not-a-repo",
             )
-            return Location(None, None, None)
+            return location
         worktree = None if _same_path(top, root) else top
         return Location(root.name, root, worktree)
+
+
+def _layout_location(cwd: Path) -> Location:
+    """Where a directory git cannot answer for sits in fujimoto's layout.
+
+    Three places are recognised, all by path alone (the directory may be gone):
+
+    * `$FUJIMOTO_WORKTREE_ROOT/<project>/<worktree>/…`
+    * `<project root>/.fujimoto/worktrees/<worktree>/…` (no worktree root set)
+    * `~/.fujimoto/chats/<project>/…` — a chat's scratch directory, which
+      belongs to the project but no worktree.
+
+    The project root is the in-project one, else `$FUJIMOTO_GIT_ROOT/<project>`
+    when that exists, else unknown.
+    """
+    target = Path(os.path.normpath(cwd))
+    scratch_base = get_chat_scratch_dir("x", create=False).parent
+    parts = _parts_under(target, scratch_base)
+    if parts:
+        return Location(parts[0], _project_root_for(parts[0]), None)
+
+    raw = os.environ.get("FUJIMOTO_WORKTREE_ROOT")
+    if raw:
+        parts = _parts_under(target, Path(raw).expanduser())
+        if parts and len(parts) >= 2:
+            base = Path(raw).expanduser() / parts[0]
+            return Location(parts[0], _project_root_for(parts[0]), base / parts[1])
+
+    meta = (META_DIR, "worktrees")
+    all_parts = target.parts
+    for i in range(1, len(all_parts) - 2):
+        if all_parts[i : i + 2] == meta:
+            root = Path(*all_parts[:i])
+            return Location(root.name, root, Path(*all_parts[: i + 3]))
+    return Location(None, None, None)
+
+
+def _parts_under(target: Path, base: Path) -> tuple[str, ...]:
+    """`target`'s path parts below `base`, or () when it is not under it.
+
+    Both spellings of `base` are tried, as given and resolved, since a
+    transcript records whichever one the shell was in (`/tmp` vs
+    `/private/tmp`).
+    """
+    for candidate in {Path(os.path.normpath(base)), _resolved(base)}:
+        try:
+            return target.relative_to(candidate).parts
+        except ValueError:
+            continue
+    return ()
+
+
+def _project_root_for(project: str) -> Path | None:
+    git_root = get_git_projects_root()
+    if git_root is not None and (git_root / project).is_dir():
+        return git_root / project
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -579,6 +658,24 @@ class SearchReport:
     sort: SortOrder = SortOrder.RECENT
 
 
+def _scope_logs(scope: Scope) -> list[Path]:
+    """The scope's transcripts, newest (by mtime) first."""
+    if scope.all_projects:
+        return claude_search.list_all_session_logs()
+    return claude_search.list_session_logs(
+        scope.root, (*scope.worktrees, *scope.extra_dirs)
+    )
+
+
+def _scope_json(scope: Scope) -> dict[str, object]:
+    return {
+        "all_projects": scope.all_projects,
+        "outside_repo": scope.outside_repo,
+        "project": scope.project,
+        "project_root": str(scope.root) if scope.root else None,
+    }
+
+
 def calling_session_id() -> str | None:
     """The Claude session running this command, if any.
 
@@ -618,12 +715,7 @@ def run_search(
     except SearchError as e:
         raise QueryError(str(e)) from e
 
-    if scope.all_projects:
-        logs = claude_search.list_all_session_logs()
-    else:
-        logs = claude_search.list_session_logs(
-            scope.root, (*scope.worktrees, *scope.extra_dirs)
-        )
+    logs = _scope_logs(scope)
 
     hits: list[SearchHit] = []
     excluded = False
@@ -717,11 +809,7 @@ def search_json(report: SearchReport) -> dict[str, object]:
         "regex": report.regex,
         "case_sensitive": report.case_sensitive,
         "mode": report.mode.value,
-        "scope": {
-            "all_projects": scope.all_projects,
-            "project": scope.project,
-            "project_root": str(scope.root) if scope.root else None,
-        },
+        "scope": _scope_json(scope),
         "total_logs": report.total_logs,
         "scanned": report.scanned,
         "truncated": report.truncated,
@@ -817,6 +905,200 @@ def format_search(report: SearchReport, *, color: bool = False) -> str:
 
 
 # --------------------------------------------------------------------------
+# List
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ListedSession:
+    session: ClaudeSession
+    location: Location
+    activity: Activity
+
+
+@dataclass(frozen=True)
+class ListReport:
+    scope: Scope
+    total_logs: int
+    scanned: int
+    # Transcripts read but not listable (empty, or no parseable entries).
+    unreadable: int
+    # The limit was reached with transcripts left unread.
+    truncated: bool
+    running_only: bool
+    sessions: tuple[ListedSession, ...]
+    # The session running this command, marked in the listing (not left out:
+    # unlike a search, a listing that skipped it would just look incomplete).
+    calling_session: str | None = None
+
+
+def run_list(
+    scope: Scope,
+    *,
+    limit: int = DEFAULT_LIMIT,
+    running_only: bool = False,
+    calling_session: str | None = None,
+    activity: ActivityIndex | None = None,
+) -> ListReport:
+    """The scope's sessions, most recently used first, stopping at `limit`.
+
+    Transcripts are read in mtime order, so the first `limit` that parse are
+    the newest and the rest are never opened. `limit=0` lists everything.
+    `running_only` keeps only sessions `ActivityIndex` says are live — it still
+    reads transcripts in order until `limit` of those are found.
+    """
+    logs = _scope_logs(scope)
+    index = activity or ActivityIndex.gather()
+    locator = Locator(scope)
+    listed: list[ListedSession] = []
+    scanned = unreadable = 0
+    for log in logs:
+        if limit and len(listed) >= limit:
+            break
+        scanned += 1
+        try:
+            session = parse_session(log)
+        except ClaudeLogError:
+            unreadable += 1
+            continue
+        state = index.for_session(session.session_id, session.cwd)
+        if running_only and not state.running:
+            continue
+        listed.append(ListedSession(session, locator.locate(session.cwd), state))
+    listed.sort(key=lambda s: s.session.last_activity, reverse=True)
+    truncated = scanned < len(logs)
+    debug.log(
+        "query.list",
+        scope="all" if scope.all_projects else "project",
+        outside_repo=scope.outside_repo,
+        logs=len(logs),
+        scanned=scanned,
+        unreadable=unreadable,
+        listed=len(listed),
+        truncated=truncated,
+        limit=limit,
+        running_only=running_only,
+        running=sum(1 for s in listed if s.activity.running),
+    )
+    return ListReport(
+        scope=scope,
+        total_logs=len(logs),
+        scanned=scanned,
+        unreadable=unreadable,
+        truncated=truncated,
+        running_only=running_only,
+        sessions=tuple(listed),
+        calling_session=calling_session,
+    )
+
+
+def list_json(report: ListReport) -> dict[str, object]:
+    return {
+        "scope": _scope_json(report.scope),
+        "total_logs": report.total_logs,
+        "scanned": report.scanned,
+        "unreadable": report.unreadable,
+        "truncated": report.truncated,
+        "running_only": report.running_only,
+        "sessions": [
+            {
+                **_session_json(s.session, s.location, s.activity),
+                "this_session": s.session.session_id == report.calling_session,
+            }
+            for s in report.sessions
+        ],
+    }
+
+
+_SHORT_ID = 8
+_LABEL_WIDTH_CAP = 56
+
+
+def _list_activity(activity: Activity) -> str:
+    """The short form of a running session's whereabouts: its address.
+
+    >>> _list_activity(Activity(running=True, status="idle", peer_name="p",
+    ...                         tmux_session="proj/wt", pid=1))
+    'idle · peer p'
+    >>> _list_activity(Activity(running=True, tmux_session="proj/wt"))
+    'running · tmux proj/wt'
+    >>> _list_activity(NOT_RUNNING)
+    ''
+    """
+    if not activity.running:
+        return ""
+    where = (
+        f"peer {activity.peer_name}"
+        if activity.peer_name
+        else f"tmux {activity.tmux_session}"
+        if activity.tmux_session
+        else None
+    )
+    parts = [activity.status or "running"]
+    if where:
+        parts.append(where)
+    return " · ".join(parts)
+
+
+def format_list(report: ListReport) -> str:
+    """One row per session (where, when, id, address) and its title under it."""
+    scope = report.scope.describe()
+    if not report.sessions:
+        what = "running sessions" if report.running_only else "sessions"
+        return f"No {what} in {report.total_logs} transcripts ({scope})."
+
+    rows: list[tuple[str, str, str, str, str]] = []
+    for item in report.sessions:
+        session = item.session
+        label = item.location.label(session.cwd)
+        if not session.cwd.is_dir():
+            label += " (deleted)"
+        notes = [_list_activity(item.activity)]
+        if session.session_id == report.calling_session:
+            notes.append("this session")
+        rows.append(
+            (
+                "●" if item.activity.running else "○",
+                label,
+                relative_time(session.last_activity),
+                session.session_id[:_SHORT_ID],
+                " · ".join(n for n in notes if n),
+            )
+        )
+    # One long label (a scratch path) must not push every row off screen.
+    label_width = min(max(len(r[1]) for r in rows), _LABEL_WIDTH_CAP)
+    when_width = max(len(r[2]) for r in rows)
+
+    lines: list[str] = []
+    for item, (marker, label, when, short_id, note) in zip(report.sessions, rows):
+        line = f"{marker} {label:<{label_width}}  {when:<{when_width}}  {short_id}"
+        lines.append(f"{line}  {note}" if note else line)
+        lines.append(f"    {_title(item.session) or '(no prompt yet)'}")
+
+    count = len(report.sessions)
+    noun = "running session" if report.running_only else "session"
+    footer = f"{count} {noun}{'s' if count != 1 else ''} · {scope}"
+    if not report.running_only:
+        running = sum(1 for s in report.sessions if s.activity.running)
+        if running:
+            footer += f" · {running} running"
+    if report.truncated:
+        footer += (
+            f" · newest {report.scanned} of {report.total_logs} transcripts read"
+            " (-n 0 for all)"
+        )
+    if report.unreadable:
+        footer += f" · {_plural(report.unreadable, 'empty transcript')} skipped"
+    lines.append("")
+    lines.append(footer)
+    lines.append(
+        "Next: fujimoto log <id> --summary · fujimoto resume <id> · "
+        "fujimoto search QUERY"
+    )
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
 # Log
 # --------------------------------------------------------------------------
 
@@ -870,7 +1152,7 @@ def _classify(message: TranscriptMessage) -> TranscriptMessage:
     >>> _classify(TranscriptMessage("assistant", "<system-reminder>", ts)).role
     'assistant'
     """
-    if message.role == "user" and message.text.lstrip().startswith(_INJECTED_PREFIXES):
+    if message.role == "user" and message.text.lstrip().startswith(INJECTED_PREFIXES):
         return replace(message, role=INJECTED)
     return message
 

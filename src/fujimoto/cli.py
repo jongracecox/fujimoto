@@ -7207,7 +7207,9 @@ def _run_search_command(args: argparse.Namespace) -> None:
     """`fujimoto search`: transcript search for scripts, agents and people."""
     try:
         scope = session_query.resolve_scope(
-            project=args.project, all_projects=args.all_projects
+            project=args.project,
+            all_projects=args.all_projects,
+            outside_repo_all=True,
         )
         report = session_query.run_search(
             args.query,
@@ -7230,6 +7232,31 @@ def _run_search_command(args: argparse.Namespace) -> None:
     else:
         color = session_query.use_color(sys.stdout)
         print(session_query.format_search(report, color=color))
+    _finish_debug_log()
+
+
+def _run_list_command(args: argparse.Namespace) -> None:
+    """`fujimoto list`: the sessions in a project, or on the whole machine."""
+    try:
+        scope = session_query.resolve_scope(
+            project=args.project,
+            all_projects=args.all_projects,
+            outside_repo_all=True,
+        )
+        report = session_query.run_list(
+            scope,
+            limit=args.limit,
+            running_only=args.running,
+            calling_session=session_query.calling_session_id(),
+        )
+    except session_query.QueryError as e:
+        _finish_debug_log()
+        print(f"fujimoto: {e}", file=sys.stderr)
+        sys.exit(1)
+    if args.json:
+        print(session_query.dump_json(session_query.list_json(report)))
+    else:
+        print(session_query.format_list(report))
     _finish_debug_log()
 
 
@@ -7466,7 +7493,7 @@ def _add_resume_commands(sub: argparse._SubParsersAction) -> None:
 
 
 def _add_query_commands(sub: argparse._SubParsersAction) -> None:
-    """The read-only `search`, `log` and `agent-instructions` subcommands."""
+    """The read-only `search`, `list`, `log` and `agent-instructions` subcommands."""
     sub.add_parser(
         "agent-instructions",
         help="Print a guide to the session tools, written for AI agents",
@@ -7482,8 +7509,9 @@ def _add_query_commands(sub: argparse._SubParsersAction) -> None:
         description=(
             "Search Claude session transcripts for the current project (the "
             "repo containing the current directory, plus its worktrees), "
-            "newest first. Each hit names the session, its worktree, whether "
-            "it is running, and snippets of the matching text."
+            "newest first; outside any repo, every project. Each hit names "
+            "the session, its worktree, whether it is running, and snippets "
+            "of the matching text."
         ),
     )
     search.add_argument("query", help="Text to find (a regex with --regex)")
@@ -7539,6 +7567,41 @@ def _add_query_commands(sub: argparse._SubParsersAction) -> None:
         ),
     )
     search.add_argument("--json", action="store_true", help="Print JSON")
+
+    listing = sub.add_parser(
+        "list",
+        help="List sessions, newest first",
+        description=(
+            "List Claude sessions for the current project (the repo containing "
+            "the current directory, plus its worktrees), newest first; outside "
+            "any repo, every project. Each row gives the project/worktree, when "
+            "it was last used, the session id, whether it is running (with its "
+            "peer name), and its title."
+        ),
+    )
+    list_where = listing.add_mutually_exclusive_group()
+    list_where.add_argument(
+        "--project",
+        metavar="NAME|PATH",
+        help="List this project: a path inside it, or a name under $FUJIMOTO_GIT_ROOT",
+    )
+    list_where.add_argument(
+        "--all-projects",
+        action="store_true",
+        help="List every session on this machine",
+    )
+    listing.add_argument(
+        "-n",
+        "--limit",
+        type=_non_negative,
+        default=session_query.DEFAULT_LIMIT,
+        metavar="N",
+        help=f"Show the newest N sessions (default {session_query.DEFAULT_LIMIT}; 0 = all)",
+    )
+    listing.add_argument(
+        "--running", action="store_true", help="Only sessions that are running now"
+    )
+    listing.add_argument("--json", action="store_true", help="Print JSON")
 
     log = sub.add_parser(
         "log",
@@ -7800,6 +7863,9 @@ def main() -> None:
         return
     if args.command == "search":
         _run_search_command(args)
+        return
+    if args.command == "list":
+        _run_list_command(args)
         return
     if args.command == "log":
         _run_log_command(args)
