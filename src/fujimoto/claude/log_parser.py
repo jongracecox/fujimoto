@@ -15,6 +15,19 @@ class ClaudeLogError(Exception):
     pass
 
 
+# Text Claude Code injects into "user" entries that nobody typed: background
+# task notifications, system reminders (which carry CLAUDE.md and other
+# context), slash-command output. `log` re-roles a message that starts with
+# one of these as `injected`; message-text search skips it.
+INJECTED_PREFIXES = (
+    "<task-notification>",
+    "<system-reminder>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<local-command-caveat>",
+)
+
+
 class EntryType(StrEnum):
     ASSISTANT = "assistant"
     USER = "user"
