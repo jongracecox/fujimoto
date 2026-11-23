@@ -30,6 +30,7 @@ from fujimoto.session_query import (
     format_search,
     list_json,
     load_log,
+    load_log_waiting,
     log_json,
     relative_time,
     resolve_scope,
@@ -1480,3 +1481,111 @@ class TestListJson:
         assert row["cwd_exists"] is False
         assert row["this_session"] is True
         assert row["active"] == {"running": False}
+
+
+# -- Incremental reads: --after, --reply-to, --wait --
+
+
+def _delivered(msg_id: str) -> str:
+    return (
+        "<task-notification>\n<summary>Stop hook feedback</summary>\n</task-notification>\n"
+        '<system-reminder>\nStop hook blocking error from command "Stop": '
+        f"Message from the user (via fujimoto, signed by laptop, id {msg_id}). "
+        "Deal with this at the next safe stopping point in your current work.\n\nstatus?\n"
+        "</system-reminder>"
+    )
+
+
+class TestIncremental:
+    def test_cursor_and_after(self, tmp_path: Path) -> None:
+        _chat(
+            tmp_path,
+            ("user", "a"),
+            ("assistant", "b"),
+            ("user", "c"),
+            ("assistant", "d"),
+        )
+        report = load_log("chat", activity=_index())
+        assert report.cursor == 3
+        assert log_json(report)["cursor"] == 3
+        assert "cursor:   3" in format_log(report)
+        later = load_log("chat", after=1, activity=_index())
+        assert [i for i, _ in later.messages or ()] == [2, 3]
+        assert load_log("chat", after=3, activity=_index()).shown == 0
+
+    def test_reply_to_finds_the_delivery_and_stops_at_the_next_turn(
+        self, tmp_path: Path
+    ) -> None:
+        _chat(
+            tmp_path,
+            ("user", "work on it"),
+            ("assistant", "working"),
+            ("user", _delivered("20261123T010203-aaaa1111")),
+            ("assistant", "status: half done"),
+            ("assistant", "carrying on"),
+            ("user", "next question"),
+            ("assistant", "not part of the reply"),
+        )
+        report = load_log(
+            "chat", reply_to="20261123T010203-aaaa1111", activity=_index()
+        )
+        assert report.delivered_index == 2
+        assert [m.text for _, m in report.messages or ()] == [
+            "status: half done",
+            "carrying on",
+        ]
+        data = log_json(report)
+        assert (
+            data["reply_to"] == "20261123T010203-aaaa1111"
+            and data["delivered_index"] == 2
+        )
+        assert "delivered at #2" in format_log(report)
+
+    def test_reply_to_not_yet_delivered(self, tmp_path: Path) -> None:
+        _chat(
+            tmp_path,
+            ("user", _delivered("20261123T010203-aaaa1111")),
+            ("assistant", "x"),
+        )
+        report = load_log("chat", reply_to="20261123T010203-bbbb", activity=_index())
+        assert report.delivered_index is None and report.shown == 0
+        assert "not delivered yet" in format_log(report)
+
+    def test_reply_to_with_after(self, tmp_path: Path) -> None:
+        _chat(
+            tmp_path,
+            ("user", _delivered("m-1")),
+            ("assistant", "first"),
+            ("assistant", "second"),
+        )
+        report = load_log("chat", reply_to="m-1", after=1, activity=_index())
+        assert [m.text for _, m in report.messages or ()] == ["second"]
+
+    def test_raw_fallback_after_and_reply_to(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        log = _chat(tmp_path, ("user", "a"), ("assistant", "b"))
+
+        def boom(path: Path) -> list:
+            raise ValueError("odd entry")
+
+        monkeypatch.setattr("fujimoto.session_query.read_transcript", boom)
+        assert [i for i, _ in load_log(str(log), after=0).lines or ()] == [1]
+        assert load_log(str(log), reply_to="x").lines == ()
+
+    def test_waiting(self) -> None:
+        reports = iter([type("R", (), {"shown": 0})(), type("R", (), {"shown": 2})()])
+        ticks = iter([0.0, 0.0, 0.5, 0.5])
+        slept: list[float] = []
+        got = load_log_waiting(
+            lambda: next(reports), wait=5, sleep=slept.append, clock=lambda: next(ticks)
+        )  # type: ignore[arg-type,return-value]
+        assert got.shown == 2 and slept == [1.0]
+        ticks2 = iter([0.0, 0.0, 99.0, 99.0])
+        empty = load_log_waiting(
+            lambda: type("R", (), {"shown": 0})(),
+            wait=1,
+            sleep=lambda _: None,
+            clock=lambda: next(ticks2),
+        )  # type: ignore[arg-type,return-value]
+        assert empty.shown == 0

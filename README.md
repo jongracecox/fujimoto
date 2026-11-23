@@ -672,8 +672,9 @@ Delivered to 3 of 3 listening sessions:
 
 Each session receives:
 
-> Broadcast from the user (via fujimoto, signed by laptop). Deal with this at
-> the next safe stopping point in your current work.
+> Broadcast from the user (via fujimoto, signed by laptop, id
+> 20261120T220102-3f9a1c2e). Deal with this at the next safe stopping point in
+> your current work.
 >
 > Send me a summary of this session's state and any outstanding actions or
 > decisions in Slack.
@@ -705,13 +706,17 @@ a file into the mailbox is not enough to send one (see
 
    Or create the key in your password manager and use its public key.
 
-2. **Trust it** (give it a name — it is shown to every session as "signed by
-   NAME"):
+2. **Trust it** as a `user` signer — your own key, so sessions read its
+   messages as "from the user … signed by NAME":
 
    ```sh
-   fujimoto broadcast add-signer laptop ~/.ssh/fujimoto_broadcast.pub
-   # or a literal key: fujimoto broadcast add-signer laptop "ssh-ed25519 AAAA…"
+   fujimoto broadcast add-signer laptop ~/.ssh/fujimoto_broadcast.pub --role user
+   # or a literal key: fujimoto broadcast add-signer laptop "ssh-ed25519 AAAA…" --role user
    ```
+
+   A signer is an `agent` by default — for an agent acting on your behalf
+   (see [Agents as senders](#agents-as-senders)). `fujimoto broadcast set-role
+   NAME user|agent` changes it later, for sessions launched afterwards.
 
 3. **Say which key `send` signs with** — optional. Without this, fujimoto
    uses the first key in your SSH agent that is a trusted signer, which is
@@ -812,11 +817,57 @@ fujimoto broadcast send --signed msg.json   # reads msg.json.sig alongside
 ```
 
 `project` is a project name or `null` for all; `id` is letters, digits and
-`-`; the lifetime is at most 24h. The bytes are verified exactly as signed.
+`-`; the lifetime is at most 24h. An agent signer may add
+`"approval": "what the user approved"` (see [Agents as senders](#agents-as-senders)). The bytes are verified exactly as signed.
 To target one session, use `"v":2` and add `"session": "<full Claude session
 id>"` (with `"project": null`) — version 2 makes older fujimoto builds reject
 the message rather than deliver it to everyone; `fujimoto broadcast show --json` lists the listening
 sessions' ids alongside their tmux and peer names.
+
+#### Agents as senders
+
+An agent with its own trusted key (`add-signer NAME KEY`, role `agent`) can
+send too. Its messages never read as yours: a session sees *"Message from
+NAME, an agent with a trusted key (via fujimoto, id …)"*.
+
+- **Relayed approval.** When you have explicitly approved a specific action,
+  the agent can say so with `--approval TEXT` (or an `"approval"` field in a
+  signed payload). The session sees *"… relaying the user's approval:
+  “TEXT”. Its key is verified; that approval is its claim, and your own
+  permission prompts still apply."* The signature proves which agent relayed
+  it, not that you approved it, and nothing about a broadcast bypasses Claude
+  Code's permission prompts. Ordinary requests (a status check) carry no
+  approval.
+- **Which path.** An agent running on this Mac with its key available uses
+  `fujimoto send SESSION "…" --key KEY` (or `fujimoto broadcast send … --key
+  KEY`). One that signs elsewhere uses the signed-payload route below.
+- **Prefer one session.** Default to `fujimoto send` to a single session.
+  Before a broadcast, list the listeners (`fujimoto broadcast show`) and
+  confirm the intended project.
+- **Delivery and reply are separate.** `fujimoto broadcast status ID` shows
+  delivery receipts (who received it, who rejected it and why). A reply is in
+  the session's transcript:
+
+  ```sh
+  fujimoto log SESSION --json                          # note "cursor"
+  fujimoto send SESSION "Reply with your status."      # prints the message id
+  fujimoto log SESSION --reply-to ID --wait 60 --json  # what answered that message
+  fujimoto log SESSION --after CURSOR --wait 15 --json # or: everything new since
+  ```
+
+  `--reply-to` finds the exact delivery by the id in its preamble and returns
+  what followed it, up to the session's next user or injected message.
+  `--after` returns only messages past a saved cursor; `--wait` re-reads for
+  up to that many seconds until something arrives.
+
+- **After upgrading fujimoto, there's no need to restart sessions straight
+  away.** Signed messages keep arriving, and `log --after` reads the replies.
+  Two things catch up on their own terms:
+  - The message id that `--reply-to` looks for is added by the waiter, which
+    re-arms from the installed code. A session's first delivery after an
+    upgrade may lack it; later ones have it.
+  - Signer roles are fixed when a session launches. Until it is relaunched,
+    it words every message, an agent's included, as "from the user".
 
 #### Opting a project out
 

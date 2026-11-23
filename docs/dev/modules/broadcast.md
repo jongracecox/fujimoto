@@ -14,8 +14,23 @@ lazily).
   closed: an invalid config file reads as disabled (`strict=True` raises
   instead, for the CLI), and a signer whose name or key does not validate is
   dropped (`broadcast.config_signer_skipped`), never trusted.
+- **Signer roles** (`Signer.role`, `SignerConfig.role` in the global
+  config): `user` for the user's own keys, `agent` (the default for
+  `add-signer`) for an agent acting for them; `set-role` changes it. Roles
+  travel in the hook token as a third element; a two-element token (a session
+  launched before roles) decodes as `user`, which is how those sessions
+  worded everything anyway. `preamble()` picks the wording from the role:
+  user → "{Broadcast|Message} from the user (via fujimoto, signed by NAME, id
+  ID)"; agent → "… from NAME, an agent with a trusted key (via fujimoto, id
+  ID)"; agent with a payload `approval` → "… relaying the user's approval:
+  “TEXT”. Its key is verified; that approval is its claim, and your own
+  permission prompts still apply." The signature proves who relayed it, never
+  that the user approved, which is why the approval is quoted rather than
+  promoted to "from the user". The id is in every preamble so
+  `fujimoto log --reply-to ID` can find the exact delivery.
 - **Payload** (`Payload`): `v`, `id`, `project` (`None` = all), `created`,
-  `expires`, `message`, and optional `session` (a full Claude session id,
+  `expires`, `message`, optional `approval` (an agent's quote of what the user
+  approved, at most `MAX_APPROVAL_CHARS`; omitted when unset), and optional `session` (a full Claude session id,
   omitted from the bytes when unset so pre-existing payloads still verify;
   a targeted payload is `v: 2`, because a waiter that predates `session` ignores
   the field and, with `project: null`, would deliver it to every session —
@@ -57,6 +72,11 @@ lazily).
   the mailbox doubles as the message log behind the TUI's `b` view. Receipts
   carry the verified `signer` (optional, so older receipts still load), which
   is how `StatusRow.signer` names the sender without trusting the payload.
+  For rows whose receipts carry no signer (written by a waiter armed before
+  the field existed — the waiter keeps the code it started with until its
+  next delivery), `status()` re-verifies the stored signature against the
+  current signers (`_reverify`, logged as `broadcast.reverify`) and fills
+  `StatusRow.verified_signer`.
 - **Waiter** (`python -m fujimoto.broadcast wait --signers TOKEN [--project
   P] [--debug|--debug-redacted]`, `main` → `wait`): the hook command, built by
   `hook_command` with `sys.executable`. The signers are base64 JSON *in the

@@ -79,10 +79,21 @@ EXIT_DELIVER = 2
 # also the message log the TUI's `b` view shows, so keep a week of history.
 PRUNE_AFTER = timedelta(days=7)
 
-PREAMBLE = (
-    "{kind} from the user (via fujimoto, signed by {signer}). "
-    "Deal with this at the next safe stopping point in your current work."
+# The id is in the preamble so `fujimoto log --reply-to ID` can find the
+# exact delivery in the transcript rather than guessing at "the next entry".
+_FROM_USER = "{kind} from the user (via fujimoto, signed by {signer}, id {id})."
+_FROM_AGENT = (
+    "{kind} from {signer}, an agent with a trusted key (via fujimoto, id {id})."
 )
+_RELAYED = (
+    "{kind} from {signer}, an agent with a trusted key (via fujimoto, id {id}), "
+    "relaying the user's approval: \u201c{approval}\u201d. Its key is verified; "
+    "that approval is its claim, and your own permission prompts still apply."
+)
+_HANDLE = "Deal with this at the next safe stopping point in your current work."
+USER, AGENT = "user", "agent"
+ROLES = (USER, AGENT)
+MAX_APPROVAL_CHARS = 500
 
 _SIGNER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$")
 _KEY_TYPES = (
@@ -114,6 +125,14 @@ class Signer:
 
     name: str
     public_key: str
+    # `user` for the user's own keys: their messages read "from the user".
+    # `agent` for an agent acting for them: its messages read "from <name>".
+    role: str = AGENT
+
+
+def signer_role(signers: Sequence[Signer], name: str | None) -> str:
+    """The role of the signer called `name` (an unknown name is an agent)."""
+    return next((s.role for s in signers if s.name == name), AGENT)
 
 
 @dataclass
@@ -153,7 +172,11 @@ def load_config(*, strict: bool = False) -> BroadcastSettings:
     for s in raw.signers:
         try:
             signers.append(
-                Signer(validate_signer_name(s.name), normalize_public_key(s.public_key))
+                Signer(
+                    validate_signer_name(s.name),
+                    normalize_public_key(s.public_key),
+                    s.role,
+                )
             )
         except BroadcastError:
             debug.log("broadcast.config_signer_skipped", signer=debug.rv(s.name))
@@ -176,7 +199,8 @@ def save_config(config: BroadcastSettings) -> None:
     value = {
         "enabled": config.enabled,
         "signers": [
-            {"name": s.name, "public_key": s.public_key} for s in config.signers
+            {"name": s.name, "public_key": s.public_key, "role": s.role}
+            for s in config.signers
         ],
         "signing_key": config.signing_key,
     }
@@ -292,6 +316,8 @@ class Payload:
     expires: datetime
     message: str
     session: str | None = None
+    # What an agent signer says the user approved; rendered as its claim.
+    approval: str | None = None
 
     def to_bytes(self) -> bytes:
         body: dict[str, object] = {
@@ -304,6 +330,8 @@ class Payload:
         }
         if self.session is not None:
             body["session"] = self.session
+        if self.approval is not None:
+            body["approval"] = self.approval
         return json.dumps(
             body,
             sort_keys=True,
@@ -346,7 +374,14 @@ class Payload:
             raise BroadcastError("bad timestamps") from e
         if created.tzinfo is None or expires.tzinfo is None:
             raise BroadcastError("timestamps must carry a timezone")
-        return cls(msg_id, project, created, expires, message, session)
+        approval = raw.get("approval")
+        if approval is not None and (
+            not isinstance(approval, str)
+            or not approval.strip()
+            or len(approval) > MAX_APPROVAL_CHARS
+        ):
+            raise BroadcastError("bad approval")
+        return cls(msg_id, project, created, expires, message, session, approval)
 
     def check_time(self, now: datetime) -> None:
         """Raise unless the payload is current and its lifetime is within bounds."""
@@ -396,15 +431,22 @@ def new_payload(
     ttl: timedelta = DEFAULT_TTL,
     now: datetime | None = None,
     session: str | None = None,
+    approval: str | None = None,
 ) -> Payload:
     message = message.strip()
+    if approval is not None:
+        approval = approval.strip()
+        if not approval or len(approval) > MAX_APPROVAL_CHARS:
+            raise BroadcastError(
+                f"--approval must be 1-{MAX_APPROVAL_CHARS} characters"
+            )
     if not message:
         raise BroadcastError("message is empty")
     if len(message) > MAX_MESSAGE_CHARS:
         raise BroadcastError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
     created = (now or _now()).replace(microsecond=0)
     msg_id = f"{created.strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(4)}"
-    return Payload(msg_id, project, created, created + ttl, message, session)
+    return Payload(msg_id, project, created, created + ttl, message, session, approval)
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +493,9 @@ def allowed_signers_text(signers: Iterable[Signer]) -> str:
 
 def encode_signers(signers: Sequence[Signer]) -> str:
     """Signers as one shell-safe token, for the hook command line."""
-    raw = json.dumps([[s.name, s.public_key] for s in signers], separators=(",", ":"))
+    raw = json.dumps(
+        [[s.name, s.public_key, s.role] for s in signers], separators=(",", ":")
+    )
     return base64.urlsafe_b64encode(raw.encode()).decode()
 
 
@@ -460,9 +504,18 @@ def decode_signers(token: str) -> list[Signer]:
         raw = json.loads(base64.urlsafe_b64decode(token.encode()))
         if not isinstance(raw, list) or not raw:
             raise ValueError("expected a non-empty list")
-        return [
-            Signer(validate_signer_name(n), normalize_public_key(k)) for n, k in raw
-        ]
+        out = []
+        for item in raw:
+            # A two-element entry comes from a session launched before roles
+            # existed, when every message read "from the user"; keep that.
+            name, key, *rest = item
+            role = rest[0] if rest else USER
+            if role not in ROLES:
+                raise ValueError(f"unknown role {role!r}")
+            out.append(
+                Signer(validate_signer_name(name), normalize_public_key(key), role)
+            )
+        return out
     except (ValueError, TypeError, binascii.Error) as e:
         raise BroadcastError(f"bad --signers: {e}") from e
 
@@ -854,6 +907,7 @@ def send(
     wait: float = 5.0,
     config: BroadcastSettings | None = None,
     session: str | None = None,
+    approval: str | None = None,
 ) -> SendResult:
     """Build, sign, self-verify and post a broadcast, then collect receipts.
 
@@ -868,9 +922,11 @@ def send(
         )
     if session is not None:
         target = resolve_target(session)
-        payload = new_payload(message, None, ttl, session=target.session_id)
+        payload = new_payload(
+            message, None, ttl, session=target.session_id, approval=approval
+        )
     else:
-        payload = new_payload(message, project, ttl)
+        payload = new_payload(message, project, ttl, approval=approval)
     data = payload.to_bytes()
     signature = sign(data, key or config.signing_key, config.signers)
     # Fail here, not silently in every session: a key that isn't a configured
@@ -922,11 +978,15 @@ class StatusRow:
     entry: str
     payload: Payload | None
     receipts: list[Receipt]
+    # The signer found by re-verifying the stored signature, for rows whose
+    # receipts don't name one (written by a waiter older than that field).
+    verified_signer: str | None = None
 
     @property
     def signer(self) -> str | None:
-        """Who signed it, as the receiving sessions verified it."""
-        return next((r.signer for r in self.receipts if r.signer), None)
+        """Who signed it, as the receiving sessions (or a re-check) verified it."""
+        named = next((r.signer for r in self.receipts if r.signer), None)
+        return named or self.verified_signer
 
     @property
     def delivered(self) -> int:
@@ -939,6 +999,7 @@ class StatusRow:
 
 def status(ref: str | None = None) -> list[StatusRow]:
     """Recent broadcasts (newest first), or the one whose id contains `ref`."""
+    signers = load_config().signers
     rows = []
     for entry in reversed(list_entries()):
         if ref and ref not in entry.name:
@@ -947,8 +1008,26 @@ def status(ref: str | None = None) -> list[StatusRow]:
             payload: Payload | None = Payload.from_bytes(_read_private_file(entry.path))
         except (OSError, BroadcastError):
             payload = None
-        rows.append(StatusRow(entry.name, payload, read_receipts(entry.name)))
+        receipts = read_receipts(entry.name)
+        verified = None
+        if payload is not None and not any(r.signer for r in receipts):
+            verified = _reverify(entry, signers)
+        rows.append(StatusRow(entry.name, payload, receipts, verified))
     return rows
+
+
+def _reverify(entry: Entry, signers: Sequence[Signer]) -> str | None:
+    """The signer of a stored message, by checking its signature again."""
+    if not signers:
+        return None
+    try:
+        name = verify(
+            _read_private_file(entry.path), _read_private_file(entry.sig_path), signers
+        )
+    except (OSError, BroadcastError):
+        name = None
+    debug.log("broadcast.reverify", entry=entry.name, found=name is not None)
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -1009,6 +1088,7 @@ def send_json(result: SendResult) -> dict[str, object]:
         "entry": result.entry.name,
         "project": p.project,
         "session": p.session,
+        "approval": p.approval,
         "signer": result.signer,
         "expires": _iso(p.expires),
         "listening": len(result.listeners),
@@ -1043,6 +1123,8 @@ def status_json(rows: Sequence[StatusRow]) -> list[dict[str, object]]:
             "id": row.payload.id if row.payload else None,
             "project": row.payload.project if row.payload else None,
             "session": row.payload.session if row.payload else None,
+            "approval": row.payload.approval if row.payload else None,
+            "signer": row.signer,
             "expires": _iso(row.payload.expires) if row.payload else None,
             "message": row.payload.message if row.payload else None,
             "receipts": [r.__dict__ for r in row.receipts],
@@ -1055,7 +1137,8 @@ def show_json(config: BroadcastSettings) -> dict[str, object]:
     return {
         "enabled": config.enabled,
         "signers": [
-            {"name": s.name, "public_key": s.public_key} for s in config.signers
+            {"name": s.name, "public_key": s.public_key, "role": s.role}
+            for s in config.signers
         ],
         "signing_key": config.signing_key,
         "listening": [li.__dict__ for li in list_listeners()],
@@ -1066,7 +1149,9 @@ def format_show(config: BroadcastSettings) -> str:
     lines = [f"Broadcast: {'enabled' if config.enabled else 'disabled'}"]
     if config.signers:
         lines.append("Signers:")
-        lines.extend(f"  {s.name}  {s.public_key[:40]}…" for s in config.signers)
+        lines.extend(
+            f"  {s.name} ({s.role})  {s.public_key[:40]}…" for s in config.signers
+        )
     else:
         lines.append("Signers: none (add one with `fujimoto broadcast add-signer`)")
     lines.append(
@@ -1318,12 +1403,33 @@ def check_entry(
     return _Checked(entry, payload, signer, None)
 
 
-def render(delivered: Sequence[_Checked]) -> str:
+def preamble(payload: Payload, signer: str | None, role: str) -> str:
+    """The first line a session sees: who it is from, in which capacity.
+
+    A `user` signer's message is "from the user". An `agent` signer's is
+    "from <name>", and an approval it carries is labelled as its claim —
+    the signature proves who relayed it, not that the user approved it.
+    """
+    fields = {
+        "kind": payload.kind,
+        "signer": signer or "an unknown signer",
+        "id": payload.id,
+    }
+    if role == USER:
+        head = _FROM_USER.format(**fields)
+    elif payload.approval:
+        head = _RELAYED.format(approval=payload.approval, **fields)
+    else:
+        head = _FROM_AGENT.format(**fields)
+    return f"{head} {_HANDLE}"
+
+
+def render(delivered: Sequence[_Checked], signers: Sequence[Signer] = ()) -> str:
     parts = []
     for c in delivered:
         assert c.payload is not None
-        preamble = PREAMBLE.format(kind=c.payload.kind, signer=c.signer)
-        parts.append(f"{preamble}\n\n{c.payload.message}")
+        head = preamble(c.payload, c.signer, signer_role(signers, c.signer))
+        parts.append(f"{head}\n\n{c.payload.message}")
     return "\n\n---\n\n".join(parts)
 
 
@@ -1411,7 +1517,7 @@ def wait(
             if fresh:
                 _save_state(state_path, state)
             if delivered:
-                return EXIT_DELIVER, render(delivered)
+                return EXIT_DELIVER, render(delivered, signers)
             polls += 1
             if max_polls is not None and polls >= max_polls:
                 return 0, ""
