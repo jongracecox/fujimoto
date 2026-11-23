@@ -12,6 +12,19 @@ default and JSON with `--json`, and exit 1 on error (0 for "no matches").
 
 ## Commands
 
+### List sessions: `fujimoto list`
+
+```sh
+fujimoto list                                  # this project and its worktrees, newest first
+fujimoto list --all-projects -n 50             # every project on the machine
+fujimoto list --running                        # only sessions running now
+```
+
+Each row gives the project/worktree, when it was last used, the session id
+(first 8 characters, which `log` and `resume` accept), the peer name of a
+running session, and its first prompt or title. Use it when you know roughly
+when something happened but not which words to search for.
+
 ### Find sessions: `fujimoto search QUERY`
 
 ```sh
@@ -23,9 +36,11 @@ fujimoto search "ConnectionResetError" --raw   # also search tool calls and outp
 ```
 
 - Default scope is the repo containing the current directory, plus its
-  worktrees (including deleted ones). `--project NAME|PATH` picks another.
+  worktrees (including deleted ones); outside any repo, every project.
+  `--project NAME|PATH` picks another. The same goes for `list`.
 - **By default only message text is searched**: what the user and the agent
-  said. That is usually what you want. A ticket key turns up in tool output
+  said, not the system reminders and CLAUDE.md text injected into every
+  session. That is usually what you want. A ticket key turns up in tool output
   for every session that merely ran a ticket search, while a session that
   worked on it keeps naming it in conversation. Add `--raw` for things that
   only exist in tool output (error messages, commands, file contents). Each

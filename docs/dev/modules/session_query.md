@@ -1,6 +1,6 @@
 # `session_query.py`
 
-**`session_query.py`** — The read-only `search` / `log` commands, UI-free:
+**`session_query.py`** — The read-only `list` / `search` / `log` commands, UI-free:
 - `resolve_scope(project=, all_projects=, cwd=)` → `Scope`. No flag: the main
   clone of the cwd's repo (`get_main_worktree_root`, so a worktree searches its
   siblings). `--project`: a directory (any path in the repo), else a name under
@@ -19,6 +19,22 @@
   the default creates `<root>/.fujimoto/`, and a search must not plant that in
   a repo it only looked at. `--all-projects` uses `search.list_all_session_logs`
   (every top-level `*.jsonl` under the projects dir), with no path mapping.
+- **Outside a repo.** `resolve_scope(..., outside_repo_all=True)` turns "no
+  flag, cwd not in a repo" into `Scope(all_projects=True, outside_repo=True)`
+  (`describe()` → `all projects (not in a repo)`, `outside_repo` in JSON)
+  instead of a `QueryError`. Only the cwd path falls back: an explicit
+  `--project` that is not a repo still fails, and `chat` doesn't opt in.
+- **`list`** (`run_list`) reads the scope's transcripts in mtime order,
+  `parse_session` each, and stops at `limit` listed sessions, so the rest are
+  never opened (`truncated` = transcripts left unread). `running_only` keeps
+  reading until `limit` *running* ones are found. Unparseable (empty)
+  transcripts are counted as `unreadable`, not listed. The calling session is
+  *marked* (`this session`, `"this_session"`), not left out as `search` does:
+  a listing missing the newest session would just look wrong. Text rows show
+  an 8-character id prefix (`find_session_log` accepts it) and the running
+  session's address (`_list_activity`: status + peer, else tmux). The label
+  column is padded to at most `_LABEL_WIDTH_CAP`, because one scratch-dir path
+  padded every row past the screen edge.
 - `--sort relevance` (`SortOrder.RELEVANCE`) disables the early stop, sorts
   every hit by `relevance_key` — `(message matches, tool matches,
   last_activity)` — and *then* applies `limit`, so `truncated` means "more
@@ -34,7 +50,12 @@
 - `Locator` maps a transcript `cwd` to `Location(project, project_root,
   worktree)`, memoized per cwd. In a project scope it uses the scope (so a
   deleted worktree is still named); across all projects it asks git, which
-  needs the directory to exist.
+  needs the directory to exist. For a deleted directory, or one git rejects
+  (a chat's scratch dir), `_layout_location` reads fujimoto's own layout
+  from the path: `$FUJIMOTO_WORKTREE_ROOT/<project>/<worktree>`,
+  `<root>/.fujimoto/worktrees/<worktree>`, or `~/.fujimoto/chats/<project>`
+  (project, no worktree). The project root is filled in from
+  `$FUJIMOTO_GIT_ROOT/<project>` when that exists.
 - `ActivityIndex` is gathered once per command (`live.list_live_sessions()`,
   one `tmux.list_session_paths()` call, `session_state.load_state()`) and
   matched per transcript: (1) the registry has a process writing this session
@@ -77,7 +98,7 @@
   metadata header.
 - `relative_time` lives here (re-exported into `cli.py` as `_relative_time`)
   so the query module does not import the TUI.
-- Instrumented as `query.scope` (`via=cwd|path|git-root|all`), `query.worktrees` (`existing`/`deleted`), `query.search`,
+- Instrumented as `query.scope` (`via=cwd|path|git-root|all|all-outside-repo`), `query.list`, `query.locate` (`outcome=layout|deleted-layout|deleted-unknown|not-a-repo`), `query.worktrees` (`existing`/`deleted`), `query.search`,
   `query.activity` (capped, with the matching rule as `reason=`),
   `query.locate`, `query.log_resolve` (`via=path|exact|prefix`) and
   `query.log`; `claude.live_sessions` reports `live`/`stale`/`unreadable`
