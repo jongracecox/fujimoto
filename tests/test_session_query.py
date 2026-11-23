@@ -26,11 +26,14 @@ from fujimoto.session_query import (
     Scope,
     find_session_log,
     format_log,
+    format_list,
     format_search,
+    list_json,
     load_log,
     log_json,
     relative_time,
     resolve_scope,
+    run_list,
     run_search,
     search_json,
     use_color,
@@ -220,6 +223,21 @@ class TestResolveScope:
         with pytest.raises(QueryError, match="pass --project or --all-projects"):
             resolve_scope(project=None, all_projects=False, cwd=tmp_path)
 
+    def test_cwd_outside_a_repo_can_mean_all_projects(self, tmp_path: Path) -> None:
+        scope = resolve_scope(
+            project=None, all_projects=False, cwd=tmp_path, outside_repo_all=True
+        )
+        assert scope == Scope(all_projects=True, outside_repo=True)
+        assert scope.describe() == "all projects (not in a repo)"
+        assert Scope(all_projects=True).describe() == "all projects"
+
+    def test_outside_repo_fallback_is_only_for_the_cwd(self, tmp_path: Path) -> None:
+        # An explicit --project that is not a repo is still an error.
+        with pytest.raises(QueryError, match="is not inside a git repository"):
+            resolve_scope(
+                project=str(tmp_path), all_projects=False, outside_repo_all=True
+            )
+
     def test_project_path_outside_a_repo(self, tmp_path: Path) -> None:
         with pytest.raises(QueryError, match="is not inside a git repository"):
             resolve_scope(project=str(tmp_path), all_projects=False)
@@ -259,6 +277,45 @@ class TestLocator:
         locator = Locator(Scope(all_projects=True))
         assert locator.locate(tmp_path / "gone") == Location(None, None, None)
         assert locator.locate(tmp_path) == Location(None, None, None)
+
+    def test_all_projects_deleted_worktree_under_worktree_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FUJIMOTO_WORKTREE_ROOT", str(tmp_path / "wt"))
+        gone = tmp_path / "wt" / "proj" / "20261020-gone"
+        found = Locator(Scope(all_projects=True)).locate(gone / "sub")
+        assert found == Location("proj", None, gone)
+        assert found.label(gone / "sub") == "proj/20261020-gone"
+
+    def test_all_projects_deleted_worktree_project_root_from_git_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FUJIMOTO_WORKTREE_ROOT", str(tmp_path / "wt"))
+        monkeypatch.setenv("FUJIMOTO_GIT_ROOT", str(tmp_path / "git"))
+        (tmp_path / "git" / "proj").mkdir(parents=True)
+        gone = tmp_path / "wt" / "proj" / "20261020-gone"
+        found = Locator(Scope(all_projects=True)).locate(gone)
+        assert found.project_root == (tmp_path / "git" / "proj").resolve()
+
+    def test_all_projects_deleted_in_project_worktree(self, tmp_path: Path) -> None:
+        root = tmp_path / "proj"
+        gone = root / ".fujimoto" / "worktrees" / "20261020-gone"
+        found = Locator(Scope(all_projects=True)).locate(gone / "a" / "b")
+        assert found == Location("proj", root, gone)
+
+    def test_all_projects_chat_scratch_dir(self, tmp_path: Path) -> None:
+        # The autouse fixture puts scratch dirs at tmp_path/chats/<project>.
+        scratch = tmp_path / "chats" / "proj" / "auth-question"
+        scratch.mkdir(parents=True)  # exists, but is not a repo
+        found = Locator(Scope(all_projects=True)).locate(scratch)
+        assert found == Location("proj", None, None)
+
+    def test_all_projects_worktree_root_needs_a_worktree_part(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FUJIMOTO_WORKTREE_ROOT", str(tmp_path / "wt"))
+        locator = Locator(Scope(all_projects=True))
+        assert locator.locate(tmp_path / "wt" / "proj") == Location(None, None, None)
 
     def test_memoizes(self, repo: Path) -> None:
         locator = Locator(Scope(all_projects=True))
@@ -457,6 +514,7 @@ class TestSearchOutput:
         data = search_json(self._report(tmp_path, running=True))
         assert data["scope"] == {
             "all_projects": True,
+            "outside_repo": False,
             "project": None,
             "project_root": None,
         }
@@ -1266,3 +1324,159 @@ class TestSortByRelevance:
         session = run_search("needle", Scope(all_projects=True)).results[0].hit.session
         key = session_query.relevance_key(SearchHit(session, 4, ()))
         assert key[:2] == (4, 0)
+
+
+# -- list --
+
+
+class TestRunList:
+    def test_newest_first_with_location_and_activity(
+        self, tmp_path: Path, repo: Path, worktree: Path
+    ) -> None:
+        _transcript(tmp_path, repo, "old-1", "first thing", age=30)
+        _transcript(tmp_path, worktree, "new-2", "second thing", age=1)
+        index = _index([_live("new-2", worktree, peer_name="proj-x")])
+        report = run_list(Scope(all_projects=True), activity=index)
+        assert [s.session.session_id for s in report.sessions] == ["new-2", "old-1"]
+        first, second = report.sessions
+        assert first.location.worktree == worktree.resolve()
+        assert first.activity.running and first.activity.peer_name == "proj-x"
+        assert second.location == Location("proj", repo.resolve(), None)
+        assert not second.activity.running
+        assert (report.total_logs, report.scanned, report.truncated) == (2, 2, False)
+
+    def test_project_scope(self, tmp_path: Path, repo: Path) -> None:
+        _transcript(tmp_path, repo, "in-1", "mine")
+        _transcript(tmp_path, tmp_path / "elsewhere", "out-1", "not mine")
+        scope = resolve_scope(project=None, all_projects=False, cwd=repo)
+        report = run_list(scope, activity=_index())
+        assert [s.session.session_id for s in report.sessions] == ["in-1"]
+
+    def test_limit_stops_reading(self, tmp_path: Path) -> None:
+        for age in range(3):
+            _transcript(tmp_path, tmp_path / "w", f"s-{age}", "hi", age=age)
+        report = run_list(Scope(all_projects=True), limit=2, activity=_index())
+        assert [s.session.session_id for s in report.sessions] == ["s-0", "s-1"]
+        assert (report.scanned, report.truncated) == (2, True)
+        everything = run_list(Scope(all_projects=True), limit=0, activity=_index())
+        assert len(everything.sessions) == 3
+        assert not everything.truncated
+
+    def test_running_only_keeps_reading_past_stopped_ones(self, tmp_path: Path) -> None:
+        cwd = tmp_path / "w"
+        _transcript(tmp_path, cwd, "stopped-1", "a", age=1)
+        _transcript(tmp_path, cwd, "stopped-2", "b", age=2)
+        _transcript(tmp_path, cwd, "live-3", "c", age=3)
+        index = _index([_live("live-3", cwd)])
+        report = run_list(
+            Scope(all_projects=True), limit=1, running_only=True, activity=index
+        )
+        assert [s.session.session_id for s in report.sessions] == ["live-3"]
+        assert report.scanned == 3
+
+    def test_unparseable_transcripts_are_counted_not_listed(
+        self, tmp_path: Path
+    ) -> None:
+        _transcript(tmp_path, tmp_path / "w", "good-1", "hi")
+        empty = _projects(tmp_path) / "-w" / "empty-1.jsonl"
+        empty.parent.mkdir(parents=True, exist_ok=True)
+        empty.write_text("")
+        report = run_list(Scope(all_projects=True), activity=_index())
+        assert [s.session.session_id for s in report.sessions] == ["good-1"]
+        assert report.unreadable == 1
+        assert "1 empty transcript skipped" in format_list(report)
+
+    def test_gathers_activity_itself(self, tmp_path: Path) -> None:
+        _transcript(tmp_path, tmp_path / "w", "s-1", "hi")
+        with patch(
+            "fujimoto.session_query.live.list_live_sessions", return_value=[]
+        ) as gather:
+            run_list(Scope(all_projects=True))
+        gather.assert_called_once()
+
+
+class TestFormatList:
+    def _report(self, tmp_path: Path, **kwargs: object):
+        cwd = tmp_path / "w"
+        cwd.mkdir()
+        _transcript(tmp_path, cwd, "aaaaaaaa-1111", "fix the login bug", age=1)
+        _transcript(tmp_path, tmp_path / "gone", "bbbbbbbb-2222", "old work", age=2)
+        index = _index([_live("aaaaaaaa-1111", cwd, peer_name="w-ab", status="busy")])
+        return run_list(Scope(all_projects=True), activity=index, **kwargs)
+
+    def test_rows(self, tmp_path: Path) -> None:
+        out = format_list(self._report(tmp_path, calling_session="aaaaaaaa-1111"))
+        lines = out.splitlines()
+        assert lines[0].startswith(f"● {tmp_path / 'w'}")
+        assert lines[0].endswith("aaaaaaaa  busy · peer w-ab · this session")
+        assert lines[1] == "    fix the login bug"
+        assert lines[2].startswith(f"○ {tmp_path / 'gone'} (deleted)")
+        assert lines[2].endswith("bbbbbbbb")
+        assert "2 sessions · all projects · 1 running" in out
+        assert "fujimoto resume <id>" in out
+
+    def test_truncated_footer(self, tmp_path: Path) -> None:
+        out = format_list(self._report(tmp_path, limit=1))
+        assert "newest 1 of 2 transcripts read (-n 0 for all)" in out
+
+    def test_running_only_footer(self, tmp_path: Path) -> None:
+        out = format_list(self._report(tmp_path, running_only=True))
+        assert "1 running session · all projects" in out
+        assert "· 1 running" not in out
+
+    def test_long_labels_do_not_pad_every_row(self, tmp_path: Path) -> None:
+        short = tmp_path / "s"
+        long = tmp_path / ("x" * 120)
+        _transcript(tmp_path, short, "s-1", "a", age=1)
+        _transcript(tmp_path, long, "l-1", "b", age=2)
+        out = format_list(run_list(Scope(all_projects=True), activity=_index()))
+        first = out.splitlines()[0]
+        assert len(first) < len(str(long))
+
+    def test_no_title(self, tmp_path: Path) -> None:
+        log = _projects(tmp_path) / "-w" / "s-1.jsonl"
+        log.parent.mkdir(parents=True)
+        entry = {
+            "type": "assistant",
+            "cwd": "/w",
+            "timestamp": "2026-10-20T10:00:00Z",
+            "message": {"content": [{"type": "tool_use", "name": "Bash"}]},
+        }
+        log.write_text(json.dumps(entry) + "\n")
+        out = format_list(run_list(Scope(all_projects=True), activity=_index()))
+        assert "    (no prompt yet)" in out.splitlines()
+
+    def test_empty(self, tmp_path: Path) -> None:
+        report = run_list(
+            Scope(all_projects=True, outside_repo=True), activity=_index()
+        )
+        assert format_list(report) == (
+            "No sessions in 0 transcripts (all projects (not in a repo))."
+        )
+        running = run_list(
+            Scope(all_projects=True), running_only=True, activity=_index()
+        )
+        assert format_list(running).startswith("No running sessions")
+
+
+class TestListJson:
+    def test_shape(self, tmp_path: Path) -> None:
+        _transcript(tmp_path, tmp_path / "w", "s-1", "hello")
+        report = run_list(
+            Scope(all_projects=True, outside_repo=True),
+            activity=_index(),
+            calling_session="s-1",
+        )
+        data = json.loads(session_query.dump_json(list_json(report)))
+        assert data["scope"]["outside_repo"] is True
+        assert (data["total_logs"], data["truncated"], data["unreadable"]) == (
+            1,
+            False,
+            0,
+        )
+        (row,) = data["sessions"]
+        assert row["session_id"] == "s-1"
+        assert row["first_prompt"] == "hello"
+        assert row["cwd_exists"] is False
+        assert row["this_session"] is True
+        assert row["active"] == {"running": False}

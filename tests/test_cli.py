@@ -11421,13 +11421,55 @@ class TestQueryCommands:
         data = json.loads(out)
         assert (data["case_sensitive"], data["mode"], data["hits"]) == (True, "raw", [])
 
-    def test_search_scope_error(
+    def test_search_outside_a_repo_searches_all_projects(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         monkeypatch.chdir(tmp_path)
-        code, _, err = self._main(monkeypatch, "search", "needle")
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        code, out, _ = self._main(monkeypatch, "search", "needle")
+        assert code == 0
+        assert "session:  sess-1" in out
+        assert "all projects (not in a repo)" in out
+
+    def test_search_scope_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        code, _, err = self._main(
+            monkeypatch, "search", "needle", "--project", str(tmp_path)
+        )
         assert code == 1
-        assert "pass --project or --all-projects" in err
+        assert "is not inside a git repository" in err
+
+    def test_list_text(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        code, out, _ = self._main(monkeypatch, "list")
+        assert code == 0
+        assert "sess-1" in out
+        assert "    find the needle" in out
+        assert "1 session · all projects (not in a repo)" in out
+
+    def test_list_json_and_flags(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-1")
+        code, out, _ = self._main(
+            monkeypatch, "list", "--all-projects", "-n", "0", "--json"
+        )
+        assert code == 0
+        data = json.loads(out)
+        assert data["scope"]["outside_repo"] is False
+        assert [s["session_id"] for s in data["sessions"]] == ["sess-1"]
+        assert data["sessions"][0]["this_session"] is True
+        code, out, _ = self._main(
+            monkeypatch, "list", "--all-projects", "--running", "--json"
+        )
+        assert json.loads(out)["sessions"] == []
+
+    def test_list_errors(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        code, _, err = self._main(monkeypatch, "list", "--project", str(tmp_path))
+        assert code == 1
+        assert "is not inside a git repository" in err
+        code, _, _ = self._main(monkeypatch, "list", "--project", "p", "--all-projects")
+        assert code == 2
 
     def test_project_and_all_projects_are_exclusive(
         self, monkeypatch: pytest.MonkeyPatch

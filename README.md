@@ -419,7 +419,7 @@ fujimoto never writes it) and stderr says which session to attach to.
 ### Session tools for agents
 
 `fujimoto agent-instructions` prints a short guide to the command-line tools
-below (`search`, `log`, `resume`, `stop`, `new`), written for an AI agent:
+below (`list`, `search`, `log`, `resume`, `stop`, `new`), written for an AI agent:
 what each does, and when it helps — tracing work on a ticket or error,
 avoiding duplicate work, recovering context, checking that something is really
 done, delegating. Point an agent at it from its instructions file, e.g. a line
@@ -428,6 +428,36 @@ in `CLAUDE.md`:
 ```markdown
 To search, read or talk to other Claude sessions, run `fujimoto agent-instructions`.
 ```
+
+### Listing sessions from the command line
+
+`fujimoto list` shows sessions newest first: where each one ran, when it was
+last used, its id (the first 8 characters, which `log` and `resume` accept),
+whether it is running (with the peer name to message it at), and its title.
+Like `search`, it needs no tmux and changes nothing on disk.
+
+```sh
+fujimoto list                       # current project + its worktrees
+fujimoto list --all-projects        # every session on the machine
+fujimoto list --project myproject   # a project under $FUJIMOTO_GIT_ROOT (or a path)
+fujimoto list --running             # only sessions running now
+fujimoto list -n 0 --json           # all of them, as JSON
+```
+
+```
+● myproject/20261013-fix-flaky-test  2h ago  8f0e2c1a  busy · peer 20261013-fix-flaky-test
+    Fix the flaky test in test_api.py
+○ other-project/20261001-old-work (deleted)  3w ago  1c9d77b0
+    Investigate CI timeouts
+
+2 sessions · all projects · 1 running
+Next: fujimoto log <id> --summary · fujimoto resume <id> · fujimoto search QUERY
+```
+
+Run outside any git repo, `list` and `search` cover every project, since
+there is no current one. A worktree that has been deleted is still named from
+its path (`$FUJIMOTO_WORKTREE_ROOT/<project>/<worktree>`, or
+`<project>/.fujimoto/worktrees/<worktree>`), and marked `(deleted)`.
 
 ### Searching transcripts from the command line
 
@@ -438,7 +468,7 @@ running fujimoto, and changes nothing on disk.
 ```sh
 fujimoto search "flaky test"                     # current project + its worktrees
 fujimoto search "flaky test" --project myproject # a project under $FUJIMOTO_GIT_ROOT (or a path)
-fujimoto search "flaky test" --all-projects      # every transcript on the machine
+fujimoto search "flaky test" --all-projects      # every transcript on the machine (the default outside a repo)
 fujimoto search 'retry(ing)? \d+' --regex        # regex; -s for case-sensitive
 fujimoto search "pytest -x" --raw                # also match tool calls and output
 fujimoto search "flaky test" --limit 5 --json    # JSON, at most 5 sessions
@@ -450,7 +480,9 @@ deleted (their transcripts outlive them); those show `(deleted)` next to the
 directory, and `"cwd_exists": false` in JSON. The TUI's `s` search does not
 list them, since a deleted worktree can't be resumed in place.
 
-By default only what the user and Claude *said* is matched; `--raw` also
+By default only what the user and Claude *said* is matched. Text the harness
+adds to a message (system reminders, which carry `CLAUDE.md`, and task
+notifications) doesn't count, since every session has it. `--raw` also
 matches tool calls, tool output and file contents. Results are newest first,
 and the scan stops once `--limit` sessions (default 20, `0` for no limit) have
 matched, so a search over a large history stays fast:
