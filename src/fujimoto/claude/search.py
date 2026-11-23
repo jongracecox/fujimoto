@@ -16,8 +16,8 @@ Three orthogonal axes control matching:
 * **Content** (`ContentMode`) — `RAW` scans the transcript bytes as written,
   so tool inputs, tool output, file contents, paths and shell commands all
   match; `TEXT` parses each entry and scans only what the user and Claude
-  actually said (string content and `text` blocks), which is quieter but
-  cannot see anything a tool produced.
+  actually said (string content and `text` blocks, minus harness-injected
+  text), which is quieter but cannot see anything a tool produced.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from pathlib import Path
 
 from fujimoto import debug
 from fujimoto.claude.log_parser import (
+    INJECTED_PREFIXES,
     ClaudeLogError,
     ClaudeSession,
     get_claude_projects_dir,
@@ -494,21 +495,36 @@ def _message_text(entry: dict) -> str:
     output are deliberately excluded: they are what RAW mode is for, and
     including them here would erase the distinction between the two modes.
 
-    >>> _message_text({"message": {"content": "hello"}})
+    Only what someone *said* counts, the same set `log` shows by default:
+    entries of another type are skipped (an `api-request-blob` repeats the
+    whole request, system reminders included), as are `isMeta` entries (skill
+    bodies, messages from other sessions) and any block that starts with one of
+    `INJECTED_PREFIXES`. Without this, the CLAUDE.md text in every session's
+    first request matched a search in every session.
+
+    >>> _message_text({"type": "user", "message": {"content": "hello"}})
     'hello'
-    >>> _message_text({"message": {"content": [{"type": "text", "text": "hi"}]}})
+    >>> _message_text({"type": "assistant",
+    ...                "message": {"content": [{"type": "text", "text": "hi"}]}})
     'hi'
-    >>> _message_text({"message": {"content": [{"type": "tool_result", "content": "x"}]}})
+    >>> _message_text({"type": "user",
+    ...                "message": {"content": [{"type": "tool_result", "content": "x"}]}})
+    ''
+    >>> _message_text({"type": "user", "message": {"content": "<system-reminder>x"}})
+    ''
+    >>> _message_text({"type": "api-request-blob", "message": {"content": "hello"}})
     ''
     >>> _message_text({"type": "progress"})
     ''
     """
+    if entry.get("type") not in ("user", "assistant") or entry.get("isMeta"):
+        return ""
     message = entry.get("message")
     if not isinstance(message, dict):
         return ""
     content = message.get("content")
     if isinstance(content, str):
-        return content
+        return "" if _injected(content) else content
     if not isinstance(content, list):
         return ""
     parts = [
@@ -517,8 +533,18 @@ def _message_text(entry: dict) -> str:
         if isinstance(block, dict)
         and block.get("type") == "text"
         and isinstance(block.get("text"), str)
+        and not _injected(block["text"])
     ]
     return "\n".join(parts)
+
+
+def _injected(text: str) -> bool:
+    """Whether a piece of message text was put there by the harness.
+
+    >>> _injected("  <task-notification>done"), _injected("fix <system-reminder>")
+    (True, False)
+    """
+    return text.lstrip().startswith(INJECTED_PREFIXES)
 
 
 def _tool_text(entry: dict) -> str:
