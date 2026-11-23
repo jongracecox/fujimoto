@@ -22,6 +22,7 @@ src/fujimoto/
 ├── project_config.py  # optional per-project .fujimoto.yaml (copy/link/init worktree setup, claude_args)
 ├── launch_options.py  # extra claude CLI args per session (resolve / save / replay)
 ├── session_query.py   # `fujimoto search` / `fujimoto log`: scope, location, liveness, output
+├── broadcast.py       # `fujimoto broadcast` / `send`: signed messages, mailbox, per-session waiter hook
 ├── templates/
 │   ├── __init__.py
 │   ├── fujimoto.yaml.template  # commented scaffold written by `fujimoto --create-config`
