@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -33,6 +34,9 @@ class SignerConfig(BaseModel):
     name: str
     # OpenSSH `<type> <base64>`, without a comment.
     public_key: str
+    # `user`: the user's own key, whose messages read "from the user".
+    # `agent`: an agent acting for them; its messages name it instead.
+    role: Literal["user", "agent"] = "agent"
 
 
 class BroadcastConfig(BaseModel):

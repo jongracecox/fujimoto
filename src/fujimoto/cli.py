@@ -7617,17 +7617,29 @@ def _run_log_command(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+    if args.summary and (args.after is not None or args.reply_to):
+        _finish_debug_log()
+        print(
+            "fujimoto: --summary can't be combined with --after or --reply-to",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     try:
-        report = session_query.load_log(
-            args.session,
-            roles=roles,
-            grep=args.grep,
-            regex=args.regex,
-            case_sensitive=args.case_sensitive,
-            context=args.context,
-            head=args.head,
-            tail=args.tail,
-            summary=args.summary,
+        report = session_query.load_log_waiting(
+            lambda: session_query.load_log(
+                args.session,
+                after=args.after,
+                reply_to=args.reply_to,
+                roles=roles,
+                grep=args.grep,
+                regex=args.regex,
+                case_sensitive=args.case_sensitive,
+                context=args.context,
+                head=args.head,
+                tail=args.tail,
+                summary=args.summary,
+            ),
+            wait=args.wait,
         )
     except session_query.QueryError as e:
         _finish_debug_log()
@@ -7664,7 +7676,7 @@ def _add_broadcast_command(sub: argparse._SubParsersAction) -> None:
         help="Sign and send a broadcast",
         usage=(
             "fujimoto broadcast send (TEXT | --signed FILE) "
-            "[--project NAME | --all-projects] [--ttl 1h] [--key KEY] "
+            "[--project NAME | --all-projects] [--ttl 1h] [--key KEY] [--approval TEXT] "
             "[--wait SECS] [--json]"
         ),
     )
@@ -7685,6 +7697,14 @@ def _add_broadcast_command(sub: argparse._SubParsersAction) -> None:
     )
     send.add_argument("--key", help="Signing key: a key path or a literal public key")
     send.add_argument(
+        "--approval",
+        metavar="TEXT",
+        help=(
+            "For an agent signer: what the user approved, quoted in the message "
+            "as the agent's claim"
+        ),
+    )
+    send.add_argument(
         "--wait",
         type=float,
         default=5.0,
@@ -7704,6 +7724,18 @@ def _add_broadcast_command(sub: argparse._SubParsersAction) -> None:
     add = bsub.add_parser("add-signer", help="Trust a public key to sign broadcasts")
     add.add_argument("name", help="A label, e.g. laptop or remote-agent")
     add.add_argument("key", help="A literal public key or a path to a .pub file")
+    add.add_argument(
+        "--role",
+        choices=list(broadcast.ROLES),
+        default=broadcast.AGENT,
+        help=(
+            "user: your own key, messages read 'from the user'. agent (default): "
+            "an agent acting for you, messages name it"
+        ),
+    )
+    role = bsub.add_parser("set-role", help="Change a signer's role (user or agent)")
+    role.add_argument("name")
+    role.add_argument("role", choices=list(broadcast.ROLES))
     rm = bsub.add_parser("remove-signer", help="Stop trusting a signer")
     rm.add_argument("name")
     setkey = bsub.add_parser("set-key", help="The key `send` signs with")
@@ -7726,7 +7758,8 @@ def _add_send_command(sub: argparse._SubParsersAction) -> None:
             "the broadcast configuration and signing key."
         ),
         usage=(
-            "fujimoto send SESSION TEXT [--ttl 1h] [--key KEY] [--wait SECS] [--json]"
+            "fujimoto send SESSION TEXT [--ttl 1h] [--key KEY] [--approval TEXT] "
+            "[--wait SECS] [--json]"
         ),
     )
     send.add_argument(
@@ -7737,6 +7770,14 @@ def _add_send_command(sub: argparse._SubParsersAction) -> None:
         "--ttl", default="1h", help="How long it stays valid (default 1h)"
     )
     send.add_argument("--key", help="Signing key: a key path or a literal public key")
+    send.add_argument(
+        "--approval",
+        metavar="TEXT",
+        help=(
+            "For an agent signer: what the user approved, quoted in the message "
+            "as the agent's claim"
+        ),
+    )
     send.add_argument(
         "--wait",
         type=float,
@@ -7757,6 +7798,7 @@ def _run_send_command(args: argparse.Namespace) -> None:
             ttl=broadcast.parse_ttl(args.ttl),
             key=args.key,
             wait=args.wait,
+            approval=args.approval,
         )
     except (broadcast.BroadcastError, OSError) as e:
         debug.log("cli.send_failed", detail=debug.rv(str(e)))
@@ -7795,8 +7837,17 @@ def _broadcast_config_change(args: argparse.Namespace) -> str:
         key = broadcast.normalize_public_key(args.key)
         if any(s.name == name for s in config.signers):
             raise broadcast.BroadcastError(f"a signer called {name} already exists")
-        config.signers.append(broadcast.Signer(name, key))
-        msg = f"Added signer {name}. " + note
+        config.signers.append(broadcast.Signer(name, key, args.role))
+        msg = f"Added signer {name} ({args.role}). " + note
+    elif cmd == "set-role":
+        if not any(s.name == args.name for s in config.signers):
+            raise broadcast.BroadcastError(f"no signer called {args.name}")
+        config.signers = [
+            replace(s, role=args.role) if s.name == args.name else s
+            for s in config.signers
+        ]
+        article = "an" if args.role == broadcast.AGENT else "a"
+        msg = f"{args.name} is now {article} {args.role} signer. " + note
     elif cmd == "remove-signer":
         before = len(config.signers)
         config.signers = [s for s in config.signers if s.name != args.name]
@@ -7865,6 +7916,7 @@ def _run_broadcast_command(args: argparse.Namespace) -> None:
                     ttl=broadcast.parse_ttl(args.ttl),
                     key=args.key,
                     wait=args.wait,
+                    approval=args.approval,
                 )
             print(
                 json.dumps(broadcast.send_json(result), indent=2)
@@ -8133,6 +8185,30 @@ def _add_query_commands(sub: argparse._SubParsersAction) -> None:
             "Comma-separated roles to keep (default: all but injected): "
             + ",".join(session_query.TRANSCRIPT_ROLES)
         ),
+    )
+    log.add_argument(
+        "--after",
+        type=int,
+        metavar="CURSOR",
+        help=(
+            "Only messages after this index; pass the `cursor` a previous "
+            "call reported to read just what is new"
+        ),
+    )
+    log.add_argument(
+        "--reply-to",
+        metavar="ID",
+        help=(
+            "Only the messages answering one `broadcast send` / `send` "
+            "delivery, by its id"
+        ),
+    )
+    log.add_argument(
+        "--wait",
+        type=float,
+        default=0.0,
+        metavar="SECS",
+        help="Re-read until something matches, for up to SECS seconds",
     )
     log.add_argument("--json", action="store_true", help="Print JSON")
 

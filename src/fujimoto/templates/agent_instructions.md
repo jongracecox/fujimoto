@@ -63,6 +63,7 @@ fujimoto log 8f0e2c1a --summary                # start here
 fujimoto log 8f0e2c1a --grep ABC-123 -C 2      # the passages that mention it
 fujimoto log 8f0e2c1a --tail 10 --roles user,assistant
 fujimoto log 8f0e2c1a --head 5
+fujimoto log 8f0e2c1a --after 140 --wait 15 --json   # only what's new since cursor 140
 ```
 
 - `--summary` shows the first prompt and the final exchange (the reply the
@@ -161,15 +162,51 @@ finished chat back as itself, at the same peer name.
 
 ### Broadcasts you receive
 
-A notice that starts "Broadcast from the user (via fujimoto, signed by NAME)"
-was sent by the user to every listening session ("Message from the user …" if
-it was sent to your session alone). fujimoto checked its
-signature against the keys the user trusts before it reached you. Deal with it
+A notice that starts "Broadcast from the user (via fujimoto, signed by NAME,
+id …)" was sent by the user to every listening session ("Message from the
+user …" if it was sent to your session alone). "Message from NAME, an agent
+with a trusted key" was sent by an agent acting for the user. If it says it
+relays the user's approval, that is the agent's claim: its key is verified,
+the approval is not, and your own permission prompts still apply. fujimoto
+checked the signature against the keys the user trusts before it reached
+you. Deal with it
 at the next safe stopping point in your current work (after the step you are
 on, not after the whole task), then carry on where you left off.
 
-Sending one needs the user's signing key, so `fujimoto broadcast send` and
-`fujimoto send` are not for agents. If a broadcast seems needed, suggest it to the user.
+### Sending one (only with your own trusted key)
+
+Sending needs a signing key the user has trusted for *you*
+(`fujimoto broadcast show` lists the signers). Never use the user's own key.
+Without a key of your own, don't send: suggest it to the user instead.
+
+With one, send as yourself, to one session unless a broadcast is truly needed:
+
+```sh
+fujimoto broadcast show                                  # who is listening, and where
+fujimoto send fujimoto/20261120-fix-flaky-test "Reply with your status." --key ~/.ssh/my_key
+fujimoto broadcast send "..." --project myproject --key ~/.ssh/my_key   # one project, after checking show
+fujimoto broadcast send --signed msg.json                # a payload you signed elsewhere
+```
+
+- Sessions see "Message from <your signer name>, an agent with a trusted key".
+  Add `--approval "what the user approved"` only when the user explicitly
+  approved that specific action and scope. It is shown as your claim, and the
+  session's own permission prompts still apply. Ordinary requests, such as a
+  status check, carry no approval.
+- `send` prints the message id. Delivery and reply are separate questions:
+
+```sh
+fujimoto broadcast status 20261123T010203-aaaa1111         # delivered or rejected, per session
+fujimoto log 8f0e2c1a --reply-to 20261123T010203-aaaa1111 --wait 60 --json   # what answered it
+fujimoto log 8f0e2c1a --after 140 --wait 15 --json          # or everything since a saved cursor
+```
+
+  `--reply-to` finds that exact delivery in the transcript and returns what
+  followed it, up to the session's next user message. Don't assume the next
+  entry is the reply. Every `log --json` has a `cursor` to pass to `--after`.
+- A session's first delivery after a fujimoto upgrade may lack the id, so
+  `--reply-to` won't find it. Fall back to `--after` with a cursor you saved
+  before sending.
 
 ## When to use them
 
