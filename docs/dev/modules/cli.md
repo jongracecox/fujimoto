@@ -191,3 +191,11 @@
 - All view transitions are `async` — `await _clear_main()` then `await mount()`
 - Session data stored in `_session_map` dict keyed by ListItem ID
 - `_launch_target` is a `LaunchTarget`, set before `self.exit()`
+- **TUI `b` view** (`cli.py`): `action_show_messages` (home only, via
+  `check_action`) → `_show_messages` reads `broadcast.status()` once into
+  `_message_rows` and lists `_message_row_content` rows (`msg-{i}`); Enter →
+  `_show_message_detail` (full text + receipts in `#message-detail`); Escape
+  goes detail → list (`restore=True`, highlight kept in `_message_selected`)
+  → home. Everything built from message text, reasons or paths is `Content`.
+  Flags `_on_messages`/`_on_message_detail` are reset by `_clear_main`.
+  Instrumented as `tui.messages` and `tui.message_detail`.

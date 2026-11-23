@@ -75,3 +75,34 @@ Things discovered during development that are easy to forget:
   why the launch-options binding is `shift+enter,o`: `o` is the fallback that
   works everywhere a list has focus (an `Input` types it instead).
 - **OSC escape writes during a Textual run must go to `sys.__stdout__`, not `sys.stdout`.** Textual replaces `sys.stdout` with an internal capture while the app runs, so an OSC sequence (e.g. the `set_terminal_title` iTerm2/window-title escape) written to `sys.stdout` from inside a running app — such as `_init_git_info` updating the title on project switch — never reaches the terminal. `sys.__stdout__` stays connected to the real tty, so writing there works both before and during `app.run()`. This is why the session-manager title set at `main()` (pre-run) worked but the in-app update initially did not.
+
+## Broadcast
+
+Verified with live sessions while building `fujimoto broadcast` (Claude Code
+2.1.329):
+
+- **`asyncRewake` + exit 2 wakes an idle session**, as documented; a busy one
+  queues it (`queue-operation` … `absorbed_mid_turn`) and handles it after the
+  current tool call, not at the end of the task; a session on a permission
+  prompt queues it without answering the prompt. A broadcast never bypasses
+  tool permissions.
+- **Claude Code enforces `timeout` on an `asyncRewake` hook, and the kill is
+  silent** (SIGKILL: no `finally`, a stale lock, nothing in the session). The
+  message isn't lost — the next `Stop` re-arms a waiter, which delivers from
+  its saved mark — but it is late. Hence the 7-day timeout and the dead-lock
+  takeover. A timeout above the 600s default is honoured (checked at 12.5 min).
+- **The delivered text is framed as `[SYSTEM NOTIFICATION - NOT USER INPUT]
+  … Stop hook blocking error from command "Stop": …`** (even for the
+  `SessionStart` hook). Sessions still act on it; the "signed by" preamble is
+  what earns that, and the signature is what makes it true.
+- **Wording matters.** "Reply with X and nothing else" made a busy session drop
+  the answer to the question it was working on. The preamble says "at the next
+  safe stopping point in your current work" — "finish your current work first"
+  would mean hours on a long task.
+- **`claude` keeps only the last `--settings`.** Two flags each adding a
+  `SessionStart` hook ran only the second. Hence `merge_settings_args`.
+- **Hooks don't run until the folder's trust dialog is accepted.**
+- **An SSH agent may remember an approval.** 1Password asked for a fingerprint
+  on the first `-Y sign` and not on the second (0.11s), so a process in the
+  same session can sign until the approval lapses. Documented in the README's
+  security model; a hardware key with touch-per-use closes it.

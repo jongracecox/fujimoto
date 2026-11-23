@@ -17,7 +17,9 @@ pydantic):
   failure. `model` (optional) is the project's default model (see
   `launch_options.default_model`). `claude_args` (default `[]`) is the
   project's default launch options; a single string is `shlex.split` by a `field_validator`, so both
-  `claude_args: [--a, b]` and `claude_args: --a b` work.
+  `claude_args: [--a, b]` and `claude_args: --a b` work. `broadcast` (default
+  `True`) can only opt a project *out* of `fujimoto broadcast` — trust (the
+  signers) is global config so a repo cannot name its own key.
 - `load_project_config(project_root)` — returns an empty config if the file is
   absent; raises `ConfigError` (reusing `config.ConfigError`) on malformed YAML
   or validation failure (config errors are surfaced, not swallowed).
