@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -55,7 +56,7 @@ def _keypair(dir_: Path, name: str) -> tuple[Path, str]:
 @pytest.fixture
 def alice(tmp_path: Path) -> tuple[Path, Signer]:
     path, pub = _keypair(tmp_path, "alice")
-    return path, Signer("alice", pub)
+    return path, Signer("alice", pub, "user")
 
 
 @pytest.fixture
@@ -458,7 +459,7 @@ class TestWait:
         code, text = _wait_posting([alice[1]], "proj", [msg])
         assert code == broadcast.EXIT_DELIVER
         assert text.startswith(
-            "Broadcast from the user (via fujimoto, signed by alice)."
+            "Broadcast from the user (via fujimoto, signed by alice, id "
         )
         assert "next safe stopping point" in text
         assert text.endswith("summarise to Slack")
@@ -974,7 +975,14 @@ class TestCli:
     ) -> None:
         _cli(monkeypatch, "enable")
         assert "No signers yet" in capsys.readouterr().out
-        _cli(monkeypatch, "add-signer", "alice", str(alice[0].with_suffix(".pub")))
+        _cli(
+            monkeypatch,
+            "add-signer",
+            "alice",
+            str(alice[0].with_suffix(".pub")),
+            "--role",
+            "user",
+        )
         _cli(monkeypatch, "set-key", str(alice[0]))
         config = broadcast.load_config()
         assert (
@@ -1188,7 +1196,7 @@ class TestConfig:
             "  - {name: 'bad name', public_key: 'ssh-ed25519 AAAA'}\n"
             "  - {name: junk, public_key: 'not a key'}\n"
         )
-        assert broadcast.load_config().signers == [alice[1]]
+        assert broadcast.load_config().signers == [replace(alice[1], role="agent")]
 
     def test_invalid_file_fails_closed(self) -> None:
         from fujimoto.global_config import global_config_path
@@ -1394,7 +1402,7 @@ def test_targeted_message_reads_as_a_message(alice: tuple[Path, Signer]) -> None
     _, text = broadcast.wait(
         mine, signers, "p", sleep=lambda _: None, max_polls=1, claude_pid=99
     )
-    assert text.startswith("Message from the user (via fujimoto, signed by alice).")
+    assert text.startswith("Message from the user (via fujimoto, signed by alice, id ")
     (row,) = broadcast.status()
     assert row.signer == "alice" and row.delivered == 1 and row.rejected == 0
 
@@ -1493,3 +1501,224 @@ async def test_message_log_empty_and_unreadable_detail() -> None:
             assert "unreadable" in text and "No session has received it" in text
             await app.action_show_messages()  # off the home screen: ignored
             assert app._on_message_detail
+
+
+# ---------------------------------------------------------------------------
+# Signer roles, relayed approval, signer re-verification
+# ---------------------------------------------------------------------------
+
+
+class TestRoles:
+    def test_preambles(self) -> None:
+        p = broadcast.new_payload("x", None, now=NOW)
+        user = broadcast.preamble(p, "laptop", "user")
+        assert user.startswith(
+            f"Broadcast from the user (via fujimoto, signed by laptop, id {p.id})."
+        )
+        agent = broadcast.preamble(p, "helper-agent", "agent")
+        assert agent.startswith(
+            f"Broadcast from helper-agent, an agent with a trusted key (via fujimoto, id {p.id})."
+        )
+        assert "from the user" not in agent
+        approved = broadcast.new_payload(
+            "x",
+            None,
+            now=NOW,
+            session=SID_A,
+            approval="nightly summary in every session",
+        )
+        relayed = broadcast.preamble(approved, "helper-agent", "agent")
+        assert relayed.startswith("Message from helper-agent, an agent")
+        assert (
+            "relaying the user's approval: “nightly summary in every session”"
+            in relayed
+        )
+        assert (
+            "that approval is its claim" in relayed
+            and "permission prompts still apply" in relayed
+        )
+        # A user signer's message needs no relayed approval wording.
+        assert "relaying" not in broadcast.preamble(approved, "laptop", "user")
+        assert "an unknown signer" in broadcast.preamble(p, None, "agent")
+        assert all(
+            s.endswith("safe stopping point in your current work.")
+            for s in (user, agent, relayed)
+        )
+
+    def test_signer_role_lookup(self, alice: tuple[Path, Signer]) -> None:
+        assert broadcast.signer_role([alice[1]], "alice") == "user"
+        assert broadcast.signer_role([alice[1]], "stranger") == "agent"
+
+    def test_roles_travel_in_the_hook_token(
+        self, alice: tuple[Path, Signer], mallory: tuple[Path, Signer]
+    ) -> None:
+        signers = [alice[1], mallory[1]]  # user, agent
+        assert broadcast.decode_signers(broadcast.encode_signers(signers)) == signers
+
+    def test_legacy_token_reads_as_user(self, alice: tuple[Path, Signer]) -> None:
+        import base64
+
+        token = base64.urlsafe_b64encode(
+            json.dumps([["old", alice[1].public_key]]).encode()
+        ).decode()
+        assert broadcast.decode_signers(token) == [
+            Signer("old", alice[1].public_key, "user")
+        ]
+        bad = base64.urlsafe_b64encode(
+            json.dumps([["x", alice[1].public_key, "boss"]]).encode()
+        ).decode()
+        with pytest.raises(BroadcastError, match="unknown role"):
+            broadcast.decode_signers(bad)
+
+    def test_agent_delivery_names_the_agent(self, mallory: tuple[Path, Signer]) -> None:
+        signers = [mallory[1]]
+        msg = _signed(
+            mallory[0],
+            signers,
+            broadcast.new_payload("status?", "p", approval="ok to report"),
+        )
+        code, text = _wait_posting(signers, "p", [msg])
+        assert code == 2 and text.startswith("Broadcast from mallory, an agent")
+        assert "“ok to report”" in text
+
+    def test_approval_payload(self) -> None:
+        p = broadcast.new_payload("m", None, now=NOW, approval="  yes  ")
+        assert p.approval == "yes" and Payload.from_bytes(p.to_bytes()) == p
+        assert b"approval" not in broadcast.new_payload("m", None, now=NOW).to_bytes()
+        for bad in ("", " ", "x" * (broadcast.MAX_APPROVAL_CHARS + 1)):
+            with pytest.raises(BroadcastError, match="--approval"):
+                broadcast.new_payload("m", None, now=NOW, approval=bad)
+        raw = json.loads(p.to_bytes())
+        for bad_value in (3, "", "y" * (broadcast.MAX_APPROVAL_CHARS + 1)):
+            raw["approval"] = bad_value
+            with pytest.raises(BroadcastError, match="bad approval"):
+                Payload.from_bytes(json.dumps(raw).encode())
+
+    def test_send_with_approval(self, mallory: tuple[Path, Signer]) -> None:
+        config = BroadcastSettings(
+            enabled=True, signers=[mallory[1]], signing_key=str(mallory[0])
+        )
+        result = broadcast.send("hi", "p", approval="go", wait=0, config=config)
+        assert (
+            result.payload.approval == "go"
+            and broadcast.send_json(result)["approval"] == "go"
+        )
+        assert broadcast.status_json(broadcast.status())[0]["approval"] == "go"
+
+    def test_config_roles_roundtrip(
+        self, alice: tuple[Path, Signer], mallory: tuple[Path, Signer]
+    ) -> None:
+        config = BroadcastSettings(True, [alice[1], mallory[1]], None)
+        broadcast.save_config(config)
+        assert broadcast.load_config() == config
+        shown = broadcast.format_show(config)
+        assert "alice (user)" in shown and "mallory (agent)" in shown
+        assert [s["role"] for s in broadcast.show_json(config)["signers"]] == [
+            "user",
+            "agent",
+        ]
+
+
+class TestReverify:
+    def test_receipt_without_signer_is_reverified(
+        self, alice: tuple[Path, Signer], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _use_config(monkeypatch, BroadcastSettings(True, [alice[1]]))
+        entry = broadcast.post(*_signed(alice[0], [alice[1]], _payload()))
+        broadcast._write_receipt(
+            broadcast.Receipt(entry.name, "s", "p", None, "delivered", None, "t")
+        )
+        (row,) = broadcast.status()
+        assert row.signer == "alice" and row.verified_signer == "alice"
+        assert broadcast.status_json([row])[0]["signer"] == "alice"
+
+    def test_named_receipt_skips_the_check(
+        self, alice: tuple[Path, Signer], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _use_config(monkeypatch, BroadcastSettings(True, [alice[1]]))
+        entry = broadcast.post(*_signed(alice[0], [alice[1]], _payload()))
+        broadcast._write_receipt(
+            broadcast.Receipt(
+                entry.name, "s", "p", None, "delivered", None, "t", "alice"
+            )
+        )
+        monkeypatch.setattr(
+            broadcast, "_reverify", lambda *a: pytest.fail("re-verified")
+        )
+        assert broadcast.status()[0].signer == "alice"
+
+    def test_unverifiable_or_no_signers(
+        self,
+        alice: tuple[Path, Signer],
+        mallory: tuple[Path, Signer],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        entry = broadcast.post(*_signed(mallory[0], [mallory[1]], _payload()))
+        assert broadcast._reverify(entry, []) is None
+        assert broadcast._reverify(entry, [alice[1]]) is None
+
+
+class TestRoleCli:
+    def test_add_with_role_and_set_role(
+        self,
+        alice: tuple[Path, Signer],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _cli(monkeypatch, "add-signer", "laptop", alice[1].public_key, "--role", "user")
+        _cli(monkeypatch, "add-signer", "helper", alice[1].public_key)
+        assert [s.role for s in broadcast.load_config().signers] == ["user", "agent"]
+        _cli(monkeypatch, "set-role", "helper", "user")
+        assert broadcast.load_config().signers[1].role == "user"
+        assert "helper is now a user signer" in capsys.readouterr().out
+        with pytest.raises(SystemExit):
+            _cli(monkeypatch, "set-role", "ghost", "agent")
+        assert "no signer called ghost" in capsys.readouterr().err
+
+    def test_send_approval_flag(
+        self,
+        mallory: tuple[Path, Signer],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from fujimoto import cli
+
+        _cli(monkeypatch, "add-signer", "helper", mallory[1].public_key)
+        capsys.readouterr()
+        _cli(
+            monkeypatch,
+            "send",
+            "hi",
+            "--all-projects",
+            "--approval",
+            "go ahead",
+            "--key",
+            str(mallory[0]),
+            "--wait",
+            "0",
+            "--json",
+        )
+        assert json.loads(capsys.readouterr().out)["approval"] == "go ahead"
+        _listen("1", SID_A)
+        monkeypatch.setattr(
+            broadcast, "_registry_names", lambda: {SID_A: ("t/one", None)}
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "fujimoto",
+                "send",
+                "t/one",
+                "hi",
+                "--approval",
+                "ok",
+                "--key",
+                str(mallory[0]),
+                "--wait",
+                "0",
+                "--json",
+            ],
+        )
+        cli.main()
+        assert json.loads(capsys.readouterr().out)["approval"] == "ok"

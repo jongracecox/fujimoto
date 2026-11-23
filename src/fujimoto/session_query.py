@@ -1317,6 +1317,13 @@ class LogReport:
     # `--summary` on a raw fallback: only the links can be recovered.
     summarized: bool = False
     raw_links: tuple[Link, ...] = ()
+    # Index of the last message (or line) in the whole transcript, -1 when
+    # empty. Pass it back as `--after` to read only what comes next.
+    cursor: int = -1
+    # `--reply-to ID`: the id asked about, and the index of the injected
+    # message that delivered it (None until it has been delivered).
+    reply_to: str | None = None
+    delivered_index: int | None = None
 
     @property
     def session_id(self) -> str:
@@ -1377,8 +1384,17 @@ def load_log(
     tail: int | None = None,
     summary: bool = False,
     activity: ActivityIndex | None = None,
+    after: int | None = None,
+    reply_to: str | None = None,
 ) -> LogReport:
     """Read a session's transcript: parsed, or raw lines if the parser fails.
+
+    `after` keeps only messages (or lines) whose transcript index is greater,
+    so a caller can save `cursor` and later read just what is new.
+    `reply_to` keeps the messages that answered one `fujimoto broadcast` /
+    `send` delivery: found by its id in the injected text, then everything
+    up to the next user or injected message (`delivered_index` says where;
+    None means it has not been delivered yet).
 
     `roles` filters parsed messages (default: everything but `injected`) and
     is meaningless for raw lines. `grep` keeps the messages (or lines) it
@@ -1427,8 +1443,14 @@ def load_log(
     breaks: frozenset[int] = frozenset()
     digest: Summary | None = None
     raw_links: tuple[Link, ...] = ()
+    cursor = len(parsed if parsed is not None else raw or []) - 1
+    delivered_index: int | None = None
     if parsed is not None:
         everything = [(i, _classify(m)) for i, m in enumerate(parsed)]
+        if reply_to is not None:
+            delivered_index, everything = _reply_span(everything, reply_to)
+        if after is not None:
+            everything = [item for item in everything if item[0] > after]
         if summary:
             digest = summarize(everything)
             messages = []
@@ -1447,6 +1469,10 @@ def load_log(
             )
     else:
         indexed = list(enumerate(raw or []))
+        if after is not None:
+            indexed = [item for item in indexed if item[0] > after]
+        if reply_to is not None:
+            indexed = []  # needs a parsed transcript to find the delivery
         total = len(indexed)
         if summary:
             raw_links = tuple(extract_links([line for _, line in indexed]))
@@ -1482,6 +1508,9 @@ def load_log(
         summary=digest,
         summarized=summary,
         raw_links=raw_links,
+        cursor=cursor,
+        reply_to=reply_to,
+        delivered_index=delivered_index,
     )
     debug.log(
         "query.log",
@@ -1495,6 +1524,53 @@ def load_log(
         links=len(digest.links if digest else raw_links),
         metadata=session is not None,
         running=found.running,
+    )
+    return report
+
+
+def _reply_span(
+    items: list[tuple[int, TranscriptMessage]], message_id: str
+) -> tuple[int | None, list[tuple[int, TranscriptMessage]]]:
+    """Where message `message_id` was delivered, and what followed it.
+
+    The delivery is the injected message carrying `id <message_id>` (the
+    broadcast preamble puts it there). Its reply is everything after, up to
+    the next user or injected message — so a following turn, or another
+    broadcast, is not mistaken for part of it.
+    """
+    marker = re.compile(rf"\bid {re.escape(message_id)}\b")
+    for pos, (index, message) in enumerate(items):
+        if message.role == INJECTED and marker.search(message.text):
+            span = []
+            for item in items[pos + 1 :]:
+                if item[1].role in ("user", INJECTED):
+                    break
+                span.append(item)
+            debug.log("query.reply_to", found=True, delivered=index, messages=len(span))
+            return index, span
+    debug.log("query.reply_to", found=False)
+    return None, []
+
+
+def load_log_waiting(
+    load: Callable[[], LogReport],
+    *,
+    wait: float,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> LogReport:
+    """`load()` (a `load_log` call), repeated every second until it shows
+    something or `wait` seconds pass — for `--after` / `--reply-to` callers
+    waiting on a reply."""
+    deadline = clock() + wait
+    report = load()
+    while report.shown == 0 and clock() < deadline:
+        sleep(1.0)
+        report = load()
+    debug.log(
+        "query.log_wait",
+        waited=round(wait - max(0.0, deadline - clock()), 1),
+        shown=report.shown,
     )
     return report
 
@@ -1523,7 +1599,11 @@ def log_json(report: LogReport) -> dict[str, object]:
         "parse_error": report.parse_error,
         "total": report.total,
         "matched": report.matched,
+        "cursor": report.cursor,
     }
+    if report.reply_to is not None:
+        body["reply_to"] = report.reply_to
+        body["delivered_index"] = report.delivered_index
     digest = report.summary
     if digest is not None:
         body["summary"] = {
@@ -1607,6 +1687,14 @@ def format_log(report: LogReport) -> str:
         out.append(f"{'log:':<9} {report.path}")
     if report.parse_error:
         out.append(f"{'warning:':<9} could not parse transcript ({report.parse_error})")
+    out.append(f"{'cursor:':<9} {report.cursor} (pass to --after for what comes next)")
+    if report.reply_to is not None:
+        where = (
+            f"delivered at #{report.delivered_index}"
+            if report.delivered_index is not None
+            else "not delivered yet"
+        )
+        out.append(f"{'reply to:':<9} {report.reply_to} · {where}")
     out.append("")
 
     if report.summary is not None:

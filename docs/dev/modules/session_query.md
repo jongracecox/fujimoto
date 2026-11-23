@@ -81,6 +81,17 @@
   *in the role-filtered list*, recording `breaks` (indices printed after a
   gap, drawn as `⋯`), then `--head`/`--tail`. `total` is the role-filtered
   count; `matched` the grep count.
+- **Incremental reads** (for an agent waiting on a reply). Every report
+  carries `cursor`, the index of the transcript's last message (or raw line);
+  `after=N` keeps only indices above N. `reply_to=ID` (`_reply_span`) finds
+  the injected message whose text has `id <ID>` — the broadcast preamble puts
+  it there — and keeps what followed, up to the next `user` or `injected`
+  message, so the following turn or another broadcast is never taken for the
+  reply; `delivered_index` is None until the delivery appears. Both apply
+  before the role filter. `load_log_waiting(load, wait=)` repeats a `load_log`
+  call every second until it shows something or `wait` runs out (`--wait`).
+  `--summary` with either is a usage error. Instrumented as `query.reply_to`
+  and `query.log_wait`.
 - **`log --summary`** (`summarize`) is the first user prompt, the final
   exchange (`replied_to`: the assistant reply before the last user message,
   since that is often just "yes, do it"; `last_user`; `last_assistant`), role
