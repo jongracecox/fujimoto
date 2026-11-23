@@ -223,7 +223,8 @@ def test_distant_matches_produce_separate_snippets(tmp_path):
 
 def test_no_match_returns_none(tmp_path):
     log = _simple_log(tmp_path / "a.jsonl", "hello")
-    assert search_log(log, compile_matcher("needle")) is None
+    text = compile_matcher("needle", mode=ContentMode.TEXT)
+    assert search_log(log, text) is None
 
 
 def test_unreadable_log_returns_none(tmp_path):
@@ -234,7 +235,8 @@ def test_unparseable_log_returns_none(tmp_path):
     # Contains the query but yields no session — nothing to offer the user.
     log = tmp_path / "a.jsonl"
     log.write_text("needle, but not JSON\n")
-    assert search_log(log, compile_matcher("needle")) is None
+    text = compile_matcher("needle", mode=ContentMode.TEXT)
+    assert search_log(log, text) is None
 
 
 def test_regex_matcher_against_a_log(tmp_path):
@@ -306,12 +308,12 @@ def test_text_mode_skips_unparseable_and_blank_lines(tmp_path):
     "entry",
     [
         {},
-        {"message": "not a dict"},
-        {"message": {}},
-        {"message": {"content": 42}},
-        {"message": {"content": ["a string block", None]}},
-        {"message": {"content": [{"type": "text"}]}},
-        {"message": {"content": [{"type": "tool_use", "text": "x"}]}},
+        {"type": "user", "message": "not a dict"},
+        {"type": "user", "message": {}},
+        {"type": "user", "message": {"content": 42}},
+        {"type": "user", "message": {"content": ["a string block", None]}},
+        {"type": "user", "message": {"content": [{"type": "text"}]}},
+        {"type": "user", "message": {"content": [{"type": "tool_use", "text": "x"}]}},
     ],
 )
 def test_message_text_tolerates_odd_shapes(entry):
@@ -320,14 +322,57 @@ def test_message_text_tolerates_odd_shapes(entry):
 
 def test_message_text_joins_multiple_blocks():
     entry = {
+        "type": "assistant",
         "message": {
             "content": [
                 {"type": "text", "text": "one"},
                 {"type": "text", "text": "two"},
             ]
-        }
+        },
     }
     assert _message_text(entry) == "one\ntwo"
+
+
+def test_message_text_skips_injected_blocks():
+    entry = _entry(
+        "user",
+        [
+            {"type": "text", "text": "<system-reminder>\nContents of CLAUDE.md"},
+            {"type": "text", "text": "the real prompt"},
+        ],
+    )
+    assert _message_text(entry) == "the real prompt"
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        _entry("user", "<task-notification>done</task-notification>"),
+        _entry("user", "  <local-command-stdout>ok"),
+        _entry("user", "skill body", isMeta=True),
+        _entry("api-request-blob", "a copy of the whole request"),
+        _entry("attachment", "anything"),
+    ],
+)
+def test_message_text_skips_what_nobody_said(entry):
+    assert _message_text(entry) == ""
+
+
+def test_text_search_ignores_injected_text_raw_still_finds_it(tmp_path):
+    log = _write_log(
+        tmp_path / "s.jsonl",
+        [
+            _entry("user", [{"type": "text", "text": "<system-reminder>needle"}]),
+            _entry("api-request-blob", [{"type": "text", "text": "needle"}]),
+            _entry("user", "something else"),
+        ],
+    )
+    text = compile_matcher("needle", mode=ContentMode.TEXT)
+    assert search_log(log, text) is None
+    hit = search_log(log, compile_matcher("needle", mode=ContentMode.RAW))
+    assert hit is not None
+    assert hit.breakdown is not None
+    assert (hit.breakdown.message, hit.breakdown.other) == (0, 2)
 
 
 # -- _snippet --
