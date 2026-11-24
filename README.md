@@ -965,6 +965,89 @@ The `Stop` hook re-arms a waiter after every turn, and a lock keeps it to one
 per Claude process. Nothing types into the terminal, and nothing talks to
 Claude Code's internal messaging sockets.
 
+### Claude Desktop and other MCP clients — `fujimoto mcp`
+
+`fujimoto mcp` is a local MCP server (stdio) that gives Claude Desktop, or any
+MCP client, the session tools: list, search and read sessions, start, resume
+and stop them, and message them. It needs the `mcp` extra:
+
+```sh
+uv tool install --force 'fujimoto[mcp]'
+```
+
+| Tool | Does | CLI twin |
+|---|---|---|
+| `list_sessions` | Sessions, newest first; `running_only` for what's live | `fujimoto list` |
+| `search_sessions` | Full-text transcript search | `fujimoto search` |
+| `read_transcript` | One transcript: `summary`, `grep`, `tail`, `after` cursor, `reply_to` + `wait` | `fujimoto log` |
+| `listening_sessions` | Sessions that can receive a message now | `fujimoto broadcast show` |
+| `message_status` | Recent messages and their delivery receipts | `fujimoto broadcast status` |
+| `start_session` | New worktree + session in a project | `fujimoto new --detach` |
+| `start_chat` | Chat session, no worktree | `fujimoto chat --detach` |
+| `resume_session` | Bring a stopped session back (or fork it) | `fujimoto resume --detach` |
+| `stop_session` | Stop a running session | `fujimoto stop` |
+| `send_message` | Signed message to one session *(only with a key)* | `fujimoto send` |
+| `broadcast` | Signed message to a project or everyone *(only with a key)* | `fujimoto broadcast send` |
+
+A read with no window returns the last 40 messages, so the client doesn't pull
+a whole transcript by accident. `read_transcript` with `summary: true` is the
+cheap first look.
+
+#### Setting it up
+
+`fujimoto mcp setup` checks each step below and prints the command for the
+next one, then the exact JSON to add to Claude Desktop's config. It changes
+nothing itself, so you (or Claude, walking you through it) run every step
+knowingly. Re-run it until there are no ✗ lines.
+
+1. **Read-only first.** `fujimoto mcp setup` with no key gives a server that
+   reads, starts and stops sessions, with no messaging. That is a complete
+   setup; stop here if you don't need `send_message` / `broadcast`.
+2. **Give the server its own key.** Messages from the server are signed as an
+   *agent*, so sessions see "Message from claude-desktop, an agent with a
+   trusted key", never "from the user". Don't reuse your own broadcast key:
+   setup refuses a key that is a `user` signer. The private key must be
+   protected at rest and held by an SSH agent. Use whichever you have:
+   - a key manager that holds the key and asks on use (1Password's SSH
+     agent, Secretive, a hardware security key), or
+   - a passphrase-protected key file, loaded with confirmation:
+
+     ```sh
+     ssh-keygen -t ed25519 -C claude-desktop -f ~/.ssh/fujimoto_claude_desktop   # set a passphrase
+     ssh-add -c ~/.ssh/fujimoto_claude_desktop   # -c: confirm every signature (needs ssh-askpass)
+     ```
+3. **Check it.** `fujimoto mcp setup --key ~/.ssh/fujimoto_claude_desktop.pub`
+   (or the literal public key). It fails if you pass the private key, if the
+   private key file has no passphrase, if the SSH agent doesn't hold the key,
+   or if the key isn't a signer yet.
+4. **Trust it as an agent:** `fujimoto broadcast add-signer claude-desktop
+   "<public key>" --role agent`, and `fujimoto broadcast enable` if broadcast
+   is off. Sessions fix their trusted keys at launch, so restart the ones that
+   should receive this agent's messages.
+5. **Add the printed JSON** under `mcpServers` in
+   `~/Library/Application Support/Claude/claude_desktop_config.json` and
+   restart Claude Desktop. It holds an absolute path to `fujimoto`, a `PATH`
+   that finds tmux, git and claude (GUI apps get a minimal one), the public
+   key, and your current `SSH_AUTH_SOCK` so the server reaches the same agent.
+   If your agent's socket changes (a different key manager, a new login), run
+   setup again.
+
+#### What it can and can't do
+
+- **Signing never touches a private key file.** The server passes `send` the
+  *public* key, so `ssh-keygen` asks the agent to sign. The private key stays
+  in the agent or key manager.
+- **The agent is the boundary.** Anything running as you that can reach the
+  agent can sign as `claude-desktop`. That is why per-use confirmation (step
+  2) matters, and why setup reports it as a warning it can't verify.
+- **No relayed approvals.** The server has no way to send `--approval`:
+  nothing it sends claims you approved an action.
+- **Claude Desktop asks before each tool call** (unless you allow a tool
+  always). Starting and stopping sessions and sending messages are marked as
+  write tools, and `stop_session` as destructive.
+- **Everything is local.** The server runs as you on this machine, over
+  stdio. It has no network listener.
+
 ### Home Screen
 
 ```

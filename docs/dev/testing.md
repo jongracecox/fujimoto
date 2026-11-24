@@ -33,3 +33,7 @@ TUI tests follow this pattern:
 - Use `pilot.press()` to simulate keyboard input
 - Navigate to items by setting `list.index` directly (more reliable than repeated `pilot.press("down")`)
 - Assert on app state (`_launch_target`, `_base_branch`, `_session_map`) and DOM queries (`app.query()`)
+
+The `mcp` package is in the `dev` group as well as the `mcp` extra. A plain
+`uv run pytest` re-syncs the environment *without* extras, which would
+otherwise drop `mcp` and silently skip `tests/test_mcp_server.py`.
