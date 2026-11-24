@@ -1,7 +1,8 @@
 """The user's global fujimoto config, `~/.config/fujimoto/config.yaml`.
 
 Holds preferences that apply to every project: the default Claude model, the
-quick-terminal toggle and `fujimoto broadcast`'s settings. `$XDG_CONFIG_HOME` moves it. Same contract as
+quick-terminal toggle, the TUI's PageUp/PageDown step and `fujimoto
+broadcast`'s settings. `$XDG_CONFIG_HOME` moves it. Same contract as
 `.fujimoto.yaml`: optional, YAML, validated with pydantic, and a malformed file
 raises `ConfigError` so it can be shown rather than silently ignored.
 
@@ -16,11 +17,12 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from fujimoto import debug
 
 from .config import ConfigError
+from .paging import parse_page_step
 from .yaml_edit import update_key
 
 XDG_CONFIG_HOME_ENV = "XDG_CONFIG_HOME"
@@ -64,7 +66,18 @@ class GlobalConfig(BaseModel):
     # Whether the server-global quick-terminal key binding is installed.
     # None means the first-launch prompt has not been answered yet.
     quick_terminal: bool | None = None
+    # How far PageUp/PageDown move in TUI lists: `50%` of the viewport or a
+    # row count such as `8`. None means the default (`paging.DEFAULT`).
+    page_step: str | None = None
     broadcast: BroadcastConfig = Field(default_factory=BroadcastConfig)
+
+    @field_validator("page_step", mode="before")
+    @classmethod
+    def _check_page_step(cls, value: object) -> object:
+        # YAML reads `page_step: 8` as an int; keep the normalised text.
+        if value is None:
+            return None
+        return str(parse_page_step(value))
 
 
 def global_config_path() -> Path:
@@ -98,6 +111,7 @@ def load_global_config() -> GlobalConfig:
         valid=True,
         model=config.model is not None,
         quick_terminal=config.quick_terminal,
+        page_step=config.page_step,
     )
     return config
 

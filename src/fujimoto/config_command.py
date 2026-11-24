@@ -29,6 +29,7 @@ from fujimoto import debug
 
 from .config import ConfigError
 from .git import GitError, get_main_worktree_root
+from .paging import parse_page_step
 from .global_config import (
     GlobalConfig,
     global_config_path,
@@ -66,6 +67,13 @@ def _parse_bool(text: str) -> object:
     if lowered in _FALSE:
         return False
     raise ConfigError(f"expected true/false (or on/off), got {text!r}")
+
+
+def _parse_page_step(text: str) -> object:
+    try:
+        return str(parse_page_step(text))
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def _parse_args(text: str) -> object:
@@ -106,6 +114,13 @@ KEYS: tuple[KeySpec, ...] = (
         "Install the server-global quick-terminal key binding (true/false).",
         (Scope.GLOBAL,),
         _parse_bool,
+    ),
+    KeySpec(
+        "page_step",
+        "How far PageUp/PageDown move in TUI lists: a share of the visible "
+        "rows (50%, the default) or a row count (8).",
+        (Scope.GLOBAL,),
+        _parse_page_step,
     ),
     KeySpec(
         "claude_args",

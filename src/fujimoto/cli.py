@@ -19,7 +19,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import NamedTuple, NoReturn
+from typing import ClassVar, NamedTuple, NoReturn
 
 from rich.markup import escape
 from textual import events, on, work
@@ -113,6 +113,8 @@ from fujimoto import version_check
 from fujimoto.version_check import check_for_update, dismiss as dismiss_update_version
 from fujimoto.vscode import open_vscode
 from fujimoto.global_config import load_global_config
+from fujimoto.paging import DEFAULT as DEFAULT_PAGE_STEP
+from fujimoto.paging import PageStep, parse_page_step
 from fujimoto.settings import Settings, load_settings, save_settings
 from fujimoto import chats, config_command, session_query, session_state
 from fujimoto import broadcast
@@ -1220,7 +1222,12 @@ class PagingListView(ListView):
     through to the scroll container: the view moves but the highlight stays
     put, and the next arrow key scrolls straight back to it. Here they move
     the highlight instead, and the view follows it.
+
+    How far a page moves comes from `page_step` (see `paging.py`), shared by
+    every list in the app: `SessionApp` loads it from the global config.
     """
+
+    page_step: ClassVar[PageStep] = DEFAULT_PAGE_STEP
 
     BINDINGS = [
         Binding("pageup", "page_cursor(-1)", "Page up", show=False),
@@ -1241,23 +1248,32 @@ class PagingListView(ListView):
         return None
 
     def action_page_cursor(self, direction: int) -> None:
-        """Move the highlight by one viewport's worth of rows."""
+        """Move the highlight by `page_step`: a share of the viewport, or N rows."""
         nodes = self._nodes
         if not nodes:
             return
         if self.index is None:
             self.action_edge_cursor(direction)
             return
-        # Rows can be taller than one line (search results carry snippets),
-        # so count rows until their heights fill the viewport.
-        page = max(self.scrollable_content_region.height, 1)
+        step = self.page_step
         index = self.index
-        covered = 0
-        while 0 <= index + direction < len(nodes):
-            covered += max(nodes[index + direction].outer_size.height, 1)
-            if covered > page:
-                break
-            index += direction
+        if step.kind == "rows":
+            moved = 0
+            while moved < step.amount and 0 <= index + direction < len(nodes):
+                index += direction
+                moved += 1
+        else:
+            # Rows can be taller than one line (search results carry
+            # snippets), so count rows until their heights fill the share of
+            # the viewport.
+            viewport = max(self.scrollable_content_region.height, 1)
+            page = max(viewport * step.amount // 100, 1)
+            covered = 0
+            while 0 <= index + direction < len(nodes):
+                covered += max(nodes[index + direction].outer_size.height, 1)
+                if covered > page:
+                    break
+                index += direction
         if index == self.index:
             # Viewport too small to hold another row: still make progress.
             index = max(0, min(len(nodes) - 1, index + direction))
@@ -1816,6 +1832,7 @@ class SessionApp(App):
                 await self._show_tmux_install()
                 return
             self._init_git_info()
+            self._load_page_step()
             self._start_update_check()
             await self._show_home()
             await self._open_pending_fork()
@@ -1828,6 +1845,21 @@ class SessionApp(App):
         except (ConfigError, GitError) as e:
             debug.log_exception("tui.mount_failed", e)
             await self._show_error(str(e))
+
+    def _load_page_step(self) -> None:
+        """Apply the `page_step` global config key to every `PagingListView`.
+
+        Read at startup and on refresh (`r`), never while rendering. An
+        invalid config falls back to the default; the config error dialog
+        already reports it.
+        """
+        try:
+            raw = load_global_config().page_step
+        except ConfigError:
+            raw = None
+        step = DEFAULT_PAGE_STEP if raw is None else parse_page_step(raw)
+        PagingListView.page_step = step
+        debug.log("tui.page_step", page_step=str(step), configured=raw is not None)
 
     def _start_update_check(self) -> None:
         def _run() -> None:
@@ -2931,6 +2963,7 @@ class SessionApp(App):
         if not self._on_home or not self.query("#home-list"):
             return
         self._init_git_info()
+        self._load_page_step()
         debug.log(
             "tui.refresh",
             project=debug.rv(self._project_name),

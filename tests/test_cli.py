@@ -27,6 +27,8 @@ from fujimoto.claude import (
 from fujimoto.claude.log_parser import EntryType, StopReason
 from types import SimpleNamespace
 
+from fujimoto.global_config import global_config_path
+from fujimoto.paging import PageStep
 from fujimoto.cli import (
     FUJIMOTO_CLI_PROMPT,
     _reattach_target,
@@ -1890,9 +1892,111 @@ class _PagingApp(App):
         )
 
 
+@pytest.fixture(autouse=True)
+def _default_page_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reset the app-wide page step, which `SessionApp` sets from the config."""
+    monkeypatch.setattr(PagingListView, "page_step", PageStep("percent", 50))
+
+
 class TestPagingListView:
     @pytest.mark.asyncio
-    async def test_pagedown_moves_highlight_by_a_page(self) -> None:
+    async def test_default_pagedown_moves_half_a_page(self) -> None:
+        app = _PagingApp(rows=100)
+        async with app.run_test(size=(40, 10)) as pilot:
+            lv = app.query_one("#list", PagingListView)
+            lv.focus()
+            lv.index = 0
+            await pilot.pause()
+            half = lv.scrollable_content_region.height // 2
+            assert half >= 2
+            await pilot.press("pagedown")
+            await pilot.pause()
+            assert lv.index == half
+            await pilot.press("pagedown")
+            await pilot.pause()
+            assert lv.index == 2 * half
+            await pilot.press("pageup")
+            await pilot.pause()
+            assert lv.index == half
+
+    @pytest.mark.asyncio
+    async def test_quarter_page_step(self) -> None:
+        PagingListView.page_step = PageStep("percent", 25)
+        app = _PagingApp(rows=100)
+        async with app.run_test(size=(40, 20)) as pilot:
+            lv = app.query_one("#list", PagingListView)
+            lv.focus()
+            lv.index = 50
+            await pilot.pause()
+            quarter = lv.scrollable_content_region.height // 4
+            assert quarter >= 2
+            await pilot.press("pageup")
+            await pilot.pause()
+            assert lv.index == 50 - quarter
+
+    @pytest.mark.asyncio
+    async def test_tiny_percentage_still_moves_one_row(self) -> None:
+        PagingListView.page_step = PageStep("percent", 1)
+        app = _PagingApp(rows=100)
+        async with app.run_test(size=(40, 10)) as pilot:
+            lv = app.query_one("#list", PagingListView)
+            lv.focus()
+            lv.index = 0
+            await pilot.pause()
+            await pilot.press("pagedown")
+            await pilot.pause()
+            assert lv.index == 1
+
+    @pytest.mark.asyncio
+    async def test_row_count_step(self) -> None:
+        PagingListView.page_step = PageStep("rows", 3)
+        app = _PagingApp(rows=100)
+        async with app.run_test(size=(40, 10)) as pilot:
+            lv = app.query_one("#list", PagingListView)
+            lv.focus()
+            lv.index = 10
+            await pilot.pause()
+            await pilot.press("pagedown")
+            await pilot.pause()
+            assert lv.index == 13
+            await pilot.press("pageup", "pageup")
+            await pilot.pause()
+            assert lv.index == 7
+
+    @pytest.mark.asyncio
+    async def test_row_count_larger_than_viewport(self) -> None:
+        # A row count is taken literally, even past the visible rows.
+        PagingListView.page_step = PageStep("rows", 30)
+        app = _PagingApp(rows=100)
+        async with app.run_test(size=(40, 10)) as pilot:
+            lv = app.query_one("#list", PagingListView)
+            lv.focus()
+            lv.index = 0
+            await pilot.pause()
+            await pilot.press("pagedown")
+            await pilot.pause()
+            assert lv.index == 30
+
+    @pytest.mark.asyncio
+    async def test_row_count_clamps_and_skips_disabled(self) -> None:
+        PagingListView.page_step = PageStep("rows", 4)
+        app = _PagingApp(rows=12, disabled={4, 5})
+        async with app.run_test(size=(40, 10)) as pilot:
+            lv = app.query_one("#list", PagingListView)
+            lv.focus()
+            lv.index = 0
+            await pilot.pause()
+            await pilot.press("pagedown")
+            await pilot.pause()
+            # Row 4 is a separator: the next enabled row in the direction.
+            assert lv.index == 6
+            await pilot.press("pagedown", "pagedown")
+            await pilot.pause()
+            assert lv.index == 11
+
+    @pytest.mark.asyncio
+    async def test_full_page_step_moves_highlight_by_a_page(self) -> None:
+        PagingListView.page_step = PageStep("percent", 100)
         app = _PagingApp(rows=100)
         async with app.run_test(size=(40, 10)) as pilot:
             lv = app.query_one("#list", PagingListView)
@@ -1948,6 +2052,7 @@ class TestPagingListView:
 
     @pytest.mark.asyncio
     async def test_paging_skips_disabled_rows(self) -> None:
+        PagingListView.page_step = PageStep("percent", 100)
         app = _PagingApp(rows=100, disabled=set(range(5, 30)))
         async with app.run_test(size=(40, 10)) as pilot:
             lv = app.query_one("#list", PagingListView)
@@ -12853,3 +12958,45 @@ class TestRestartLoop:
             main()
         run.assert_called_once()
         attach.assert_not_called()
+
+
+class TestLoadPageStep:
+    def _write_config(self, text: str) -> None:
+        path = global_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def test_unset_uses_half_a_page(self) -> None:
+        PagingListView.page_step = PageStep("rows", 9)
+        SessionApp()._load_page_step()
+        assert PagingListView.page_step == PageStep("percent", 50)
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("page_step: 25%\n", PageStep("percent", 25)),
+            ("page_step: 6\n", PageStep("rows", 6)),
+        ],
+    )
+    def test_reads_the_global_config(self, text: str, expected: PageStep) -> None:
+        self._write_config(text)
+        SessionApp()._load_page_step()
+        assert PagingListView.page_step == expected
+
+    def test_invalid_config_falls_back_to_default(self) -> None:
+        self._write_config("page_step: 0%\n")
+        SessionApp()._load_page_step()
+        assert PagingListView.page_step == PageStep("percent", 50)
+
+    @pytest.mark.asyncio
+    async def test_refresh_rereads_the_config(self, tmp_path: Path) -> None:
+        wt = tmp_path / "20260308-feature"
+        with _patch_git_info(worktrees=[wt]):
+            app = SessionApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert PagingListView.page_step == PageStep("percent", 50)
+                self._write_config("page_step: 4\n")
+                await pilot.press("r")
+                await pilot.pause()
+                assert PagingListView.page_step == PageStep("rows", 4)

@@ -11,6 +11,7 @@ src/fujimoto/
 ├── tmux.py       # tmux session lifecycle (create, attach, kill, list, install)
 ├── version.py    # importlib.metadata wrapper for the running fujimoto version
 ├── version_check.py  # daily PyPI update check, dismissals, install detection, agent notice
+├── paging.py     # PageUp/PageDown step (`page_step`) for TUI lists
 ├── settings.py   # TUI preferences (quick_terminal), stored in the global config
 ├── global_config.py   # ~/.config/fujimoto/config.yaml: model, quick_terminal
 ├── config_command.py  # `fujimoto config` list/get/set/unset (UI-free) + key registry

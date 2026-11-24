@@ -2,7 +2,7 @@
 
 **`global_config.py`** — `~/.config/fujimoto/config.yaml` (`$XDG_CONFIG_HOME`
 moves it; `global_config_path()`). Pydantic `GlobalConfig(extra="forbid")` with
-`model`, `quick_terminal` and `broadcast` (`BroadcastConfig`: `enabled`,
+`model`, `quick_terminal`, `page_step` (validated and normalised to text by `paging.parse_page_step`, so YAML `8` reads as `"8"`) and `broadcast` (`BroadcastConfig`: `enabled`,
 `signers: list[SignerConfig(name, public_key)]`, `signing_key`; managed by
 `fujimoto broadcast`, not the `config` registry — see `broadcast.md`).
 `load_global_config()` has the same contract as
