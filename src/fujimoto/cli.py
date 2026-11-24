@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -136,7 +137,12 @@ from fujimoto.tmux import (
     rename_session,
     PENDING_CLOSE,
     PENDING_FORK,
+    PENDING_RESTART,
     PENDING_STOP,
+    attach_session,
+    current_session,
+    loop_client,
+    request_restart,
     session_name,
     set_terminal_title,
     take_pending_action,
@@ -7615,6 +7621,145 @@ def _run_update_command(args: argparse.Namespace) -> None:
     _finish_debug_log()
 
 
+RESTART_OUTSIDE_SESSION = (
+    "restart reloads the fujimoto running this session, e.g. after an "
+    "upgrade. Run it inside a fujimoto session, or use --all to restart every "
+    "attached fujimoto."
+)
+RESTART_NO_LOOP = (
+    "no fujimoto is attached to {name} (it was started with --detach or "
+    "attached with plain tmux); quit and start fujimoto to load a new version"
+)
+
+
+def _run_restart_command(args: argparse.Namespace) -> None:
+    """`fujimoto restart [--all] [--json]`: re-execute attached fujimoto loops.
+
+    Each loop is flagged and detached; it re-executes itself in its own
+    terminal and reattaches (`_restart_fujimoto`). A session with no loop
+    behind it is skipped, since detaching it would strand the user at a shell.
+    `--session` is the `Ctrl-A r` binding's entry point: it reports through
+    the status line, because `run-shell` output would cover the pane.
+    """
+    if args.all:
+        names = list_all_sessions()
+    else:
+        name = args.session or current_session()
+        if name is None:
+            _finish_debug_log()
+            print(f"fujimoto: {RESTART_OUTSIDE_SESSION}", file=sys.stderr)
+            sys.exit(1)
+        names = [name]
+    restarted: list[str] = []
+    skipped: list[str] = []
+    for name in names:
+        client = loop_client(name)
+        if client is None:
+            skipped.append(name)
+            continue
+        try:
+            request_restart(name, client)
+        except subprocess.CalledProcessError as e:
+            debug.log_exception("restart.request_failed", e)
+            skipped.append(name)
+            continue
+        restarted.append(name)
+    debug.log(
+        "restart.done",
+        all=args.all,
+        restarted=len(restarted),
+        skipped=len(skipped),
+    )
+    _finish_debug_log()
+    if args.session and not args.all:
+        if skipped:
+            display_message(args.session, RESTART_NO_LOOP.format(name=args.session))
+        return
+    if args.json:
+        print(json.dumps({"restarted": restarted, "skipped": skipped}))
+    elif args.all:
+        print(f"restarted: {', '.join(restarted) or 'none'}")
+        if skipped:
+            print(f"skipped:   {', '.join(skipped)} (no fujimoto attached)")
+    elif restarted:
+        print(f"Restarting fujimoto for {restarted[0]}.")
+    if not args.all and skipped:
+        print(f"fujimoto: {RESTART_NO_LOOP.format(name=skipped[0])}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _add_restart_commands(sub: argparse._SubParsersAction) -> None:
+    """`restart [--all]`."""
+    restart = sub.add_parser(
+        "restart",
+        help="Reload the fujimoto running this session (e.g. after upgrading)",
+        description=(
+            "Detaches this session's fujimoto, which re-executes itself (picking "
+            "up a newly installed version) and reattaches to the same session in "
+            "the same terminal. The Claude session keeps running throughout. "
+            "Inside a session, `Ctrl-A r` does the same. With --all, restarts "
+            "every fujimoto attached to a session; sessions with none are "
+            "skipped."
+        ),
+    )
+    restart.add_argument(
+        "--all", action="store_true", help="Restart every attached fujimoto"
+    )
+    restart.add_argument("--json", action="store_true", help="Print JSON")
+    # The `Ctrl-A r` binding names its session, since `run-shell` has no pane.
+    restart.add_argument("--session", help=argparse.SUPPRESS)
+
+
+def _reattach_target(name: str) -> LaunchTarget | None:
+    """A target for reattaching to running session `name` after a restart.
+
+    None (and so the home screen) when the session has gone or fujimoto has
+    no record of it.
+    """
+    record = session_state.load_state().get(name)
+    if record is None or not session_exists(name):
+        debug.log("restart.reattach", session=debug.rv(name), result="missing")
+        return None
+    return LaunchTarget(record.project, Path(record.cwd), name, record.session_type)
+
+
+def _reattach(target: LaunchTarget) -> str:
+    """Attach to an already-running session, skipping launch setup."""
+    assert target.tmux_name is not None  # _reattach_target always names it
+    debug.log("restart.reattach", session=debug.rv(target.tmux_name), result="attach")
+    set_terminal_title(
+        _session_terminal_title(
+            target.project, target.tmux_name, target.working_dir, target.session_type
+        )
+    )
+    attach_session(target.tmux_name)
+    return target.tmux_name
+
+
+def _restart_fujimoto(tmux_name: str) -> None:
+    """Replace this process with a fresh fujimoto that reattaches to `tmux_name`.
+
+    `exec` keeps the pid and the terminal, so the user lands back in the same
+    session in the same window, now on whatever version is installed. Returns
+    only if the exec failed, leaving the old process to carry on.
+    """
+    program = sys.argv[0] if Path(sys.argv[0]).is_file() else None
+    program = program or shutil.which("fujimoto")
+    flags = [a for a in sys.argv[1:] if a in ("--debug", "--debug-redacted")]
+    debug.log("restart.exec", session=debug.rv(tmux_name), found=program is not None)
+    if program is None:
+        print("fujimoto: restart failed: fujimoto not found on PATH", file=sys.stderr)
+        return
+    _finish_debug_log()
+    set_terminal_title("")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        os.execv(program, [program, *flags, "--attach", tmux_name])
+    except OSError as e:
+        print(f"fujimoto: restart failed: {e}", file=sys.stderr)
+
+
 def _add_update_commands(sub: argparse._SubParsersAction) -> None:
     """`update [check|dismiss]`."""
     update = sub.add_parser(
@@ -8364,6 +8509,8 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Write a commented .fujimoto.yaml template to the repo root and exit",
     )
+    # Internal: `_restart_fujimoto` re-executes fujimoto with this to reattach.
+    parser.add_argument("--attach", metavar="SESSION", help=argparse.SUPPRESS)
     parser.add_argument(
         "--debug",
         action="store_true",
@@ -8390,6 +8537,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_broadcast_command(sub)
     _add_send_command(sub)
     _add_update_commands(sub)
+    _add_restart_commands(sub)
     new = sub.add_parser(
         "new",
         help="Create a worktree and launch Claude in it",
@@ -8543,6 +8691,9 @@ def main() -> None:
     if args.command == "update":
         _run_update_command(args)
         return
+    if args.command == "restart":
+        _run_restart_command(args)
+        return
     if args.command == "agent-instructions":
         print(session_query.agent_instructions(), end="")
         _finish_debug_log()
@@ -8572,6 +8723,12 @@ def main() -> None:
         # `fujimoto new` skips the TUI for its first launch only; detaching
         # then lands on the home screen like any other session.
         initial_target: LaunchTarget | None = None
+        # `--attach` is how a restarted fujimoto (see `_restart_fujimoto`)
+        # gets back into the session it was restarted from.
+        reattach = False
+        if args.attach:
+            initial_target = _reattach_target(args.attach)
+            reattach = initial_target is not None
         if args.command in ("new", "resume", "chat"):
             prepare = {
                 "new": _prepare_new_session,
@@ -8596,7 +8753,11 @@ def main() -> None:
                 target = app._launch_target
 
             if target:
-                resolved_name = _start_launch(target)
+                if reattach:
+                    reattach = False
+                    resolved_name = _reattach(target)
+                else:
+                    resolved_name = _start_launch(target)
                 if resolved_name is None:
                     continue  # setup failed and on_error=abort -> reopen the TUI
                 project_name = target.project
@@ -8605,7 +8766,10 @@ def main() -> None:
                 # `Ctrl-A f` / `s` / `x` inside the session flag it and detach,
                 # handing the work to the TUI (which can show pickers/prompts).
                 action = take_pending_action(resolved_name)
-                if action == PENDING_FORK:
+                if action == PENDING_RESTART:
+                    # Only returns if the exec failed; the old code carries on.
+                    _restart_fujimoto(resolved_name)
+                elif action == PENDING_FORK:
                     pending_fork = working_dir
                 elif action == PENDING_STOP:
                     # Stop needs no prompt: the record stays open, so the

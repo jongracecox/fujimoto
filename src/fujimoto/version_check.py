@@ -299,10 +299,12 @@ def agent_update_notice(current: str, latest: str, install: InstallInfo) -> str:
     >>> print(agent_update_notice("1.0.0", "1.1.0", info))  # doctest: +NORMALIZE_WHITESPACE
     fujimoto 1.1.0 is available (installed: 1.0.0, via uv tool). At a natural
     pause, ask the user once whether to upgrade it: yes, not now, or don't ask
-    again. Yes: run `uv tool upgrade fujimoto`; it applies to fujimoto processes
-    started afterwards. Not now: do nothing, so a later session asks again.
-    Don't ask again: run `fujimoto update dismiss 1.1.0`, which stops new
-    sessions asking about this version.
+    again. Yes: run `uv tool upgrade fujimoto`, then ask whether to restart
+    fujimoto now to load it (this session keeps running); if so, run `fujimoto
+    restart`, and if that reports no fujimoto attached, tell the user to quit
+    and start fujimoto again. Not now: do nothing, so a later session asks
+    again. Don't ask again: run `fujimoto update dismiss 1.1.0`, which stops
+    new sessions asking about this version.
     """
     if install.upgrade_command:
         how = f"run `{install.upgrade_command}`"
@@ -319,8 +321,11 @@ def agent_update_notice(current: str, latest: str, install: InstallInfo) -> str:
     return (
         f"fujimoto {latest} is available (installed: {current}, via "
         f"{install.method.value}). At a natural pause, ask the user once whether "
-        f"to upgrade it: yes, not now, or don't ask again. Yes: {how}; it "
-        f"applies to fujimoto processes started afterwards. Not now: do nothing, "
+        f"to upgrade it: yes, not now, or don't ask again. Yes: {how}, then ask "
+        f"whether to restart fujimoto now to load it (this session keeps "
+        f"running); if so, run `fujimoto restart`, and if that reports no "
+        f"fujimoto attached, tell the user to quit and start fujimoto again. "
+        f"Not now: do nothing, "
         f"so a later session asks again. Don't ask again: run `fujimoto update "
         f"dismiss {latest}`, which stops new sessions asking about this version."
     )

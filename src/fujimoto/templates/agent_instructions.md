@@ -147,10 +147,32 @@ fujimoto update dismiss 1.4.0    # stop new sessions offering 1.4.0
 
 When a newer release is out, a new session's system prompt says so and
 names the upgrade command for this install (`uv tool`, `pipx`, `pip`). Ask
-the user once: yes, not now, or don't ask again. Yes: run that command.
-Not now: do nothing; a later session asks again. Don't ask again: run
-`update dismiss` with the version, which silences that version only. The
-home screen's banner has its own dismissal.
+the user once: yes, not now, or don't ask again. Yes: run that command,
+then offer to restart fujimoto (below). Not now: do nothing; a later
+session asks again. Don't ask again: run `update dismiss` with the
+version, which silences that version only. The home screen's banner has
+its own dismissal.
+
+```sh
+fujimoto restart          # reload the fujimoto running this session
+fujimoto restart --all    # every attached fujimoto, from anywhere
+```
+
+`restart` detaches the fujimoto behind this session, which re-executes
+itself on the installed version and reattaches in the same terminal. This
+session keeps running, so ask the user before running it: their screen
+flickers. It exits 1 when no fujimoto is attached (a `--detach` session, or
+one attached with plain tmux); then tell the user to quit and start fujimoto
+again.
+
+- Run `--all` only when the user asks: it flickers every terminal that has
+  fujimoto attached. It acts directly, so don't broadcast a restart request
+  to other sessions' agents.
+- Never run tmux server commands yourself (`tmux kill-server`,
+  `detach-client`, `kill-session`). You are inside the user's own tmux
+  server, and `$TMUX` points every `tmux` command at it, even with
+  `TMUX_TMPDIR` set: `kill-server` ends every session. `fujimoto stop` and
+  `fujimoto restart` are the safe ways to act on a session.
 
 ### Start a conversation: `fujimoto chat`
 
@@ -255,6 +277,8 @@ Each of these is a starting point. Combine the commands as the question needs.
 - **Broker between sessions.** A `chat` session can `search`, `log` and
   message other sessions for you, which keeps their transcripts out of your
   context.
+- **Upgrade fujimoto.** `update` for the command, run it once the user
+  agrees, then `restart` (with their OK) so the running fujimoto loads it.
 - **Pick the right starter.** `new` when the task changes code (it gets a
   branch to finish), `chat` when the answer is the deliverable, `resume` or
   `SendMessage` when the question is for the session that did the work. A

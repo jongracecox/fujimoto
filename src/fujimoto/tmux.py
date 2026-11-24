@@ -375,6 +375,12 @@ PENDING_ACTION_OPTION = "@fujimoto_pending_action"
 PENDING_FORK = "fork"
 PENDING_STOP = "stop"
 PENDING_CLOSE = "close"
+PENDING_RESTART = "restart"
+# The pid of the fujimoto launch loop attached to a session, set for as long
+# as its `tmux attach` runs. `fujimoto restart` uses it to tell a session a
+# loop is waiting behind from one attached with plain `tmux attach`, where
+# detaching would leave the user at a shell.
+LOOP_PID_OPTION = "@fujimoto_loop_pid"
 
 
 def _configure_session(name: str) -> None:
@@ -397,7 +403,7 @@ def _configure_session(name: str) -> None:
     if meta_key:
         meta_label = _meta_key_label(meta_key)
         status_right = (
-            f'"Fujimoto: {meta_label} t/T/w/v/f/s/d/x/[ ({meta_label} t toggles) | '
+            f'"Fujimoto: {meta_label} t/T/w/v/f/s/d/r/x/[ ({meta_label} t toggles) | '
             f'help: {meta_label} ?"'
         )
         status_len = "120"
@@ -489,6 +495,10 @@ def _configure_fujimoto_key_table(name: str, meta_key: str) -> None:
             "detach-client",
         ],
         ["d", "detach-client"],
+        # Restart goes through the CLI rather than a bare set-option/detach:
+        # the CLI first checks a fujimoto loop is attached, so pressing it in
+        # a plain `tmux attach` reports an error instead of detaching.
+        ["r", "run-shell", "fujimoto restart --session #{session_name}"],
         # With one pane, killing it ends the session — so hand over to the TUI,
         # which asks whether to terminate (forget it) or merely stop it. With a
         # split open, `x` keeps its original meaning: kill just this pane.
@@ -507,7 +517,7 @@ def _configure_fujimoto_key_table(name: str, meta_key: str) -> None:
             "-d",
             "5000",
             "F-mode: t/T=split  v=code  w=window  f=fork  s=stop  "
-            "d=detach  x=terminate  [=copy  ?=help",
+            "d=detach  r=restart fujimoto  x=terminate  [=copy  ?=help",
         ],
     ]
     for key, *cmd in fujimoto_bindings:
@@ -643,7 +653,14 @@ def create_session_with_command(name: str, working_dir: Path, command: str) -> N
 
 
 def attach_session(name: str) -> None:
+    """Attach to `name` until the user detaches, marking it with our pid."""
     debug.log("tmux.attach", session=debug.rv(name), phase="start")
+    _refresh_session_config(name)
+    pid = str(os.getpid())
+    subprocess.run(
+        ["tmux", "set-option", "-t", name, LOOP_PID_OPTION, pid],
+        capture_output=True,
+    )
     result = subprocess.run(["tmux", "attach-session", "-t", name])
     debug.log(
         "tmux.attach",
@@ -651,6 +668,123 @@ def attach_session(name: str) -> None:
         phase="returned",
         rc=result.returncode,
     )
+    # Leave the mark alone if another loop has attached since and taken it.
+    if _session_option(name, LOOP_PID_OPTION) == pid:
+        subprocess.run(
+            ["tmux", "set-option", "-t", name, "-u", LOOP_PID_OPTION],
+            capture_output=True,
+        )
+
+
+def _refresh_session_config(name: str) -> None:
+    """Re-apply this fujimoto's tmux config to a session it is attaching to.
+
+    The key table is server-global and was installed by whichever fujimoto
+    created a session, so reattaching after an upgrade would otherwise keep
+    the old bindings (no `Ctrl-A r` until some session was newly created).
+    A failure must not stop the attach: the old bindings still work.
+    """
+    try:
+        _configure_session(name)
+    except (TmuxError, subprocess.CalledProcessError, OSError) as e:
+        debug.log_exception("tmux.refresh_config_failed", e)
+
+
+def _session_option(name: str, option: str) -> str | None:
+    """A user option's value on session `name`; None if unset or no session."""
+    result = subprocess.run(
+        ["tmux", "show-options", "-t", name, "-v", option],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _parent_pids(pids: Sequence[int]) -> dict[int, int]:
+    """`{pid: parent pid}` for those of `pids` still running."""
+    if not pids:
+        return {}
+    result = subprocess.run(
+        ["ps", "-o", "pid=,ppid=", "-p", ",".join(str(p) for p in pids)],
+        capture_output=True,
+        text=True,
+    )
+    parents: dict[int, int] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and all(f.isdigit() for f in fields):
+            parents[int(fields[0])] = int(fields[1])
+    return parents
+
+
+def loop_client(name: str) -> str | None:
+    """The tty of the client a fujimoto loop has attached to session `name`.
+
+    The loop marks the session with its pid (`LOOP_PID_OPTION`) and runs
+    `tmux attach` as a child, so the client to detach is the one whose parent
+    is that pid. A stale mark (the loop died) or a session attached only with
+    plain `tmux attach` has no such client, and None means detaching would
+    strand the user at a shell.
+    """
+    mark = _session_option(name, LOOP_PID_OPTION)
+    if mark is None or not mark.isdigit():
+        debug.log("tmux.loop_client", session=debug.rv(name), result="unmarked")
+        return None
+    result = subprocess.run(
+        ["tmux", "list-clients", "-t", name, "-F", "#{client_pid} #{client_tty}"],
+        capture_output=True,
+        text=True,
+    )
+    clients: dict[int, str] = {}
+    for line in result.stdout.splitlines():
+        pid, _, tty = line.partition(" ")
+        if pid.isdigit() and tty:
+            clients[int(pid)] = tty
+    parents = _parent_pids(list(clients))
+    for pid, tty in clients.items():
+        if parents.get(pid) == int(mark):
+            debug.log("tmux.loop_client", session=debug.rv(name), result="found")
+            return tty
+    debug.log(
+        "tmux.loop_client",
+        session=debug.rv(name),
+        result="no-client",
+        clients=len(clients),
+    )
+    return None
+
+
+def request_restart(name: str, client_tty: str) -> None:
+    """Flag `name` for a restart and detach the loop's client.
+
+    The loop wakes from `tmux attach`, finds `PENDING_RESTART` and re-executes
+    fujimoto, which reattaches to the same session.
+    """
+    debug.log("tmux.request_restart", session=debug.rv(name))
+    subprocess.run(
+        ["tmux", "set-option", "-t", name, PENDING_ACTION_OPTION, PENDING_RESTART],
+        capture_output=True,
+        check=True,
+    )
+    subprocess.run(
+        ["tmux", "detach-client", "-t", client_tty], capture_output=True, check=True
+    )
+
+
+def current_session() -> str | None:
+    """The tmux session this process runs in, or None outside tmux."""
+    pane = os.environ.get("TMUX_PANE")
+    if not os.environ.get("TMUX") or not pane:
+        return None
+    result = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", pane, "#{session_name}"],
+        capture_output=True,
+        text=True,
+    )
+    name = result.stdout.strip()
+    return name if result.returncode == 0 and name else None
 
 
 def take_pending_action(name: str) -> str | None:
