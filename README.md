@@ -967,8 +967,8 @@ Claude Code's internal messaging sockets.
 
 ### Claude Desktop and other MCP clients — `fujimoto mcp`
 
-`fujimoto mcp` is a local MCP server (stdio) that gives Claude Desktop, or any
-MCP client, the session tools: list, search and read sessions, start, resume
+`fujimoto mcp` is a local MCP server (stdio) that gives Claude Desktop, the
+ChatGPT desktop app, Codex, or any local MCP client, the session tools: list, search and read sessions, start, resume
 and stop them, and message them. It needs the `mcp` extra:
 
 ```sh
@@ -1037,6 +1037,19 @@ knowingly. Re-run it until there are no ✗ lines.
    To edit the file yourself instead, `fujimoto mcp setup [--key …] --config-only`
    prints just `{"mcpServers": {"fujimoto": …}}` (nothing if a check fails) to
    merge into `~/Library/Application Support/Claude/claude_desktop_config.json`.
+
+   **ChatGPT desktop and Codex:** `fujimoto mcp setup chatgpt` (or `codex`,
+   the same thing) writes the same server as `[mcp_servers.fujimoto]` into
+   `~/.codex/config.toml` (`$CODEX_HOME` moves it). The ChatGPT desktop app
+   and the Codex CLI share that file, so both get the server. Only
+   fujimoto's own tables are touched: the rest of the file, comments
+   included, stays byte-for-byte, and the new file is parsed before it is
+   written. The same backup, update and `--replace` rules apply, and
+   `setup chatgpt --config-only` prints the TOML instead. Then quit the
+   ChatGPT app (⌘Q) and reopen it. ChatGPT on the web and on mobile only
+   reach *remote* MCP servers (public HTTPS), so they aren't supported:
+   fujimoto's server controls your sessions and never listens on the
+   network.
 
    The entry holds an absolute path to `fujimoto`, a `PATH` that finds tmux,
    git and claude (GUI apps get a minimal one), the public key, and your

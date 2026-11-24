@@ -8119,10 +8119,12 @@ def _add_mcp_command(sub: argparse._SubParsersAction) -> None:
     setup.add_argument(
         "client",
         nargs="?",
-        choices=("claude-desktop",),
+        choices=("claude-desktop", "chatgpt", "codex"),
         help=(
-            "Also write the entry into this client's config (backed up first; "
-            "only if every check passes)"
+            "Also write the entry into this client's config, backed up first and "
+            "only if every check passes (chatgpt and codex share "
+            "~/.codex/config.toml); with --config-only, print it in that "
+            "client's format instead"
         ),
     )
     setup.add_argument("--key", help="The public key the server will sign with")
@@ -8189,23 +8191,21 @@ def _run_mcp_command(args: argparse.Namespace) -> None:
 def _install_mcp_client(
     args: argparse.Namespace, report: mcp_setup_types.SetupReport
 ) -> None:
-    """`fujimoto mcp setup claude-desktop`: write the entry if every check passes."""
+    """`fujimoto mcp setup CLIENT`: write the entry if every check passes."""
     from fujimoto import mcp_setup
 
-    if args.config_only:
-        _finish_debug_log()
-        print(
-            "fujimoto: --config-only prints config; drop it to write it",
-            file=sys.stderr,
-        )
-        sys.exit(2)
     if not report.ok:
         _finish_debug_log()
         print(mcp_setup.format_failures(report), file=sys.stderr)
         sys.exit(1)
+    if args.config_only:
+        # Print in the client's own format (TOML for chatgpt/codex); write nothing.
+        print(mcp_setup.client_snippet(args.client, report.desktop_config))
+        _finish_debug_log()
+        return
     try:
-        result = mcp_setup.install_desktop_config(
-            report.desktop_config, replace=args.replace
+        result = mcp_setup.install_client_config(
+            args.client, report.desktop_config, replace=args.replace
         )
     except mcp_setup.InstallError as e:
         _finish_debug_log()

@@ -457,6 +457,7 @@ class TestInstallDesktopConfig:
         replaced = mcp_setup.InstallResult(mcp_setup.REPLACED, p, None, "-a\n+b")
         assert "Updated" in mcp_setup.format_install(replaced)
         assert mcp_setup.install_json(same) == {
+            "client": "claude-desktop",
             "status": "unchanged",
             "path": str(p),
             "backup": None,
@@ -521,14 +522,192 @@ class TestInstallCli:
         assert exc.value.code == 1
         assert "Claude Desktop installed" in capsys.readouterr().err
 
+    def test_replace_needs_a_client(self) -> None:
+        with pytest.raises(SystemExit) as exc:
+            self._main("mcp", "setup", "--replace")
+        assert exc.value.code == 2
+
+    def test_config_only_with_client_prints_its_format(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        path = tmp_path / "codex" / "config.toml"
+        path.parent.mkdir()
+        with patch.object(mcp_setup, "codex_config_path", return_value=path):
+            self._main("mcp", "setup", "chatgpt", "--config-only")
+        out = capsys.readouterr().out
+        assert out.startswith("[mcp_servers.fujimoto]\n")
+        assert not path.exists()  # printed, not written
+        self._main("mcp", "setup", "claude-desktop", "--config-only")
+        assert "mcpServers" in json.loads(capsys.readouterr().out)
+
+    def test_chatgpt_writes_toml(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        path = tmp_path / "codex" / "config.toml"
+        path.parent.mkdir()
+        path.write_text('model = "x"\n')
+        with patch.object(mcp_setup, "codex_config_path", return_value=path):
+            self._main("mcp", "setup", "codex", "--json")
+        result = json.loads(capsys.readouterr().out)
+        assert result["client"] == "codex" and result["status"] == "added"
+        import tomllib
+
+        data = tomllib.loads(path.read_text())
+        assert data["model"] == "x"
+        assert data["mcp_servers"]["fujimoto"]["args"] == ["mcp"]
+
+
+CODEX_CONFIG = """\
+# Codex / ChatGPT desktop config
+model = "gpt-x"
+
+[desktop]
+theme = "light"   # keep this comment
+
+[mcp_servers.node_repl]
+command = "/Applications/ChatGPT.app/node_repl"
+args = []
+startup_timeout_sec = 120
+
+[mcp_servers.node_repl.env]
+CODEX_HOME = "/Users/someone/.codex"
+
+[plugins."browser@openai-bundled"]
+enabled = true
+"""
+
+
+def _codex_file(tmp_path: Path, text: str = CODEX_CONFIG) -> Path:
+    path = tmp_path / ".codex" / "config.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(0o600)
+    return path
+
+
+def _toml(path: Path) -> dict:
+    import tomllib
+
+    return tomllib.loads(path.read_text())
+
+
+TOML_ENTRY = {
+    "command": "/Users/someone/.local/bin/fujimoto",
+    "args": ["mcp", "--key", "ssh-ed25519 AAAA"],
+    "env": {"PATH": "/usr/bin:/bin", "SSH_AUTH_SOCK": "/Users/some one/agent.sock"},
+}
+
+
+class TestCodexConfig:
+    def test_appends_and_leaves_the_rest_byte_for_byte(self, tmp_path: Path) -> None:
+        path = _codex_file(tmp_path)
+        result = mcp_setup.install_client_config(
+            "chatgpt", TOML_ENTRY, path=path, stamp="1"
+        )
+        assert result.status == mcp_setup.ADDED
+        text = path.read_text()
+        assert text.startswith(CODEX_CONFIG)  # untouched, comments included
+        assert _toml(path)["mcp_servers"]["fujimoto"] == TOML_ENTRY
+        assert _toml(path)["mcp_servers"]["node_repl"]["startup_timeout_sec"] == 120
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert result.backup is not None and result.backup.read_text() == CODEX_CONFIG
+        assert "ChatGPT app" in mcp_setup.format_install(result)
+
+    def test_rerun_is_a_no_op(self, tmp_path: Path) -> None:
+        path = _codex_file(tmp_path)
+        mcp_setup.install_client_config("chatgpt", TOML_ENTRY, path=path, stamp="1")
+        before = path.read_text()
+        again = mcp_setup.install_client_config("codex", TOML_ENTRY, path=path)
+        assert again.status == mcp_setup.UNCHANGED
+        assert path.read_text() == before
+
+    def test_own_block_is_updated_in_place(self, tmp_path: Path) -> None:
+        old = mcp_setup.toml_block(
+            {"command": "/x/fujimoto", "args": ["--debug-redacted", "mcp"]}
+        )
+        text = CODEX_CONFIG.replace("[plugins.", old + "\n[plugins.", 1)
+        path = _codex_file(tmp_path, text)
+        result = mcp_setup.install_client_config(
+            "chatgpt", TOML_ENTRY, path=path, stamp="1"
+        )
+        assert result.status == mcp_setup.REPLACED
+        ours = _toml(path)["mcp_servers"]["fujimoto"]
+        assert ours["args"] == ["--debug-redacted", "mcp", "--key", "ssh-ed25519 AAAA"]
+        new_text = path.read_text()
+        # Same place: still before the plugins table, nothing else moved.
+        assert new_text.index("[mcp_servers.fujimoto]") < new_text.index("[plugins.")
+        assert new_text.count("[mcp_servers.fujimoto]") == 1
+        assert _toml(path)["plugins"] == _toml(_codex_file(tmp_path / "o"))["plugins"]
+
+    def test_foreign_entry_needs_replace(self, tmp_path: Path) -> None:
+        text = (
+            CODEX_CONFIG
+            + '\n[mcp_servers.fujimoto]\ncommand = "node"\nargs = ["x.js"]\n'
+        )
+        path = _codex_file(tmp_path, text)
+        result = mcp_setup.install_client_config("chatgpt", TOML_ENTRY, path=path)
+        assert result.status == mcp_setup.CONFLICT
+        assert path.read_text() == text
+        result = mcp_setup.install_client_config(
+            "chatgpt", TOML_ENTRY, path=path, replace=True, stamp="1"
+        )
+        assert result.status == mcp_setup.REPLACED
+        assert _toml(path)["mcp_servers"]["fujimoto"] == TOML_ENTRY
+
     @pytest.mark.parametrize(
-        "argv",
+        "form",
         [
-            ("mcp", "setup", "claude-desktop", "--config-only"),
-            ("mcp", "setup", "--replace"),
+            '[mcp_servers]\nfujimoto = { command = "/x/fujimoto", args = ["mcp"] }\n',
+            'mcp_servers.fujimoto.command = "/x/fujimoto"\n'
+            'mcp_servers.fujimoto.args = ["mcp"]\n',
         ],
     )
-    def test_misuse(self, argv: tuple[str, ...]) -> None:
-        with pytest.raises(SystemExit) as exc:
-            self._main(*argv)
-        assert exc.value.code == 2
+    def test_forms_it_cannot_edit_are_refused(self, tmp_path: Path, form: str) -> None:
+        path = _codex_file(tmp_path, form)
+        with pytest.raises(mcp_setup.InstallError, match="can't edit safely"):
+            mcp_setup.install_client_config("chatgpt", TOML_ENTRY, path=path)
+        assert path.read_text() == form
+        assert list(path.parent.glob("*.bak-*")) == []
+
+    def test_invalid_toml_is_left_alone(self, tmp_path: Path) -> None:
+        path = _codex_file(tmp_path, "this is = = not toml\n")
+        with pytest.raises(mcp_setup.InstallError, match="not valid TOML"):
+            mcp_setup.install_client_config("chatgpt", TOML_ENTRY, path=path)
+
+    def test_mcp_servers_not_a_table(self, tmp_path: Path) -> None:
+        path = _codex_file(tmp_path, 'mcp_servers = "nope"\n')
+        with pytest.raises(mcp_setup.InstallError, match="not a table"):
+            mcp_setup.install_client_config("chatgpt", TOML_ENTRY, path=path)
+
+    @pytest.mark.parametrize("text", ["", "model = 1", "model = 1\n", "model = 1\n\n"])
+    def test_append_spacing(self, tmp_path: Path, text: str) -> None:
+        path = _codex_file(tmp_path, text)
+        mcp_setup.install_client_config("chatgpt", TOML_ENTRY, path=path, stamp="1")
+        new = path.read_text()
+        assert "\n\n\n" not in new
+        assert _toml(path)["mcp_servers"]["fujimoto"] == TOML_ENTRY
+
+    def test_missing_file_and_dir(self, tmp_path: Path) -> None:
+        path = tmp_path / ".codex" / "config.toml"
+        with pytest.raises(mcp_setup.InstallError, match="ChatGPT desktop app"):
+            mcp_setup.install_client_config("chatgpt", TOML_ENTRY, path=path)
+        path.parent.mkdir()
+        mcp_setup.install_client_config("chatgpt", TOML_ENTRY, path=path)
+        assert path.read_text() == mcp_setup.toml_block(TOML_ENTRY)
+
+    def test_codex_home(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "ch"))
+        assert mcp_setup.codex_config_path() == tmp_path / "ch" / "config.toml"
+        monkeypatch.delenv("CODEX_HOME")
+        assert mcp_setup.codex_config_path() == Path.home() / ".codex" / "config.toml"
+        assert mcp_setup.config_path("chatgpt") == mcp_setup.codex_config_path()
+
+    def test_block_without_env_and_snippets(self) -> None:
+        block = mcp_setup.toml_block({"command": "/x/fujimoto", "args": ["mcp"]})
+        assert ".env]" not in block
+        assert mcp_setup.client_snippet("codex", TOML_ENTRY).startswith("[mcp_servers.")
+        assert "mcpServers" in mcp_setup.client_snippet("claude-desktop", TOML_ENTRY)
+
+    def test_codex_restart_message(self, tmp_path: Path) -> None:
+        r = mcp_setup.InstallResult(mcp_setup.ADDED, tmp_path, client="codex")
+        assert "new Codex session" in mcp_setup.format_install(r)

@@ -46,7 +46,7 @@ install command when the extra is missing.
 - Instrumented as `mcp.serve` (started, messaging / reason), `mcp.tool`
   (tool, ok) and `mcp.cli` (command, rc: int, `timeout` or `oserror`).
 
-**`mcp_setup.py`**: `fujimoto mcp setup [claude-desktop] [--key KEY] [--replace] [--name N] [--json | --config-only]`.
+**`mcp_setup.py`**: `fujimoto mcp setup [claude-desktop|chatgpt|codex] [--key KEY] [--replace] [--name N] [--json | --config-only]`.
 Stdlib + `broadcast` only, so it runs before the extra is installed.
 Read-only unless a client is named: `check_setup` returns `Check(name, status ok|warn|fail, detail,
 fix[])` for the mcp package, tmux, the key (must be public; a private key
@@ -71,10 +71,11 @@ contains "shim": terminal wrappers such as cmux put per-session shim dirs
 first, and those are gone when Claude Desktop starts the server later.
 Logged as `mcp.setup` (one `name=status` list).
 
-**`setup claude-desktop`** (`install_desktop_config`, CLI `_install_mcp_client`)
-writes `desktop_entry` into `desktop_config_path()`, and only when
+**`setup CLIENT`** (`install_client_config`, CLI `_install_mcp_client`)
+writes `desktop_entry` into `config_path(client)`, and only when
 `report.ok`: a failing setup gets `format_failures` on stderr and exit 1,
-the same rule as `--config-only` (which it can't be combined with). Steps:
+the same rule as `--config-only`, which with a client prints `client_snippet` in
+that client's format (JSON or TOML) instead of writing. Steps:
 parse the file (invalid JSON, a non-object, or a non-object `mcpServers` →
 `InstallError`, nothing touched; a missing file is created `0600`; a missing
 `Claude/` directory is an error), compare the current `fujimoto` entry
@@ -87,4 +88,21 @@ a temp file in the same directory with the original mode and `os.replace` it,
 then read it back and restore the backup if anything other than
 `mcpServers.fujimoto` changed. Indentation is detected from the file and
 key order kept (`json` preserves insertion order). Logged as
-`mcp.desktop_install` (status, backup).
+`mcp.client_install` (client, status, backup).
+
+Each client is a `_Format` (`_FORMATS`): the table name, a parser and a
+renderer. Claude Desktop is JSON (`mcpServers`, `_render_json` re-serializes
+with the detected indent). `chatgpt` and its alias `codex` are TOML
+(`mcp_servers` in `codex_config_path()`: `$CODEX_HOME/config.toml` or
+`~/.codex/config.toml`, shared by the ChatGPT desktop app and the Codex CLI).
+`_render_toml` is a text edit: it drops every `[mcp_servers.fujimoto…]` table
+(each runs to the next header), puts `toml_block(entry)` where the first one
+was or at the end, and leaves every other byte alone. stdlib has no TOML
+writer, and a round-trip library would reformat a file the ChatGPT app
+manages. Safety comes from `unchanged_but_ours`: the rendered text is parsed
+and must equal the original with only `fujimoto` changed, or the install is
+refused (`InstallError`, nothing written). That is how an inline table or
+dotted-key definition, which the text edit can't see, is caught.
+`toml_block` writes strings as JSON strings, which are valid TOML basic
+strings for anything setup produces. Logged as `mcp.client_install` (client,
+status, backup).
