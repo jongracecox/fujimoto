@@ -107,3 +107,23 @@ Verified with live sessions while building `fujimoto broadcast` (Claude Code
   on the first `-Y sign` and not on the second (0.11s), so a process in the
   same session can sign until the approval lapses. Documented in the README's
   security model; a hardware key with touch-per-use closes it.
+
+## MCP server
+
+- **Claude Desktop starts servers in `/` with a minimal `PATH`.** `new` and
+  `resume` refuse to run outside a git repo, so the server sets the
+  subprocess cwd (project root / the session's cwd). Homebrew's tmux and
+  `~/.local/bin/claude` aren't on the default `PATH`, which is why setup puts
+  a `PATH` in the Desktop config.
+- **`which` finds terminal shims first.** cmux puts
+  `~/.cmuxterm/cmux-cli-shims/<id>/claude` ahead on `PATH`, a directory that
+  is gone after that terminal closes. `mcp_setup._stable_dir` skips dirs named
+  `*shim*`, but only by their last two path components: a temp dir like
+  `test_stable_dir_skips_shims0` once made it skip everything.
+- **Don't match ssh-keygen errors by a word.** `ssh-keygen -y -P ''` echoes
+  the key path in its error. Matching "passphrase" anywhere in stderr called
+  a missing key "encrypted" when the path contained the word. Match the
+  phrase "incorrect passphrase".
+- **mcp 2.x renamed `FastMCP` to `MCPServer`** (`mcp.server.mcpserver`).
+  `MCPServer.call_tool` *raises* `ToolError`, and the protocol layer turns
+  it into an `is_error` result, so in-process tests expect the raise.

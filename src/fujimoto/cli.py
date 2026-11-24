@@ -8081,6 +8081,65 @@ def _add_broadcast_command(sub: argparse._SubParsersAction) -> None:
     )
 
 
+def _add_mcp_command(sub: argparse._SubParsersAction) -> None:
+    """`mcp [--key KEY]` serves; `mcp setup [--key KEY] [--name N]` checks."""
+    mcp = sub.add_parser(
+        "mcp",
+        help="Run a local MCP server (stdio) for Claude Desktop",
+        description=(
+            "Serve fujimoto's session tools over MCP on stdin/stdout, for an MCP "
+            "client such as Claude Desktop. Needs the `mcp` extra. Run "
+            "`fujimoto mcp setup` first: it checks a secure setup and prints the "
+            "client config."
+        ),
+    )
+    mcp.add_argument(
+        "--key",
+        help=(
+            "Public key (literal or .pub path) of an agent-role signer held by "
+            "your SSH agent; turns on send_message and broadcast"
+        ),
+    )
+    msub = mcp.add_subparsers(dest="mcp_command")
+    setup = msub.add_parser(
+        "setup",
+        help="Check the MCP server's setup and print the Claude Desktop config",
+        description=(
+            "Read-only: checks each step of a secure setup (agent-held signing "
+            "key with a passphrase, agent-role signer, broadcast enabled) and "
+            "prints the command for anything missing, then the config to add "
+            "to Claude Desktop."
+        ),
+    )
+    setup.add_argument("--key", help="The public key the server will sign with")
+    setup.add_argument(
+        "--name", default="claude-desktop", help="Signer name (default claude-desktop)"
+    )
+    setup.add_argument("--json", action="store_true", help="Print JSON")
+
+
+def _run_mcp_command(args: argparse.Namespace) -> None:
+    """`fujimoto mcp`: serve over stdio, or `setup` to check and configure."""
+    if args.mcp_command == "setup":
+        from fujimoto import mcp_setup
+
+        report = mcp_setup.check_setup(args.key, name=args.name)
+        if args.json:
+            print(json.dumps(mcp_setup.report_json(report), indent=2))
+        else:
+            print(mcp_setup.format_report(report))
+        _finish_debug_log()
+        if not report.ok:
+            sys.exit(1)
+        return
+    from fujimoto import mcp_server
+
+    code = mcp_server.serve(args.key)
+    _finish_debug_log()
+    if code:
+        sys.exit(code)
+
+
 def _add_send_command(sub: argparse._SubParsersAction) -> None:
     """`send`: a signed message to one session (same machinery as `broadcast`)."""
     send = sub.add_parser(
@@ -8671,6 +8730,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_send_command(sub)
     _add_update_commands(sub)
     _add_restart_commands(sub)
+    _add_mcp_command(sub)
     new = sub.add_parser(
         "new",
         help="Create a worktree and launch Claude in it",
@@ -8826,6 +8886,9 @@ def main() -> None:
         return
     if args.command == "restart":
         _run_restart_command(args)
+        return
+    if args.command == "mcp":
+        _run_mcp_command(args)
         return
     if args.command == "agent-instructions":
         print(session_query.agent_instructions(), end="")

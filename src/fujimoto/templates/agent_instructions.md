@@ -313,6 +313,19 @@ fujimoto log 8f0e2c1a --after 140 --wait 15 --json --fields messages,cursor   # 
   `--reply-to` won't find it. Fall back to `--after` with a cursor you saved
   before sending.
 
+### Claude Desktop: `fujimoto mcp setup`
+
+If the user wants these tools in Claude Desktop (or another MCP client), walk
+them through `fujimoto mcp setup`. It is read-only: it checks each step and
+prints the next command and the Desktop config. Re-run it until nothing
+fails. Let the user create the signing key and run the `add-signer` it prints
+themselves, and never use their own (`user`) key for it.
+
+```sh
+fujimoto mcp setup                                        # read-only server, no messaging
+fujimoto mcp setup --key ~/.ssh/fujimoto_claude_desktop.pub   # with messaging
+```
+
 ## When to use them
 
 Each of these is a starting point. Combine the commands as the question needs.

@@ -41,6 +41,11 @@ build-backend = "hatchling.build"
 [project.scripts]
 fujimoto = "fujimoto.cli:main"
 
+[project.optional-dependencies]
+mcp = [
+    "mcp>=2.3,<3",
+]
+
 [tool.hatch.version]
 source = "vcs"
 fallback-version = "0.0.0"
@@ -58,6 +63,8 @@ dev = [
     "pytest-cov>=7.0.0",
     "ty",
     "nox>=2025.5.1",
+    # The `mcp` extra, so the MCP server's tests run in every dev environment.
+    "mcp>=2.3,<3",
 ]
 
 [tool.pytest.ini_options]
