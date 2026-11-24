@@ -32,6 +32,13 @@ from typing import cast
 from fujimoto import broadcast, debug
 
 DEFAULT_SIGNER = "claude-desktop"
+
+
+def default_signer(client: str | None) -> str:
+    """The signer name `setup` suggests: one per client, so messages name their sender."""
+    return "chatgpt" if client in ("chatgpt", "codex") else DEFAULT_SIGNER
+
+
 SERVER_NAME = "fujimoto"
 OK, WARN, FAIL = "ok", "warn", "fail"
 _MARK = {OK: "✓", WARN: "!", FAIL: "✗"}
@@ -322,7 +329,27 @@ def check_setup(
         )
 
         matches = [s for s in config.signers if s.public_key == public_key]
-        if not matches:
+        taken = next(
+            (
+                s
+                for s in config.signers
+                if s.name == name and s.public_key != public_key
+            ),
+            None,
+        )
+        if not matches and taken is not None:
+            checks.append(
+                Check(
+                    "broadcast signer",
+                    FAIL,
+                    f"the signer name {name!r} is already used by another key "
+                    f"(role {taken.role}); give this key its own name",
+                    [
+                        f'fujimoto mcp setup [CLIENT] --key "{public_key}" --name <new name>'
+                    ],
+                )
+            )
+        elif not matches:
             checks.append(
                 Check(
                     "broadcast signer",

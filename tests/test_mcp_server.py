@@ -30,6 +30,16 @@ def _isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     debug.disable()
 
 
+@pytest.fixture(autouse=True)
+def _refs_pass_through(request: pytest.FixtureRequest):
+    """Session refs reach the mocked loaders as given (TestSessionIdFor aside)."""
+    if request.node.cls is not None and request.node.cls.__name__ == "TestSessionIdFor":
+        yield
+        return
+    with patch.object(mcp_server, "session_id_for", side_effect=lambda ref: ref):
+        yield
+
+
 def _signers(*signers: tuple[str, str, str]) -> None:
     update_global_key(
         "broadcast",
@@ -69,11 +79,15 @@ class TestReadTools:
             patch.object(session_query, "run_list") as run,
             patch.object(session_query, "list_json", return_value={"sessions": []}),
         ):
-            assert mcp_server.list_sessions("proj", False, True, 5) == {"sessions": []}
+            assert mcp_server.list_sessions("proj", False, True, 5, format="json") == {
+                "sessions": []
+            }
         rs.assert_called_once_with(
             project="proj", all_projects=False, outside_repo_all=True
         )
-        run.assert_called_once_with(scope, limit=5, running_only=True)
+        run.assert_called_once_with(
+            scope, limit=5, running_only=True, waiting_only=False, states=(), refs=()
+        )
 
     def test_project_and_all_projects_conflict(self) -> None:
         with pytest.raises(FujimotoToolError, match="not both"):
@@ -113,7 +127,7 @@ class TestReadTools:
             patch.object(session_query, "load_log") as load,
             patch.object(session_query, "log_json", return_value={}),
         ):
-            mcp_server.read_transcript("8f0e2c1a")
+            mcp_server.read_transcript("8f0e2c1a", format="json")
         assert load.call_args.kwargs["tail"] == mcp_server.DEFAULT_TAIL
 
     @pytest.mark.parametrize(
@@ -131,7 +145,7 @@ class TestReadTools:
             patch.object(session_query, "load_log") as load,
             patch.object(session_query, "log_json", return_value={}),
         ):
-            mcp_server.read_transcript("8f0e2c1a", **kwargs)
+            mcp_server.read_transcript("8f0e2c1a", format="json", **kwargs)
         assert load.call_args.kwargs["tail"] is None
 
     def test_read_rejects_unknown_roles(self) -> None:
@@ -147,7 +161,7 @@ class TestReadTools:
             patch.object(session_query, "load_log_waiting") as waiting,
             patch.object(session_query, "log_json", return_value={}),
         ):
-            mcp_server.read_transcript("8f0e2c1a", after=1, wait=9999)
+            mcp_server.read_transcript("8f0e2c1a", after=1, wait=9999, format="json")
         assert waiting.call_args.kwargs["wait"] == mcp_server.MAX_WAIT
 
     def test_reads_a_real_transcript(self, tmp_path: Path) -> None:
@@ -170,8 +184,80 @@ class TestReadTools:
             "gather",
             return_value=session_query.ActivityIndex([], {}, {}),
         ):
-            data = mcp_server.read_transcript("conv")
+            data = mcp_server.read_transcript("conv", format="json")
+            text = mcp_server.read_transcript("conv")
+            cut = mcp_server.read_transcript("conv", fields=["cursor"])
+        assert isinstance(data, dict)
         assert [m["text"] for m in data["messages"]] == ["fix the bug"]
+        assert isinstance(text, str) and "fix the bug" in text
+        assert text.startswith("# session conv")
+        assert cut == {"session_id": "conv", "cursor": 0}
+
+    def test_list_text_default_drops_cli_hints(self) -> None:
+        with (
+            patch.object(session_query, "run_list"),
+            patch.object(
+                session_query,
+                "format_list",
+                return_value="● 8f0e2c1a  proj  now  idle\n\n1 session\nNext: fujimoto list",
+            ),
+        ):
+            out = mcp_server.list_sessions(all_projects=True)
+        assert out == "● 8f0e2c1a  proj  now  idle\n\n1 session"
+
+    def test_list_filters_and_refs(self) -> None:
+        from fujimoto.claude.log_parser import SessionState
+
+        with (
+            patch.object(session_query, "resolve_scope") as rs,
+            patch.object(session_query, "run_list") as run,
+            patch.object(
+                session_query, "list_json", return_value={"sessions": []}
+            ) as lj,
+        ):
+            mcp_server.list_sessions(
+                project="ignored",
+                sessions=["8f0e", "peer-1"],
+                waiting=True,
+                states=["waiting_for_user"],
+                fields=["active.waiting", "title"],
+            )
+        rs.assert_not_called()  # named sessions are found anywhere
+        assert run.call_args.args[0].all_projects
+        kw = run.call_args.kwargs
+        assert kw["refs"] == ("8f0e", "peer-1") and kw["waiting_only"] is True
+        assert kw["states"] == (SessionState.WAITING_FOR_USER,)
+        assert lj.call_args.args[1] == ("active.waiting", "title")  # fields → json
+
+    def test_bad_state_and_field(self) -> None:
+        with pytest.raises(FujimotoToolError, match="unknown state 'busy'.*working"):
+            mcp_server.list_sessions(states=["busy"])
+        with pytest.raises(FujimotoToolError, match="unknown field 'nope'"):
+            mcp_server.list_sessions(fields=["nope"])
+        with pytest.raises(FujimotoToolError, match="unknown field"):
+            mcp_server.read_transcript("s", fields=["active.nope"])
+
+    def test_list_ref_error(self) -> None:
+        with (
+            patch.object(
+                session_query,
+                "run_list",
+                side_effect=session_query.QueryError("no session matches 'zz'"),
+            ),
+            pytest.raises(FujimotoToolError, match="no session matches"),
+        ):
+            mcp_server.list_sessions(sessions=["zz"])
+
+    def test_search_text_and_json(self) -> None:
+        scope = session_query.Scope(all_projects=True)
+        with (
+            patch.object(session_query, "resolve_scope", return_value=scope),
+            patch.object(session_query, "run_search"),
+            patch.object(session_query, "format_search", return_value="hit\nNext: x"),
+            patch.object(session_query, "search_json", return_value={"hits": []}),
+        ):
+            assert mcp_server.search_sessions("q") == "hit"
+            assert mcp_server.search_sessions("q", format="json") == {"hits": []}
 
     def test_listening_and_status(self) -> None:
         _signers(("me", KEY, "user"))
@@ -489,3 +575,44 @@ def test_messaging_docs_explain_launch_time_trust() -> None:
     for name in ("send_message", "broadcast"):
         assert "launched" in (tools[name].description or "")
     assert "not signed by a configured signer" in mcp_server.INSTRUCTIONS
+
+
+class TestSessionIdFor:
+    def test_id_or_prefix_goes_straight_through(self, tmp_path: Path) -> None:
+        with patch.object(
+            session_query, "find_session_log", return_value=tmp_path / "abcd-1234.jsonl"
+        ):
+            assert mcp_server.session_id_for("abcd") == "abcd-1234"
+
+    def test_peer_name_resolves_through_list(self) -> None:
+        listed = MagicMock()
+        listed.session.session_id = "full-id"
+        report = MagicMock(sessions=(listed,))
+        with (
+            patch.object(
+                session_query,
+                "find_session_log",
+                side_effect=session_query.QueryError(
+                    "no session log found for 'peer-1'"
+                ),
+            ),
+            patch.object(session_query, "run_list", return_value=report) as run,
+        ):
+            assert mcp_server.session_id_for("peer-1") == "full-id"
+        assert run.call_args.kwargs["refs"] == ("peer-1",)
+
+    def test_unknown_keeps_the_original_error(self) -> None:
+        with (
+            patch.object(
+                session_query,
+                "find_session_log",
+                side_effect=session_query.QueryError("no session log found for 'zz'"),
+            ),
+            patch.object(
+                session_query,
+                "run_list",
+                side_effect=session_query.QueryError("unknown session 'zz'"),
+            ),
+            pytest.raises(FujimotoToolError, match="no session log found for 'zz'"),
+        ):
+            mcp_server.session_id_for("zz")

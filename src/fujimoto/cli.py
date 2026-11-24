@@ -8137,7 +8137,11 @@ def _add_mcp_command(sub: argparse._SubParsersAction) -> None:
         ),
     )
     setup.add_argument(
-        "--name", default="claude-desktop", help="Signer name (default claude-desktop)"
+        "--name",
+        help=(
+            "Signer name for this key (default: chatgpt for chatgpt/codex, "
+            "else claude-desktop)"
+        ),
     )
     output = setup.add_mutually_exclusive_group()
     output.add_argument("--json", action="store_true", help="Print JSON")
@@ -8156,7 +8160,8 @@ def _run_mcp_command(args: argparse.Namespace) -> None:
     if args.mcp_command == "setup":
         from fujimoto import mcp_setup
 
-        report = mcp_setup.check_setup(args.key, name=args.name)
+        name = args.name or mcp_setup.default_signer(args.client)
+        report = mcp_setup.check_setup(args.key, name=name)
         if args.client:
             _install_mcp_client(args, report)
             return
