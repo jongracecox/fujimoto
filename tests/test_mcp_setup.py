@@ -248,3 +248,50 @@ class TestCli:
         ):
             self._main("mcp")
         assert exc.value.code == 1
+
+
+class TestConfigOnly:
+    def _main(self, *argv: str) -> None:
+        from fujimoto import cli
+
+        with patch("sys.argv", ["fujimoto", *argv]):
+            cli.main()
+
+    def test_prints_only_pasteable_json(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._main("mcp", "setup", "--config-only")
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert list(data) == ["mcpServers"]
+        entry = data["mcpServers"]["fujimoto"]
+        assert entry["args"] == ["mcp"]
+        assert Path(entry["command"]).is_absolute()
+        assert "PATH" in entry["env"]
+
+    def test_failing_check_prints_no_config(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with (
+            patch.object(broadcast, "_agent_keys", return_value=[]),
+            pytest.raises(SystemExit) as exc,
+        ):
+            self._main("mcp", "setup", "--key", "nonsense", "--config-only")
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "no config was printed" in captured.err
+        assert "✗ signing key" in captured.err
+
+    def test_json_and_config_only_conflict(self) -> None:
+        with pytest.raises(SystemExit) as exc:
+            self._main("mcp", "setup", "--json", "--config-only")
+        assert exc.value.code == 2
+
+    def test_client_config_with_key(self, tmp_path: Path) -> None:
+        _, key = _keypair(tmp_path, "k")
+        report = check_setup(
+            key, agent_keys=[key], config=_config(("claude-desktop", key, "agent"))
+        )
+        entry = mcp_setup.client_config(report)["mcpServers"]["fujimoto"]
+        assert entry["args"] == ["mcp", "--key", key]

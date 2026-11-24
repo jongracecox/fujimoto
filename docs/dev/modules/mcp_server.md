@@ -46,7 +46,7 @@ install command when the extra is missing.
 - Instrumented as `mcp.serve` (started, messaging / reason), `mcp.tool`
   (tool, ok) and `mcp.cli` (command, rc: int, `timeout` or `oserror`).
 
-**`mcp_setup.py`**: `fujimoto mcp setup [--key KEY] [--name N] [--json]`.
+**`mcp_setup.py`**: `fujimoto mcp setup [--key KEY] [--name N] [--json | --config-only]`.
 Stdlib + `broadcast` only, so it runs before the extra is installed.
 Read-only: `check_setup` returns `Check(name, status ok|warn|fail, detail,
 fix[])` for the mcp package, tmux, the key (must be public; a private key
@@ -57,6 +57,11 @@ SSH agent holding it (`broadcast._agent_keys`), per-use confirmation (always
 a warning: not observable), the signer (missing → the `add-signer … --role
 agent` command; `user` role → fail) and broadcast enabled (fail only with a
 key). Exit 1 when any check fails.
+`--config-only` prints only `client_config` (`{"mcpServers": {"fujimoto":
+…}}`) so stdout is always pasteable JSON; when a check fails it prints
+nothing there, writes `format_failures` to stderr and exits 1, so an insecure
+setup never yields config to paste. `--json` and `--config-only` are
+mutually exclusive.
 
 `desktop_entry` builds the `mcpServers.fujimoto` JSON: the `fujimoto` path,
 `args` with `--key <literal>`, and `env` with `PATH` (the dirs holding tmux,
