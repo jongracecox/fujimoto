@@ -11,9 +11,22 @@ install command when the extra is missing.
 
 - **Read tools, in-process.** `list_sessions`, `search_sessions`,
   `read_transcript`, `listening_sessions`, `message_status` call
-  `session_query` / `broadcast` and return the same dicts as the CLI's
-  `--json` (`list_json`, `search_json`, `log_json`, `show_json`,
-  `status_json`). `read_transcript` with no window (summary, grep, head, tail,
+  `session_query` / `broadcast`. The first three take `format: "text" |
+  "json"` (default text): text is the CLI's own `format_list` /
+  `format_search` / `format_log`, minus their "Next: fujimoto …" CLI hint
+  lines (`_text`); JSON is `list_json` / `search_json` / `log_json`. A tool
+  returning `str | dict` still gets an output schema from the SDK, with the
+  value under `result`. `fields` is validated with `parse_fields` against
+  `LIST_FIELDS` / `LOG_FIELDS` (`_fields`), implies JSON, and goes to
+  `list_json` / `log_json`, which force the full `session_id` first.
+  `list_sessions` also passes `sessions` (refs; the scope is then
+  `Scope(all_projects=True)`), `waiting` (`waiting_only`) and `states`
+  (`SessionState(name)`, a bad name is a tool error listing the valid ones)
+  to `run_list`. `session_id_for` turns an id, prefix, path or running peer
+  name into a full id (`find_session_log`, else `run_list(refs=…)`, since the
+  peer lookup is private to `session_query`); `read_transcript` and
+  `resume_session` use it. The other read tools return `show_json` /
+  `status_json`. `read_transcript` with no window (summary, grep, head, tail,
   after, reply_to) gets `tail=DEFAULT_TAIL` (40), and `wait` is capped at
   `MAX_WAIT` (120s). A tool error is `FujimotoToolError`, turned into the
   SDK's `ToolError` (an `is_error` result) in `build_server`'s `call`.

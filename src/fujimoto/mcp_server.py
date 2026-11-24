@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fujimoto import broadcast, debug, session_query
+from fujimoto.claude.log_parser import SessionState
 from fujimoto.claude.search import ContentMode
 
 SERVER_NAME = "fujimoto"
@@ -45,8 +46,12 @@ fujimoto manages Claude Code sessions running in tmux, one per git worktree
 (or a "chat" in a project). Use it to see what sessions exist, what they did,
 and to steer them.
 
-- Start with list_sessions (running_only for what is live now) or
+- "What needs me?": list_sessions(waiting=true). It reads Claude Code's own
+  status, so there's no need to read transcripts to find out.
+- Otherwise start with list_sessions (running_only for what is live now) or
   search_sessions for a ticket key, branch or phrase.
+- Results are compact text by default. Ask for format=json, or pass
+  `fields`, only when you need exact values.
 - read_transcript with summary=true is the cheap first look at a session;
   then tail/grep for detail. `cursor` in a result can be passed back as
   `after` to read only what is new.
@@ -84,18 +89,98 @@ def _scope(project: str | None, all_projects: bool) -> session_query.Scope:
         raise FujimotoToolError(str(e)) from e
 
 
+Format = Literal["text", "json"]
+Result = str | dict[str, object]
+
+
+def _text(rendered: str) -> str:
+    """CLI text for a tool result, without its "Next: fujimoto …" CLI hints.
+
+    The hints name shell commands; an MCP client uses the tools instead (the
+    server instructions say which).
+    """
+    return "\n".join(
+        line for line in rendered.splitlines() if not line.startswith("Next: ")
+    ).rstrip("\n")
+
+
+def _fields(
+    fields: Sequence[str] | None, valid: Sequence[str]
+) -> tuple[str, ...] | None:
+    if not fields:
+        return None
+    try:
+        return session_query.parse_fields(",".join(fields), valid)
+    except session_query.QueryError as e:
+        raise FujimotoToolError(str(e)) from e
+
+
+def _states(states: Sequence[str] | None) -> tuple[SessionState, ...]:
+    out = []
+    for name in states or ():
+        try:
+            out.append(SessionState(name))
+        except ValueError as e:
+            valid = ", ".join(s.value for s in SessionState)
+            raise FujimotoToolError(
+                f"unknown state {name!r}; choose from: {valid}"
+            ) from e
+    return tuple(out)
+
+
+def session_id_for(ref: str) -> str:
+    """A full session id for an id, id prefix, `.jsonl` path or running peer name.
+
+    `find_session_log` takes everything but a peer name; `run_list(refs=…)`
+    resolves that, exactly as `list_sessions(sessions=…)` does.
+    """
+    try:
+        return session_query.find_session_log(ref).stem
+    except session_query.QueryError as first:
+        try:
+            report = session_query.run_list(
+                session_query.Scope(all_projects=True), refs=(ref,)
+            )
+        except session_query.QueryError:
+            raise FujimotoToolError(str(first)) from first
+        if not report.sessions:  # pragma: no cover - run_list raises instead
+            raise FujimotoToolError(str(first)) from first
+        return report.sessions[0].session.session_id
+
+
 def list_sessions(
     project: str | None = None,
     all_projects: bool = False,
     running_only: bool = False,
     limit: int = session_query.DEFAULT_LIMIT,
-) -> dict[str, object]:
-    scope = _scope(project, all_projects)
+    sessions: Sequence[str] | None = None,
+    waiting: bool = False,
+    states: Sequence[str] | None = None,
+    fields: Sequence[str] | None = None,
+    format: Format = "text",
+) -> Result:
+    picked = _fields(fields, session_query.LIST_FIELDS)
+    wanted = _states(states)
+    # Named sessions are found wherever they are, so the scope is moot.
+    scope = (
+        session_query.Scope(all_projects=True)
+        if sessions
+        else _scope(project, all_projects)
+    )
     try:
-        report = session_query.run_list(scope, limit=limit, running_only=running_only)
+        report = session_query.run_list(
+            scope,
+            limit=limit,
+            running_only=running_only,
+            waiting_only=waiting,
+            states=wanted,
+            refs=tuple(sessions or ()),
+        )
     except session_query.QueryError as e:
         raise FujimotoToolError(str(e)) from e
-    return session_query.list_json(report)
+    if format == "json" or picked:
+        return session_query.list_json(report, picked)
+    return _text(session_query.format_list(report))
 
 
 def search_sessions(
@@ -107,7 +192,8 @@ def search_sessions(
     raw: bool = False,
     limit: int = session_query.DEFAULT_LIMIT,
     sort: Literal["recent", "relevance"] = "recent",
-) -> dict[str, object]:
+    format: Format = "text",
+) -> Result:
     scope = _scope(project, all_projects)
     try:
         report = session_query.run_search(
@@ -121,7 +207,9 @@ def search_sessions(
         )
     except session_query.QueryError as e:
         raise FujimotoToolError(str(e)) from e
-    return session_query.search_json(report)
+    if format == "json":
+        return session_query.search_json(report)
+    return _text(session_query.format_search(report))
 
 
 def read_transcript(
@@ -137,9 +225,11 @@ def read_transcript(
     after: int | None = None,
     reply_to: str | None = None,
     wait: float = 0.0,
+    fields: Sequence[str] | None = None,
+    format: Format = "text",
     *,
     sleep: Callable[[float], None] | None = None,
-) -> dict[str, object]:
+) -> Result:
     unknown = sorted(set(roles or ()) - set(session_query.TRANSCRIPT_ROLES))
     if unknown:
         valid = ", ".join(session_query.TRANSCRIPT_ROLES)
@@ -148,6 +238,7 @@ def read_transcript(
         )
     if summary and (after is not None or reply_to):
         raise FujimotoToolError("summary can't be combined with after or reply_to")
+    picked = _fields(fields, session_query.LOG_FIELDS)
     windowed = (
         summary
         or grep is not None
@@ -160,10 +251,11 @@ def read_transcript(
         tail = DEFAULT_TAIL
     wait = max(0.0, min(wait, MAX_WAIT))
     extra: dict[str, Any] = {"sleep": sleep} if sleep is not None else {}
+    resolved = session_id_for(session)
     try:
         report = session_query.load_log_waiting(
             lambda: session_query.load_log(
-                session,
+                resolved,
                 roles=list(roles) if roles else None,
                 grep=grep,
                 regex=regex,
@@ -180,7 +272,9 @@ def read_transcript(
         )
     except session_query.QueryError as e:
         raise FujimotoToolError(str(e)) from e
-    return session_query.log_json(report)
+    if format == "json" or picked:
+        return session_query.log_json(report, picked)
+    return _text(session_query.format_log(report))
 
 
 def listening_sessions() -> dict[str, object]:
@@ -325,7 +419,9 @@ class Commands:
         wait: float | None = None,
     ) -> dict[str, object]:
         try:
-            found = session_query.resolve_session(_positional(session, "session"))
+            found = session_query.resolve_session(
+                session_id_for(_positional(session, "session"))
+            )
         except session_query.QueryError as e:
             raise FujimotoToolError(str(e)) from e
         # `resume` checks it runs inside a repo; the session's own directory
@@ -430,7 +526,7 @@ def build_server(key: str | None = None, run: Runner = _run_cli) -> Any:
         read_only_hint=False, destructive_hint=True, open_world_hint=False
     )
 
-    async def call(name: str, fn: Callable[[], dict[str, object]]) -> dict[str, object]:
+    async def call(name: str, fn: Callable[[], Any]) -> Any:
         # Off the event loop: transcript reads, waits and subprocesses block.
         try:
             result = await to_thread.run_sync(fn)
@@ -446,14 +542,36 @@ def build_server(key: str | None = None, run: Runner = _run_cli) -> Any:
         all_projects: bool = False,
         running_only: bool = False,
         limit: int = session_query.DEFAULT_LIMIT,
-    ) -> dict[str, object]:
-        """Sessions, most recently used first: id, project, branch, title,
-        whether it is running (busy/idle) and its peer and tmux names.
-        `project` is a project name or path; with neither project nor
-        all_projects every project is listed."""
+        sessions: list[str] | None = None,
+        waiting: bool = False,
+        states: list[str] | None = None,
+        fields: list[str] | None = None,
+        format: Format = "text",
+    ) -> Result:
+        """Sessions, most recently used first: short id, project/worktree,
+        when, status (busy/idle, and what it is waiting on), peer name, title.
+        waiting=true: only running sessions waiting on the user (a permission
+        prompt, a question, or an idle prompt) - the cheap way to answer
+        "what needs me?". `sessions`: look up specific sessions by id, id
+        prefix or peer name (project/all_projects are then ignored).
+        `states` filters by transcript state (working, waiting_for_user,
+        waiting_for_tool_approval, idle, unknown). With neither project nor
+        all_projects, every project is listed. format=json returns the full
+        record per session; `fields` (e.g. ["active.waiting", "title"])
+        trims it, implies json, and always includes the full session_id."""
         return await call(
             "list_sessions",
-            lambda: list_sessions(project, all_projects, running_only, limit),
+            lambda: list_sessions(
+                project,
+                all_projects,
+                running_only,
+                limit,
+                sessions,
+                waiting,
+                states,
+                fields,
+                format,
+            ),
         )
 
     @server.tool(name="search_sessions", annotations=read_only)
@@ -466,14 +584,24 @@ def build_server(key: str | None = None, run: Runner = _run_cli) -> Any:
         raw: bool = False,
         limit: int = session_query.DEFAULT_LIMIT,
         sort: Literal["recent", "relevance"] = "recent",
-    ) -> dict[str, object]:
+        format: Format = "text",
+    ) -> Result:
         """Full-text search of session transcripts (messages by default; raw
         also searches tool output). Use sort=relevance to find the session
-        that discussed something most, e.g. a ticket key."""
+        that discussed something most, e.g. a ticket key. format=json for
+        structured hits with match spans."""
         return await call(
             "search_sessions",
             lambda: search_sessions(
-                query, project, all_projects, regex, case_sensitive, raw, limit, sort
+                query,
+                project,
+                all_projects,
+                regex,
+                case_sensitive,
+                raw,
+                limit,
+                sort,
+                format,
             ),
         )
 
@@ -491,14 +619,18 @@ def build_server(key: str | None = None, run: Runner = _run_cli) -> Any:
         after: int | None = None,
         reply_to: str | None = None,
         wait: float = 0.0,
-    ) -> dict[str, object]:
-        """One session's transcript. `session` is an id or id prefix.
-        summary=true gives the first prompt, the final exchange and links.
-        With no summary/grep/head/tail/after/reply_to, the last 40 messages.
-        `roles` picks from user, assistant, thinking, tool_use, tool_result,
-        injected. `after` takes the `cursor` of an earlier read; `reply_to`
-        takes a send_message id; `wait` (seconds, max 120) re-reads until
-        something arrives."""
+        fields: list[str] | None = None,
+        format: Format = "text",
+    ) -> Result:
+        """One session's transcript. `session` is an id, id prefix or peer
+        name. summary=true gives the first prompt, the final exchange and
+        links. With no summary/grep/head/tail/after/reply_to, the last 40
+        messages. `roles` picks from user, assistant, thinking, tool_use,
+        tool_result, injected. `after` takes the `cursor` of an earlier read;
+        `reply_to` takes a send_message id; `wait` (seconds, max 120)
+        re-reads until something arrives. `fields` (e.g. ["cursor",
+        "messages"] or ["summary.last_assistant.text"]) trims a json result
+        and implies format=json."""
         return await call(
             "read_transcript",
             lambda: read_transcript(
@@ -514,6 +646,8 @@ def build_server(key: str | None = None, run: Runner = _run_cli) -> Any:
                 after,
                 reply_to,
                 wait,
+                fields,
+                format,
             ),
         )
 

@@ -977,9 +977,9 @@ uv tool install --force 'fujimoto[mcp]'
 
 | Tool | Does | CLI twin |
 |---|---|---|
-| `list_sessions` | Sessions, newest first; `running_only` for what's live | `fujimoto list` |
+| `list_sessions` | Sessions, newest first; `running_only`, `waiting` (needs you), `states`, `sessions` (by id, prefix or peer name), `fields` | `fujimoto list` |
 | `search_sessions` | Full-text transcript search | `fujimoto search` |
-| `read_transcript` | One transcript: `summary`, `grep`, `tail`, `after` cursor, `reply_to` + `wait` | `fujimoto log` |
+| `read_transcript` | One transcript (by id, prefix or peer name): `summary`, `grep`, `tail`, `after` cursor, `reply_to` + `wait`, `fields` | `fujimoto log` |
 | `listening_sessions` | Sessions that can receive a message now | `fujimoto broadcast show` |
 | `message_status` | Recent messages and their delivery receipts | `fujimoto broadcast status` |
 | `start_session` | New worktree + session in a project | `fujimoto new --detach` |
@@ -989,9 +989,14 @@ uv tool install --force 'fujimoto[mcp]'
 | `send_message` | Signed message to one session *(only with a key)* | `fujimoto send` |
 | `broadcast` | Signed message to a project or everyone *(only with a key)* | `fujimoto broadcast send` |
 
-A read with no window returns the last 40 messages, so the client doesn't pull
-a whole transcript by accident. `read_transcript` with `summary: true` is the
-cheap first look.
+`list_sessions`, `search_sessions` and `read_transcript` answer in the same
+compact text as the CLI, which is cheaper for a model to read. Pass
+`format: "json"` for the structured record, or `fields` (which implies JSON)
+for just the values you need, e.g. `["active.waiting", "title"]`; the full
+`session_id` always comes first. `list_sessions` with `waiting: true` is the
+cheap answer to "what needs me?". A read with no window returns the last 40
+messages, so the client doesn't pull a whole transcript by accident.
+`read_transcript` with `summary: true` is the cheap first look.
 
 #### Setting it up
 

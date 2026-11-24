@@ -711,3 +711,42 @@ class TestCodexConfig:
     def test_codex_restart_message(self, tmp_path: Path) -> None:
         r = mcp_setup.InstallResult(mcp_setup.ADDED, tmp_path, client="codex")
         assert "new Codex session" in mcp_setup.format_install(r)
+
+
+class TestSignerName:
+    def test_default_follows_client(self) -> None:
+        assert mcp_setup.default_signer("chatgpt") == "chatgpt"
+        assert mcp_setup.default_signer("codex") == "chatgpt"
+        assert mcp_setup.default_signer("claude-desktop") == "claude-desktop"
+        assert mcp_setup.default_signer(None) == "claude-desktop"
+
+    def test_name_taken_by_another_key_fails(self, tmp_path: Path) -> None:
+        _, desktop = _keypair(tmp_path, "d")
+        _, other = _keypair(tmp_path, "o")
+        report = check_setup(
+            other,
+            name="claude-desktop",
+            agent_keys=[other],
+            config=_config(("claude-desktop", desktop, "agent")),
+        )
+        check = next(c for c in report.checks if c.name == "broadcast signer")
+        assert check.status == FAIL
+        assert "already used by another key" in check.detail
+        assert "add-signer" not in " ".join(check.fix)  # never suggest a clash
+        assert "--name <new name>" in check.fix[0]
+
+    def test_chatgpt_cli_suggests_chatgpt_signer(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from fujimoto import cli
+
+        _, key = _keypair(tmp_path, "k")
+        with (
+            patch.object(broadcast, "_agent_keys", return_value=[key]),
+            patch("sys.argv", ["fujimoto", "mcp", "setup", "chatgpt", "--key", key]),
+            pytest.raises(SystemExit),
+        ):
+            cli.main()
+        # With a client, failing checks go to stderr and nothing is written.
+        err = capsys.readouterr().err
+        assert f'add-signer chatgpt "{key}" --role agent' in err
