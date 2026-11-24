@@ -14,19 +14,20 @@
 [![buymeacoffee](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/jongracecox)
 
 
-Running one Claude Code session is easy. Running ten is chaos: terminals
-everywhere, branches you forgot about, and an agent that finished an hour ago
-and has been waiting on you ever since. fujimoto puts them all on one screen.
-Start a session in a fresh worktree, in your main clone, or as a throwaway
-chat, with a keystroke. Detach, and pick it up later from any terminal. See at
-a glance which sessions are working, which are done, and which need you.
+Running one Claude Code session is easy. Running ten is chaos. I'll come
+back to my desk, open the wrong terminal twice, and find that the session I
+was looking for has been waiting for a yes the whole time.
 
-Then it goes further. Ask which sessions need you, read the one that's stuck,
-and send it a reply, all without switching terminals, or straight from Claude
-Desktop, ChatGPT or any other agent. Your sessions can do the same with each
-other: search every past conversation on the machine, read what another
-session decided, message each other, and start background sessions that see
-their own work through.
+That's why I built Fujimoto. I can see which sessions are still working and
+which ones are waiting for me. If all I've got is an old Jira ticket number,
+I'll run `fujimoto search PROJ-123 --all-projects` and read what we decided.
+It doesn't matter which repo I was in or whether the session is still
+running, as long as the transcript is still on disk.
+
+I don't always have to open a terminal at all. The half-page scrolling change
+in [#73](https://github.com/jongracecox/fujimoto/pull/73) started with me
+describing what was annoying me in chat. A detached Claude Code session made
+the change and opened the PR. I tried it without opening Claude Code.
 
 ## What you can do with it
 
@@ -36,9 +37,9 @@ their own work through.
   [`.fujimoto.yaml`](#per-project-setup-fujimotoyaml)).
 - **Close the terminal, keep the session.** Sessions run in tmux, so they
   survive detaching, restarts and upgrades ([home screen](#home-screen)).
-- **Find any conversation.** Search every transcript on the machine, then jump
-  to the passage that matters
-  ([search](#searching-transcripts-from-the-command-line)).
+- **Find an old conversation.** Search for a ticket number or a phrase you
+  remember, even if the session isn't running
+  ([transcript search](#searching-transcripts-from-the-command-line)).
 - **Let your agents work together.** Sessions list, read and message each
   other, and can resume or fork a finished session to ask it a question
   ([session tools for agents](#session-tools-for-agents),
@@ -56,12 +57,6 @@ their own work through.
   agent or harness that can run a shell command can use the CLI directly:
   `fujimoto agent-instructions` is its guide
   ([session tools for agents](#session-tools-for-agents)).
-
-For example, [#73](https://github.com/jongracecox/fujimoto/pull/73)
-(half-page PageUp/PageDown) began as a few sentences in a chat with an agent.
-The agent handed the request to a new, detached fujimoto session, which built
-the change in its own worktree, added tests and opened the PR. Nobody opened a
-terminal to get it started.
 
 ## Why "Fujimoto"?
 
