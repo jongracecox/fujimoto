@@ -23,6 +23,15 @@ which ones are waiting for me. My agents can see that too. I can ask,
 "Am I holding anything up?" and get an answer without interrupting any of
 the sessions.
 
+Before I head out for lunch, I can send one message to all my running Fujimoto
+sessions in a project: "What do you need from me?" If one's waiting for a
+decision, I can give it an answer before I leave.
+
+If something comes up while I'm out, I can message my assistant on Slack.
+As long as my Mac is awake and connected, the assistant can use the Fujimoto
+CLI to find the right session, pass along my answer, and check what happened.
+I can do the same from the ChatGPT desktop app without opening Claude Code.
+
 If all I've got is an old Jira ticket number,
 I'll run `fujimoto search PROJ-123 --all-projects` and read what we decided.
 It doesn't matter which repo I was in or whether the session is still
