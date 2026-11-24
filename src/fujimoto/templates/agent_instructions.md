@@ -329,6 +329,7 @@ fujimoto mcp setup                                        # read-only server, no
 fujimoto mcp setup --key ~/.ssh/fujimoto_claude_desktop.pub   # with messaging
 fujimoto mcp setup --config-only                          # just the JSON to paste
 fujimoto mcp setup claude-desktop                         # write it into Claude Desktop's config
+fujimoto mcp setup chatgpt                                # ChatGPT desktop + Codex (~/.codex/config.toml)
 ```
 
 `--config-only` prints only `{"mcpServers": {"fujimoto": …}}`, pointing at the
@@ -338,7 +339,9 @@ the server needs. It prints nothing and exits 1 if a check fails.
 file up first (`claude_desktop_config.json.bak-<time>`), and updates an entry
 it wrote before (so re-running with `--key` adds messaging). It won't
 overwrite a `fujimoto` entry it didn't write without `--replace`. Claude
-Desktop then needs a full restart (⌘Q).
+Desktop then needs a full restart (⌘Q). `setup chatgpt` (alias `codex`) does
+the same for `~/.codex/config.toml`, which the ChatGPT desktop app and the
+Codex CLI share; ChatGPT on the web can't use a local server.
 
 ## When to use them
 

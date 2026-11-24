@@ -20,10 +20,11 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import cast
@@ -422,7 +423,8 @@ def report_json(report: SetupReport) -> dict[str, object]:
 # `fujimoto mcp setup claude-desktop`: write the entry into the client config
 # --------------------------------------------------------------------------
 
-CLIENTS = ("claude-desktop",)
+CLAUDE_DESKTOP, CHATGPT, CODEX = "claude-desktop", "chatgpt", "codex"
+CLIENTS = (CLAUDE_DESKTOP, CHATGPT, CODEX)
 ADDED, UNCHANGED, REPLACED, CONFLICT = "added", "unchanged", "replaced", "conflict"
 
 
@@ -437,6 +439,21 @@ class InstallResult:
     backup: Path | None = None
     # A unified diff of the old entry against the new one (conflict/replaced).
     diff: str = ""
+    client: str = CLAUDE_DESKTOP
+
+
+def codex_config_path() -> Path:
+    """The config the ChatGPT desktop app and the Codex CLI share.
+
+    `$CODEX_HOME/config.toml`, else `~/.codex/config.toml`. The ChatGPT app
+    keeps its local (stdio) MCP servers under `[mcp_servers.*]` there.
+    """
+    home = os.environ.get("CODEX_HOME")
+    return (Path(home) if home else Path.home() / ".codex") / "config.toml"
+
+
+def config_path(client: str) -> Path:
+    return desktop_config_path() if client == CLAUDE_DESKTOP else codex_config_path()
 
 
 def _entry_diff(old: object, new: object) -> str:
@@ -485,6 +502,22 @@ def _keep_global_flags(current: object, entry: dict[str, object]) -> dict[str, o
     return {**entry, "args": [*leading, *new_args]}
 
 
+def _without_ours(data: dict[str, object], table: str) -> dict[str, object]:
+    """`data` with `<table>.fujimoto` removed, for "nothing else changed" checks."""
+    out = dict(data)
+    servers = out.get(table)
+    if isinstance(servers, dict):
+        rest = {k: v for k, v in servers.items() if k != SERVER_NAME}
+        if rest:
+            out[table] = rest
+        else:  # the table only held ours (or was created for it)
+            del out[table]
+    return out
+
+
+# -- JSON (Claude Desktop) -------------------------------------------------
+
+
 def _indent_of(raw: str) -> int:
     for line in raw.splitlines()[1:]:
         stripped = line.lstrip(" ")
@@ -493,73 +526,200 @@ def _indent_of(raw: str) -> int:
     return 2
 
 
-def install_desktop_config(
+def _parse_json(raw: str, path: Path) -> dict[str, object]:
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError as e:
+        raise InstallError(
+            f"{path} is not valid JSON ({e}); fix it by hand, nothing was changed"
+        ) from e
+    if not isinstance(data, dict):
+        raise InstallError(f"{path} is not a JSON object; nothing was changed")
+    return data
+
+
+def _render_json(
+    raw: str | None, data: dict[str, object], entry: dict[str, object]
+) -> str:
+    data = dict(data)
+    servers = data.get("mcpServers", {})
+    data["mcpServers"] = {**cast("dict[str, object]", servers), SERVER_NAME: entry}
+    text = json.dumps(data, indent=_indent_of(raw) if raw else 2, ensure_ascii=False)
+    return text + "\n" if raw is None or raw.endswith("\n") else text
+
+
+# -- TOML (ChatGPT desktop / Codex) ----------------------------------------
+
+_OUR_HEADER = re.compile(
+    r"""^\s*\[\s*mcp_servers\s*\.\s*(?:fujimoto|"fujimoto"|'fujimoto')\s*(?:\.[^\]]*)?\]\s*(?:\#.*)?$"""
+)
+_ANY_HEADER = re.compile(r"^\s*\[")
+
+
+def _toml_string(value: str) -> str:
+    # A JSON string is a valid TOML basic string for anything setup writes.
+    return json.dumps(value, ensure_ascii=False)
+
+
+def toml_block(entry: dict[str, object]) -> str:
+    """`[mcp_servers.fujimoto]` (+ `.env`) for an entry, as TOML text."""
+    lines = [f"[mcp_servers.{SERVER_NAME}]"]
+    lines.append(f"command = {_toml_string(str(entry['command']))}")
+    args = cast("list[object]", entry.get("args", []))
+    lines.append("args = [" + ", ".join(_toml_string(str(a)) for a in args) + "]")
+    env = cast("dict[str, object]", entry.get("env") or {})
+    if env:
+        lines += ["", f"[mcp_servers.{SERVER_NAME}.env]"]
+        lines += [f"{k} = {_toml_string(str(v))}" for k, v in env.items()]
+    return "\n".join(lines) + "\n"
+
+
+def _parse_toml(raw: str, path: Path) -> dict[str, object]:
+    import tomllib
+
+    try:
+        return tomllib.loads(raw)
+    except tomllib.TOMLDecodeError as e:
+        raise InstallError(
+            f"{path} is not valid TOML ({e}); fix it by hand, nothing was changed"
+        ) from e
+
+
+def _render_toml(
+    raw: str | None, data: dict[str, object], entry: dict[str, object]
+) -> str:
+    """`raw` with fujimoto's own tables replaced by `entry`; nothing else touched.
+
+    Removes every `[mcp_servers.fujimoto…]` table (each runs to the next
+    header) and puts the new block where the first one was, or at the end.
+    The caller re-parses the result, so a form this can't edit (an inline
+    table, dotted keys) is refused rather than written.
+    """
+    block = toml_block(entry)
+    if not raw:
+        return block
+    lines = raw.splitlines(keepends=True)
+    kept: list[str] = []
+    insert_at: int | None = None
+    skipping = False
+    for line in lines:
+        if _OUR_HEADER.match(line):
+            skipping = True
+            if insert_at is None:
+                insert_at = len(kept)
+            continue
+        if skipping and _ANY_HEADER.match(line):
+            skipping = False
+        if not skipping:
+            kept.append(line)
+    if insert_at is None:
+        text = "".join(kept)
+        if not text.strip():
+            return block
+        if text.endswith("\n\n"):
+            return text + block
+        return text + ("\n" if text.endswith("\n") else "\n\n") + block
+    head, tail = "".join(kept[:insert_at]), "".join(kept[insert_at:])
+    return head + block + ("\n" + tail if tail else "")
+
+
+# -- Shared install ----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Format:
+    table: str
+    parse: Callable[[str, Path], dict[str, object]]
+    render: Callable[[str | None, dict[str, object], dict[str, object]], str]
+    missing_dir: str
+
+
+_FORMATS = {
+    CLAUDE_DESKTOP: _Format(
+        "mcpServers",
+        _parse_json,
+        _render_json,
+        "is Claude Desktop installed and run once?",
+    ),
+    CHATGPT: _Format(
+        "mcp_servers",
+        _parse_toml,
+        _render_toml,
+        "is the ChatGPT desktop app (or Codex) installed and run once?",
+    ),
+}
+_FORMATS[CODEX] = _FORMATS[CHATGPT]
+
+
+def install_client_config(
+    client: str,
     entry: dict[str, object],
     *,
     path: Path | None = None,
     replace: bool = False,
     stamp: str | None = None,
 ) -> InstallResult:
-    """Add or update `mcpServers.fujimoto` in Claude Desktop's config.
+    """Add or update the `fujimoto` server in a client's config file.
 
     An entry fujimoto wrote before (`_is_ours`) is updated in place, keeping
     any global flags before `mcp`; any other `fujimoto` entry is only
-    overwritten with `replace`.
-
-    Every other key is kept as it was. An existing file is copied to
-    `<name>.bak-<stamp>` before anything is written, the new file replaces
-    the old atomically with the same permissions, and it is read back: if
-    anything but `mcpServers.fujimoto` differs, the backup is restored.
-    A missing file is created; a missing Claude directory is an error,
-    since it means Claude Desktop isn't installed for this user.
+    overwritten with `replace`. Every other part of the file is kept: the new
+    text is parsed before writing and refused unless only fujimoto's entry
+    differs. An existing file is copied to `<name>.bak-<stamp>` first, the
+    new one replaces it atomically with the same permissions, and it is read
+    back, restoring the backup on any difference. A missing file is created
+    0600; a missing config directory means the client isn't installed.
     """
     import tempfile
     from datetime import datetime
 
-    path = path or desktop_config_path()
+    fmt = _FORMATS[client]
+    path = path or config_path(client)
     if not path.parent.is_dir():
-        raise InstallError(
-            f"{path.parent} does not exist: is Claude Desktop installed and run once?"
-        )
+        raise InstallError(f"{path.parent} does not exist: {fmt.missing_dir}")
     raw: str | None = None
+    data: dict[str, object] = {}
     if path.exists():
         try:
             raw = path.read_text()
-            data = json.loads(raw) if raw.strip() else {}
         except (OSError, UnicodeDecodeError) as e:
             raise InstallError(f"cannot read {path}: {e}") from e
-        except json.JSONDecodeError as e:
-            raise InstallError(
-                f"{path} is not valid JSON ({e}); fix it by hand, nothing was changed"
-            ) from e
-        if not isinstance(data, dict):
-            raise InstallError(f"{path} is not a JSON object; nothing was changed")
-    else:
-        data = {}
-    servers = data.get("mcpServers", {})
+        data = fmt.parse(raw, path)
+    servers = data.get(fmt.table, {})
     if not isinstance(servers, dict):
         raise InstallError(
-            f'"mcpServers" in {path} is not an object; nothing was changed'
+            f'"{fmt.table}" in {path} is not a table/object; nothing was changed'
         )
 
-    current = servers.get(SERVER_NAME)
+    current = cast("dict[str, object]", servers).get(SERVER_NAME)
     entry = _keep_global_flags(current, entry)
+    log = "mcp.client_install"
     if current == entry:
-        debug.log("mcp.desktop_install", status=UNCHANGED)
-        return InstallResult(UNCHANGED, path)
+        debug.log(log, client=client, status=UNCHANGED)
+        return InstallResult(UNCHANGED, path, client=client)
     diff = _entry_diff(current, entry) if current is not None else ""
     if current is not None and not replace and not _is_ours(current):
-        debug.log("mcp.desktop_install", status=CONFLICT)
-        return InstallResult(CONFLICT, path, diff=diff)
+        debug.log(log, client=client, status=CONFLICT)
+        return InstallResult(CONFLICT, path, diff=diff, client=client)
 
-    before = json.loads(json.dumps(data))
-    servers = dict(servers)
-    servers[SERVER_NAME] = entry
-    data["mcpServers"] = servers
-    indent = _indent_of(raw) if raw else 2
-    text = json.dumps(data, indent=indent, ensure_ascii=False)
-    if raw is None or raw.endswith("\n"):
-        text += "\n"
+    text = fmt.render(raw, data, entry)
+
+    def unchanged_but_ours(written: str) -> bool:
+        try:
+            after = fmt.parse(written, path)
+        except InstallError:  # e.g. our block next to an inline-table one
+            return False
+        ours = cast("dict[str, object]", after.get(fmt.table) or {}).get(SERVER_NAME)
+        return ours == entry and _without_ours(after, fmt.table) == _without_ours(
+            data, fmt.table
+        )
+
+    if not unchanged_but_ours(text):
+        debug.log(log, client=client, status="refused")
+        raise InstallError(
+            f"{path} defines the fujimoto server in a form setup can't edit safely "
+            "(an inline table or dotted keys?); change it by hand, nothing was changed"
+        )
 
     backup: Path | None = None
     mode = 0o600
@@ -578,38 +738,64 @@ def install_desktop_config(
         Path(tmp).unlink(missing_ok=True)
         raise InstallError(f"cannot write {path}: {e}") from e
 
-    # Read back: only mcpServers.fujimoto may differ from what was there.
-    after = json.loads(path.read_text())
-    others_after = {k: v for k, v in after.items() if k != "mcpServers"}
-    others_before = {k: v for k, v in before.items() if k != "mcpServers"}
-    servers_after = {
-        k: v for k, v in after.get("mcpServers", {}).items() if k != SERVER_NAME
-    }
-    servers_before = {
-        k: v for k, v in before.get("mcpServers", {}).items() if k != SERVER_NAME
-    }
-    if (
-        others_after != others_before
-        or servers_after != servers_before
-        or after["mcpServers"].get(SERVER_NAME) != entry
-    ):  # pragma: no cover - would need a racing writer
+    if not unchanged_but_ours(path.read_text()):  # pragma: no cover - racing writer
         if backup is not None:
             shutil.copy2(backup, path)
         raise InstallError(f"{path} did not read back as written; restored the backup")
 
     status = REPLACED if current is not None else ADDED
-    debug.log("mcp.desktop_install", status=status, backup=backup is not None)
-    return InstallResult(status, path, backup, diff)
+    debug.log(log, client=client, status=status, backup=backup is not None)
+    return InstallResult(status, path, backup, diff, client)
+
+
+def install_desktop_config(
+    entry: dict[str, object],
+    *,
+    path: Path | None = None,
+    replace: bool = False,
+    stamp: str | None = None,
+) -> InstallResult:
+    """`install_client_config` for Claude Desktop."""
+    return install_client_config(
+        CLAUDE_DESKTOP, entry, path=path, replace=replace, stamp=stamp
+    )
+
+
+def client_snippet(client: str, entry: dict[str, object]) -> str:
+    """What `--config-only` prints for a client: its own config format."""
+    if client in (CHATGPT, CODEX):
+        return toml_block(entry).rstrip("\n")
+    return json.dumps({"mcpServers": {SERVER_NAME: entry}}, indent=2)
+
+
+_RESTART = {
+    CLAUDE_DESKTOP: "Quit Claude Desktop (⌘Q) and reopen it to load the server.",
+    CHATGPT: (
+        "Quit the ChatGPT app (⌘Q) and reopen it to load the server. The Codex "
+        "CLI reads the same file, so it gets the server too."
+    ),
+}
+_RESTART[CODEX] = (
+    "Start a new Codex session to load the server. The ChatGPT desktop app reads "
+    "the same file: quit (⌘Q) and reopen it."
+)
+_APP = {
+    CLAUDE_DESKTOP: "Claude Desktop",
+    CHATGPT: "ChatGPT/Codex",
+    CODEX: "ChatGPT/Codex",
+}
 
 
 def format_install(result: InstallResult) -> str:
-    restart = "Quit Claude Desktop (⌘Q) and reopen it to load the server."
+    app = _APP[result.client]
     if result.status == UNCHANGED:
-        return f"Claude Desktop already has this fujimoto entry ({result.path}); nothing changed."
+        return (
+            f"{app} already has this fujimoto entry ({result.path}); nothing changed."
+        )
     if result.status == CONFLICT:
         return "\n".join(
             [
-                f"Claude Desktop already has a different fujimoto entry in {result.path}:",
+                f"{app} already has a different fujimoto entry in {result.path}:",
                 "",
                 result.diff,
                 "",
@@ -623,12 +809,13 @@ def format_install(result: InstallResult) -> str:
         lines.append(f"Backup of the previous file: {result.backup}")
     if result.diff:
         lines += ["", result.diff]
-    lines += ["", restart]
+    lines += ["", _RESTART[result.client]]
     return "\n".join(lines)
 
 
 def install_json(result: InstallResult) -> dict[str, object]:
     return {
+        "client": result.client,
         "status": result.status,
         "path": str(result.path),
         "backup": str(result.backup) if result.backup else None,
