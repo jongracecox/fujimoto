@@ -8,7 +8,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from fujimoto import debug
+from fujimoto import cmux, debug
 
 META_KEY_ENV = "FUJIMOTO_META_KEY"
 DEFAULT_META_KEY = "C-a"
@@ -606,19 +606,7 @@ def create_session(
         system_prompt_chars=len(system_prompt or ""),
         command=debug.rv(claude_cmd),
     )
-    subprocess.run(
-        [
-            "tmux",
-            "new-session",
-            "-d",
-            "-s",
-            name,
-            "-c",
-            str(working_dir),
-            claude_cmd,
-        ],
-        check=True,
-    )
+    _new_session(name, working_dir, claude_cmd)
     _ensure_focus_events()
     _configure_session(name)
     _ensure_extended_keys()
@@ -633,27 +621,51 @@ def create_session_with_command(name: str, working_dir: Path, command: str) -> N
         cwd=debug.rp(working_dir),
         command=debug.rv(command),
     )
-    subprocess.run(
-        [
-            "tmux",
-            "new-session",
-            "-d",
-            "-s",
-            name,
-            "-c",
-            str(working_dir),
-            command,
-        ],
-        check=True,
-    )
+    _new_session(name, working_dir, command)
     _ensure_focus_events()
     _configure_session(name)
     _ensure_extended_keys()
     _apply_quick_terminal_setting()
 
 
+def _forget_surface_scope() -> None:
+    """Drop cmux's pane-scoped keys from a running server's global environment.
+
+    A server started from a cmux pane (by an older fujimoto, or by hand) holds
+    that pane's `CMUX_SURFACE_ID`, and every session it creates inherits it.
+    One chained call; with no server running it fails without starting one.
+    """
+    args = ["tmux"]
+    for i, key in enumerate(cmux.SURFACE_SCOPED_KEYS):
+        args += ([";"] if i else []) + ["set-environment", "-gu", key]
+    result = subprocess.run(args, capture_output=True, text=True)
+    debug.log("tmux.forget_surface_scope", rc=result.returncode)
+
+
+def _new_session(name: str, working_dir: Path, command: str) -> None:
+    """`tmux new-session -d` with no cmux pane identity in its environment.
+
+    A new server copies the starting process's whole environment, so it is
+    given one without the pane-scoped keys; an existing server is cleaned of
+    them first. Otherwise cmux files every Claude session in tmux under the
+    pane that started the server (see `cmux.py`).
+    """
+    _forget_surface_scope()
+    subprocess.run(
+        ["tmux", "new-session", "-d", "-s", name, "-c", str(working_dir), command],
+        check=True,
+        env=cmux.without_surface_scope(),
+    )
+
+
 def attach_session(name: str) -> None:
-    """Attach to `name` until the user detaches, marking it with our pid."""
+    """Attach to `name` until the user detaches, marking it with our pid.
+
+    Inside cmux the pane is bound to `fujimoto --attach <name>` while
+    attached, so if cmux crashes or relaunches it restores the pane through
+    fujimoto. Detaching clears the binding: the home screen has nothing to
+    restore.
+    """
     debug.log("tmux.attach", session=debug.rv(name), phase="start")
     _refresh_session_config(name)
     pid = str(os.getpid())
@@ -661,6 +673,7 @@ def attach_session(name: str) -> None:
         ["tmux", "set-option", "-t", name, LOOP_PID_OPTION, pid],
         capture_output=True,
     )
+    bound = cmux.set_resume_binding(name)
     result = subprocess.run(["tmux", "attach-session", "-t", name])
     debug.log(
         "tmux.attach",
@@ -668,6 +681,8 @@ def attach_session(name: str) -> None:
         phase="returned",
         rc=result.returncode,
     )
+    if bound:
+        cmux.clear_resume_binding(name)
     # Leave the mark alone if another loop has attached since and taken it.
     if _session_option(name, LOOP_PID_OPTION) == pid:
         subprocess.run(

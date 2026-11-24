@@ -340,6 +340,26 @@ Fujimoto runs on macOS and Linux.
 
 "Open terminal → This window" instead pauses the TUI and launches your `$SHELL` as a child process with the working directory set to the session path. Running `exit` returns you to fujimoto, on the same session's action menu.
 
+### Running inside cmux
+
+Fujimoto works inside the [cmux](https://cmux.com) terminal, and does two
+things for it:
+
+- **Each Claude session stays its own.** Sessions in fujimoto's tmux no longer
+  inherit the cmux pane that happened to start tmux, so cmux's notifications
+  and session list don't pile every session onto that one pane.
+- **Panes come back after cmux restarts.** While you're attached to a session,
+  fujimoto tells cmux to restore the pane by running
+  `fujimoto --attach <session>`. If cmux crashes or relaunches, the pane
+  reattaches to the same session, which kept running in tmux the whole time.
+  If that session has gone, you get the home screen instead.
+
+cmux runs a third-party restore command automatically only after you approve
+it once. You can review the pane's restore command from cmux (the pane's
+resume menu, or **Settings > Terminal > Resume Commands**) and allow it to
+resume automatically. Until you do, cmux keeps the command for a manual
+`cmux restore --surface`.
+
 ## Usage
 
 Run from inside any git repository:

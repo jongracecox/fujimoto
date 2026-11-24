@@ -12873,7 +12873,7 @@ class TestRestartLoop:
     def test_restart_falls_back_to_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("sys.argv", ["fujimoto"])
         with (
-            patch("fujimoto.cli.shutil.which", return_value="/bin/fujimoto"),
+            patch("fujimoto.config.shutil.which", return_value="/bin/fujimoto"),
             patch("fujimoto.cli.os.execv") as execv,
         ):
             _restart_fujimoto("p/s")
@@ -12886,7 +12886,7 @@ class TestRestartLoop:
     ) -> None:
         monkeypatch.setattr("sys.argv", ["fujimoto"])
         with (
-            patch("fujimoto.cli.shutil.which", return_value=None),
+            patch("fujimoto.config.shutil.which", return_value=None),
             patch("fujimoto.cli.os.execv") as execv,
         ):
             _restart_fujimoto("p/s")
@@ -12898,7 +12898,7 @@ class TestRestartLoop:
     ) -> None:
         monkeypatch.setattr("sys.argv", ["fujimoto"])
         with (
-            patch("fujimoto.cli.shutil.which", return_value="/bin/fujimoto"),
+            patch("fujimoto.config.shutil.which", return_value="/bin/fujimoto"),
             patch("fujimoto.cli.os.execv", side_effect=OSError("nope")),
         ):
             _restart_fujimoto("p/s")

@@ -136,3 +136,33 @@ Verified with live sessions while building `fujimoto broadcast` (Claude Code
   by Claude Desktop or ChatGPT saw no `FUJIMOTO_GIT_ROOT` or
   `FUJIMOTO_WORKTREE_ROOT`: project names didn't resolve, and worktree
   history was missing. `mcp setup` now writes them into the client config.
+
+## cmux
+
+Checked against cmux 0.65 while working out why fujimoto panes didn't come
+back after a cmux relaunch:
+
+- **A tmux server started in cmux keeps that pane's identity.** `tmux
+  new-session` that *starts* the server copies the caller's whole environment
+  into tmux's global environment, `CMUX_SURFACE_ID` included, and every later
+  session inherits it. cmux's `claude` wrapper (first on the tmux `PATH`)
+  reports hooks to that id, so cmux filed every Claude session in tmux under
+  the one pane that started the server. On relaunch it tried to
+  `claude --resume` one of them there, found it still running in tmux, and
+  refused (`Restore failed stage=admission.live-owner`). cmux's zsh
+  integration does unset these keys from a running server, but only at a
+  shell prompt outside tmux, and the fujimoto TUI never shows one. Hence
+  `tmux._new_session` (see `cmux.md`).
+- **cmux's own tmux restore didn't bring fujimoto panes back.** cmux detects
+  a `tmux attach-session` in the foreground and saves the pane as
+  `tmux attach -t <session>` (`source: process-detected`). After a relaunch,
+  `cmux restore --surface` failed in every such pane with
+  `stage=record.missing` (no restore record by the time it ran). Even when it
+  works, a bare `tmux attach` comes back without the fujimoto loop, so
+  detaching drops to a shell. Hence the `fujimoto --attach` binding.
+- **Where to look.** `log show --predicate 'process == "cmux" AND eventMessage
+  CONTAINS "Restore failed"'` gives the failing stage per pane;
+  `cmux surface resume show --json --surface surface:N` shows a pane's binding
+  and restore record; `cmux sessions list` shows which pane each Claude
+  session is filed under; `~/Library/Application Support/cmux/session-history/`
+  keeps the snapshot cmux restores from.
