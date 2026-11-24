@@ -8053,6 +8053,27 @@ def _add_broadcast_command(sub: argparse._SubParsersAction) -> None:
         help="Check for this session id (default: $CLAUDE_CODE_SESSION_ID)",
     )
     ver.add_argument("--json", action="store_true")
+    fol = bsub.add_parser(
+        "follow",
+        help="What became of a message sent to one session (delivery, reply, ...)",
+        description=(
+            "Follow a message from `fujimoto send` by its id: its delivery "
+            "receipt, whether a relayed approval verifies for the target and "
+            "whether the target's transcript shows it checking, the reply, and "
+            "the target's current activity. Waits up to --wait seconds for a "
+            "reply, returning early if it is rejected, expires, or the target "
+            "is waiting on the user. Read-only."
+        ),
+    )
+    fol.add_argument("id", help="The message id `fujimoto send` printed")
+    fol.add_argument(
+        "--wait",
+        type=float,
+        default=30.0,
+        metavar="SECS",
+        help="Longest to wait for an outcome (default 30; 0 looks once)",
+    )
+    fol.add_argument("--json", action="store_true")
     show = bsub.add_parser("show", help="Configuration and listening sessions")
     show.add_argument("--json", action="store_true")
     bsub.add_parser(
@@ -8143,6 +8164,33 @@ def _add_mcp_command(sub: argparse._SubParsersAction) -> None:
             "else claude-desktop)"
         ),
     )
+    doctor = msub.add_parser(
+        "doctor",
+        help="Check the MCP server your clients are configured with (read-only)",
+        description=(
+            "For each client with a fujimoto entry (Claude Desktop, ChatGPT/"
+            "Codex): checks the launcher runs, starts the server the way the "
+            "client would and asks for its tools, and, when the entry has "
+            "--key, checks signing readiness against the agent it points at. "
+            "Read-only: nothing is signed, sent or changed, and no session is "
+            "touched. With no client configured, checks the entry `mcp setup` "
+            "would write."
+        ),
+    )
+    doctor.add_argument(
+        "client",
+        nargs="?",
+        choices=("claude-desktop", "chatgpt", "codex"),
+        help="Only this client (default: every client)",
+    )
+    doctor.add_argument(
+        "--timeout",
+        type=float,
+        default=20.0,
+        metavar="SECS",
+        help="How long the server gets to answer (default 20)",
+    )
+    doctor.add_argument("--json", action="store_true", help="Print JSON")
     output = setup.add_mutually_exclusive_group()
     output.add_argument("--json", action="store_true", help="Print JSON")
     output.add_argument(
@@ -8156,7 +8204,22 @@ def _add_mcp_command(sub: argparse._SubParsersAction) -> None:
 
 
 def _run_mcp_command(args: argparse.Namespace) -> None:
-    """`fujimoto mcp`: serve over stdio, or `setup` to check and configure."""
+    """`fujimoto mcp`: serve over stdio, `setup` to configure, `doctor` to check."""
+    if args.mcp_command == "doctor":
+        from fujimoto import mcp_doctor
+
+        report = mcp_doctor.diagnose(
+            [args.client] if args.client else None, timeout=args.timeout
+        )
+        print(
+            json.dumps(mcp_doctor.doctor_json(report), indent=2)
+            if args.json
+            else mcp_doctor.format_doctor(report)
+        )
+        _finish_debug_log()
+        if not report.ok:
+            sys.exit(1)
+        return
     if args.mcp_command == "setup":
         from fujimoto import mcp_setup
 
@@ -8421,6 +8484,17 @@ def _run_broadcast_command(args: argparse.Namespace) -> None:
             if not verdict.passed:
                 _finish_debug_log()
                 sys.exit(1)
+        elif cmd == "follow":
+            from fujimoto import follow
+
+            if args.wait < 0:
+                raise broadcast.BroadcastError("--wait must be 0 or more")
+            report = follow.follow(args.id, wait=args.wait)
+            print(
+                json.dumps(follow.follow_json(report), indent=2)
+                if args.json
+                else follow.format_follow(report)
+            )
         elif cmd == "show":
             config = broadcast.load_config(strict=True)
             print(

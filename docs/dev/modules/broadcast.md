@@ -114,8 +114,18 @@ lazily).
   working dir) — see `docs/dev/gotchas.md` (Broadcast). It never raises: a failure is logged
   (`broadcast.launch included=False reason=…`) and printed, and the session
   launches without broadcast.
+- **Reachability** (`listening_session_ids`): the session ids with a live
+  waiter, from the lock files alone (`_live_waiters`, no registry read),
+  for `session_query.ActivityIndex` → `active.listening`. A waiter's lock
+  keeps the session id it armed with, so after `/clear` (new id, same
+  process) the new id reads as not listening until the next delivery
+  re-arms it. Logged as `broadcast.listening`.
+- `find_entry(id)` is the exact-id lookup (`<arrival>-<id>`, never a
+  substring, unlike `status(ref)`); `read_payload(entry)` reads it unverified.
+  Both back `follow.py`.
 - Output: `format_send`/`send_json`, `format_status`/`status_json`,
-  `format_show`/`show_json`.
+  `format_show`/`show_json`. `format_send` ends a targeted send with
+  `Next: fujimoto broadcast follow ID --wait 60`.
 - Instrumented as `broadcast.ssh_keygen` (op, rc), `broadcast.signing_key`
   (`via=path|literal|agent`), `broadcast.posted`, `broadcast.sent`,
   `broadcast.pruned`, `broadcast.launch`, `broadcast.wait` (`armed`,

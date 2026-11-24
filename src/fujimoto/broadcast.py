@@ -689,6 +689,23 @@ def list_entries() -> list[Entry]:
     return [Entry(p) for p in sorted(paths, key=lambda p: p.name)]
 
 
+def find_entry(message_id: str) -> Entry:
+    """The one mailbox entry for an exact message id (not a substring)."""
+    matches = [e for e in list_entries() if e.name.endswith(f"-{message_id}")]
+    if len(matches) != 1:
+        found = "no message" if not matches else f"{len(matches)} messages"
+        raise BroadcastError(f"{found} with id {message_id} in the mailbox")
+    return matches[0]
+
+
+def read_payload(entry: Entry) -> Payload:
+    """An entry's payload, as stored (not verified: see `verify`)."""
+    try:
+        return Payload.from_bytes(_read_private_file(entry.path))
+    except OSError as e:
+        raise BroadcastError(f"cannot read message {entry.name}: {e}") from e
+
+
 def post(data: bytes, signature: bytes) -> Entry:
     """Write a signed payload into the mailbox (signature first, then payload)."""
     payload = Payload.from_bytes(data)
@@ -811,10 +828,8 @@ def _registry_names() -> dict[str, tuple[str | None, str | None]]:
         return {}
 
 
-def list_listeners() -> list[Listener]:
-    """Waiters that are running now, from their lock files, with the names
-    Claude's registry knows them by."""
-    names = _registry_names()
+def _live_waiters() -> list[Listener]:
+    """Waiters running now, from their lock files, without registry names."""
     out = []
     for p in sorted(state_dir().glob("*.lock")):
         try:
@@ -828,11 +843,30 @@ def list_listeners() -> list[Listener]:
         except (OSError, ValueError, KeyError, TypeError):
             continue
         if _pid_alive(listener.pid):
-            tmux_session, peer_name = names.get(listener.session_id, (None, None))
-            out.append(
-                replace(listener, tmux_session=tmux_session, peer_name=peer_name)
-            )
+            out.append(listener)
     return out
+
+
+def list_listeners() -> list[Listener]:
+    """Waiters that are running now, from their lock files, with the names
+    Claude's registry knows them by."""
+    names = _registry_names()
+    out = []
+    for listener in _live_waiters():
+        tmux_session, peer_name = names.get(listener.session_id, (None, None))
+        out.append(replace(listener, tmux_session=tmux_session, peer_name=peer_name))
+    return out
+
+
+def listening_session_ids() -> frozenset[str]:
+    """Session ids a signed message can reach right now (a live waiter).
+
+    For `fujimoto list`: the lock files alone, since the caller already
+    has Claude's registry. A session handling a message is briefly absent.
+    """
+    ids = frozenset(li.session_id for li in _live_waiters())
+    debug.log("broadcast.listening", sessions=len(ids))
+    return ids
 
 
 def resolve_target(ref: str) -> Listener:
@@ -1193,6 +1227,8 @@ def format_send(result: SendResult) -> str:
         lines.append(
             f"{pending} not confirmed yet — check with `fujimoto broadcast status {p.id}`."
         )
+    if p.session is not None:
+        lines.append(f"Next: fujimoto broadcast follow {p.id} --wait 60")
     return "\n".join(lines)
 
 

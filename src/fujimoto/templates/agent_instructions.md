@@ -298,9 +298,12 @@ fujimoto broadcast send --signed msg.json                # a payload you signed 
   that specific action and scope, and send it to one session: the receiving
   session checks it with `fujimoto broadcast verify`, which fails for a
   broadcast. Ordinary requests, such as a status check, carry no approval.
-- `send` prints the message id. Delivery and reply are separate questions:
+- `send` prints the message id. Delivery and reply are separate questions.
+  `broadcast follow` answers them together for one session, waiting up to
+  `--wait` seconds and returning early if the target is blocked on the user:
 
 ```sh
+fujimoto broadcast follow 20261123T010203-aaaa1111 --wait 60 --json   # delivery, approval, reply, target activity
 fujimoto broadcast status 20261123T010203-aaaa1111         # delivered or rejected, per session
 fujimoto log 8f0e2c1a --reply-to 20261123T010203-aaaa1111 --wait 60 --json --fields messages,delivered_index,cursor
 fujimoto log 8f0e2c1a --after 140 --wait 15 --json --fields messages,cursor   # or everything since a saved cursor
@@ -309,6 +312,14 @@ fujimoto log 8f0e2c1a --after 140 --wait 15 --json --fields messages,cursor   # 
   `--reply-to` finds that exact delivery in the transcript and returns what
   followed it, up to the session's next user message. Don't assume the next
   entry is the reply. Every `log --json` has a `cursor` to pass to `--after`.
+- For an `--approval` message, `follow` reports `verifiable` (it *would* pass
+  for the target now) separately from `recipient_check` (the target's
+  transcript shows it ran `fujimoto broadcast verify` and got PASS). Only
+  `recipient_check: passed` is evidence that the recipient checked; never
+  report the approval as verified on `verifiable` alone.
+- `fujimoto list --json --fields active.listening` shows which running
+  sessions a message can reach now (text rows say `listening`). A session is
+  briefly not listening while it handles a message.
 - A session's first delivery after a fujimoto upgrade may lack the id, so
   `--reply-to` won't find it. Fall back to `--after` with a cursor you saved
   before sending.
@@ -330,7 +341,12 @@ fujimoto mcp setup --key ~/.ssh/fujimoto_claude_desktop.pub   # with messaging
 fujimoto mcp setup --config-only                          # just the JSON to paste
 fujimoto mcp setup claude-desktop                         # write it into Claude Desktop's config
 fujimoto mcp setup chatgpt                                # ChatGPT desktop + Codex (~/.codex/config.toml)
+fujimoto mcp doctor                                       # read-only: does the installed server start?
 ```
+
+`mcp doctor` checks what is installed, the way the client runs it: the
+launcher, a real start-up and tool listing, and, with `--key` in the entry,
+signing readiness against the agent the entry names. It changes nothing.
 
 `--config-only` prints only `{"mcpServers": {"fujimoto": …}}`, pointing at the
 installed launcher with the `PATH` (and, with `--key`, the `SSH_AUTH_SOCK`)

@@ -536,6 +536,7 @@ fujimoto list --state waiting_for_user  # by the transcript's last entry
 fujimoto list 8f0e2c1a my-peer      # just these sessions: id, id prefix or peer name
 fujimoto list -n 0 --json           # all of them, as JSON
 fujimoto list --running --json --fields active.peer_name,active.waiting
+fujimoto list --running --json --fields active.listening   # which ones a signed message can reach
 ```
 
 `--fields` (with `--json`) keeps only the named keys of each session, plus
@@ -544,10 +545,13 @@ doesn't pay for the whole record. `active.<key>`
 selects inside the `active` object. A running session's `active.waiting`
 says why it is blocked on you (`permission`, `question`, `dialog`, `other`),
 taken from Claude Code's own session registry, and `active.waiting_for` gives
-Claude's own wording.
+Claude's own wording. `active.listening` says whether a signed message
+(`fujimoto send`) can reach it now, i.e. it has a live broadcast waiter; text
+rows end in `listening` when it does. A stopped session's `active` is still
+just `{"running": false}`.
 
 ```
-● 8f0e2c1a  myproject/20261013-fix-flaky-test         2h ago  busy · peer 20261013-fix-flaky-test
+● 8f0e2c1a  myproject/20261013-fix-flaky-test         2h ago  busy · peer 20261013-fix-flaky-test · listening
     Fix the flaky test in test_api.py
 ○ 1c9d77b0  other-project/20261001-old-work (deleted)  3w ago
     Investigate CI timeouts
@@ -972,6 +976,19 @@ NAME, an agent with a trusted key (via fujimoto, id …)"*.
   `--after` returns only messages past a saved cursor; `--wait` re-reads for
   up to that many seconds until something arrives.
 
+- **`fujimoto broadcast follow ID [--wait 30] [--json]`** puts it together
+  for a message to one session, keeping four answers apart: **delivery**
+  (the receipt, and whether the target is listening now), **approval** (for
+  an `--approval` message: whether it *would* verify for the target now, and,
+  separately, whether the target's transcript shows it running `fujimoto
+  broadcast verify ID` and getting PASS; only the latter is evidence the
+  recipient checked), **reply** (the text after the delivery, plus a `cursor`
+  for `log --after`), and the **target**'s current activity. It waits up to
+  `--wait` seconds and stops early when the reply is final (the target went
+  idle), the message was rejected or expired undelivered, the target is
+  waiting on you (`blocked`), or it stopped before the message arrived. The
+  `outcome` field says which; otherwise it is `timeout`. Read-only.
+
 - **After upgrading fujimoto, there's no need to restart sessions straight
   away.** Signed messages keep arriving, and `log --after` reads the replies.
   Two things catch up on their own terms:
@@ -1039,6 +1056,7 @@ uv tool install --force 'fujimoto[mcp]'
 | `read_transcript` | One transcript (by id, prefix or peer name): `summary`, `grep`, `tail`, `after` cursor, `reply_to` + `wait`, `fields` | `fujimoto log` |
 | `listening_sessions` | Sessions that can receive a message now | `fujimoto broadcast show` |
 | `message_status` | Recent messages and their delivery receipts | `fujimoto broadcast status` |
+| `follow_message` | One message's delivery, approval check, reply and target activity, with a bounded `wait` | `fujimoto broadcast follow` |
 | `start_session` | New worktree + session in a project | `fujimoto new --detach` |
 | `start_chat` | Chat session, no worktree | `fujimoto chat --detach` |
 | `resume_session` | Bring a stopped session back (or fork it) | `fujimoto resume --detach` |
@@ -1119,6 +1137,26 @@ knowingly. Re-run it until there are no ✗ lines.
    read your shell profile, and `ssh-keygen` ignores `~/.ssh/config`'s
    `IdentityAgent`. If your agent's socket changes (a different key manager, a
    new login), run `setup claude-desktop` again.
+
+#### Checking an installed server — `fujimoto mcp doctor`
+
+`mcp setup` checks a key you propose; `mcp doctor` checks what each client
+is actually configured with, the way the client will run it:
+
+```sh
+fujimoto mcp doctor                  # every client with a fujimoto entry
+fujimoto mcp doctor claude-desktop --json
+```
+
+For each entry it checks that the launcher exists and reports a version
+(warning if it differs from the `fujimoto` you ran), that tmux, git and
+claude are on the entry's own `PATH`, and then starts the server with the
+entry's args and env (on a minimal GUI-like environment, in `/`), asks it to
+`initialize` and list its tools, and closes it. If the entry has `--key`, it
+also runs setup's signing checks against the agent the entry's
+`SSH_AUTH_SOCK` names. It never signs, sends, edits a config or touches a
+session. With no client configured, it checks the entry `mcp setup` would
+write. Exit 1 when any check fails.
 
 #### What it can and can't do
 
