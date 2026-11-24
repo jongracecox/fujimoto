@@ -416,14 +416,18 @@ def _agent_keys_at(sock: str | None) -> list[str]:
 
 
 def _signing_checks(
-    client: str, key: str | None, env: Mapping[str, str], where: str = "the entry"
+    client: str,
+    key: str | None,
+    env: Mapping[str, str],
+    where: str = "the entry",
+    no_key: str = "no --key in the entry",
 ) -> list[Check]:
     if key is None:
         return [
             Check(
                 "signing",
                 OK,
-                f"no --key in {where}: a read-only server, messaging off by design",
+                f"{no_key}: a read-only server, messaging off by design",
             )
         ]
     try:
@@ -508,7 +512,13 @@ def self_checks(
     """
     env = os.environ if env is None else env
     checks = [_drift_check(env, run), _path_check(env, key, "this server's")]
-    checks += _signing_checks(PREVIEW, key, env, "this server's environment")
+    checks += _signing_checks(
+        PREVIEW,
+        key,
+        env,
+        "this server's environment",
+        "this server was started without --key",
+    )
     debug.log(
         "mcp.server_health",
         checks=",".join(f"{c.name.replace(' ', '_')}={c.status}" for c in checks),
