@@ -46,9 +46,9 @@ install command when the extra is missing.
 - Instrumented as `mcp.serve` (started, messaging / reason), `mcp.tool`
   (tool, ok) and `mcp.cli` (command, rc: int, `timeout` or `oserror`).
 
-**`mcp_setup.py`**: `fujimoto mcp setup [--key KEY] [--name N] [--json | --config-only]`.
+**`mcp_setup.py`**: `fujimoto mcp setup [claude-desktop] [--key KEY] [--replace] [--name N] [--json | --config-only]`.
 Stdlib + `broadcast` only, so it runs before the extra is installed.
-Read-only: `check_setup` returns `Check(name, status ok|warn|fail, detail,
+Read-only unless a client is named: `check_setup` returns `Check(name, status ok|warn|fail, detail,
 fix[])` for the mcp package, tmux, the key (must be public; a private key
 file fails), the private key at rest (`private_key_has_passphrase`: `ssh-keygen
 -y -P ''` succeeds only for an unencrypted key; matched on the phrase
@@ -70,3 +70,21 @@ walks `PATH` itself and skips directories whose own name or parent's name
 contains "shim": terminal wrappers such as cmux put per-session shim dirs
 first, and those are gone when Claude Desktop starts the server later.
 Logged as `mcp.setup` (one `name=status` list).
+
+**`setup claude-desktop`** (`install_desktop_config`, CLI `_install_mcp_client`)
+writes `desktop_entry` into `desktop_config_path()`, and only when
+`report.ok`: a failing setup gets `format_failures` on stderr and exit 1,
+the same rule as `--config-only` (which it can't be combined with). Steps:
+parse the file (invalid JSON, a non-object, or a non-object `mcpServers` →
+`InstallError`, nothing touched; a missing file is created `0600`; a missing
+`Claude/` directory is an error), compare the current `fujimoto` entry
+(equal → `unchanged`, no backup; one `setup` wrote, per `_is_ours` — a
+command named `fujimoto` with `mcp` in its args — is updated in place,
+keeping any global flags before `mcp` via `_keep_global_flags`, so adding
+`--key` later is just a re-run; anything else → `conflict` with a unified
+diff and exit 1 unless `--replace`), `shutil.copy2` to `<name>.bak-<stamp>`, write
+a temp file in the same directory with the original mode and `os.replace` it,
+then read it back and restore the backup if anything other than
+`mcpServers.fujimoto` changed. Indentation is detected from the file and
+key order kept (`json` preserves insertion order). Logged as
+`mcp.desktop_install` (status, backup).

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import ClassVar, NamedTuple, NoReturn
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, NoReturn
 
 from rich.markup import escape
 from textual import events, on, work
@@ -149,6 +149,9 @@ from fujimoto.tmux import (
     set_terminal_title,
     take_pending_action,
 )
+
+if TYPE_CHECKING:  # the MCP modules load lazily, only for `fujimoto mcp`
+    from fujimoto import mcp_setup as mcp_setup_types
 
 BRANCH_ICON = "\ue0a0"
 ICON_EYES = "\U0001f440"
@@ -8105,13 +8108,32 @@ def _add_mcp_command(sub: argparse._SubParsersAction) -> None:
         "setup",
         help="Check the MCP server's setup and print the Claude Desktop config",
         description=(
-            "Read-only: checks each step of a secure setup (agent-held signing "
-            "key with a passphrase, agent-role signer, broadcast enabled) and "
-            "prints the command for anything missing, then the config to add "
-            "to Claude Desktop."
+            "Checks each step of a secure setup (agent-held signing key with a "
+            "passphrase, agent-role signer, broadcast enabled) and prints the "
+            "command for anything missing, then the config to add to Claude "
+            "Desktop. Read-only, unless a client is named: `setup "
+            "claude-desktop` then writes the entry into its config, backing "
+            "the file up first."
+        ),
+    )
+    setup.add_argument(
+        "client",
+        nargs="?",
+        choices=("claude-desktop",),
+        help=(
+            "Also write the entry into this client's config (backed up first; "
+            "only if every check passes)"
         ),
     )
     setup.add_argument("--key", help="The public key the server will sign with")
+    setup.add_argument(
+        "--replace",
+        action="store_true",
+        help=(
+            "With a client: overwrite a fujimoto entry that fujimoto didn't write "
+            "(its own entries are updated without it)"
+        ),
+    )
     setup.add_argument(
         "--name", default="claude-desktop", help="Signer name (default claude-desktop)"
     )
@@ -8133,6 +8155,15 @@ def _run_mcp_command(args: argparse.Namespace) -> None:
         from fujimoto import mcp_setup
 
         report = mcp_setup.check_setup(args.key, name=args.name)
+        if args.client:
+            _install_mcp_client(args, report)
+            return
+        if args.replace:
+            _finish_debug_log()
+            print(
+                "fujimoto: --replace needs a client (claude-desktop)", file=sys.stderr
+            )
+            sys.exit(2)
         if args.config_only:
             # stdout is only ever pasteable JSON; a failing setup gets none.
             if report.ok:
@@ -8153,6 +8184,40 @@ def _run_mcp_command(args: argparse.Namespace) -> None:
     _finish_debug_log()
     if code:
         sys.exit(code)
+
+
+def _install_mcp_client(
+    args: argparse.Namespace, report: mcp_setup_types.SetupReport
+) -> None:
+    """`fujimoto mcp setup claude-desktop`: write the entry if every check passes."""
+    from fujimoto import mcp_setup
+
+    if args.config_only:
+        _finish_debug_log()
+        print(
+            "fujimoto: --config-only prints config; drop it to write it",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if not report.ok:
+        _finish_debug_log()
+        print(mcp_setup.format_failures(report), file=sys.stderr)
+        sys.exit(1)
+    try:
+        result = mcp_setup.install_desktop_config(
+            report.desktop_config, replace=args.replace
+        )
+    except mcp_setup.InstallError as e:
+        _finish_debug_log()
+        print(f"fujimoto: {e}", file=sys.stderr)
+        sys.exit(1)
+    if args.json:
+        print(json.dumps(mcp_setup.install_json(result), indent=2))
+    else:
+        print(mcp_setup.format_install(result))
+    _finish_debug_log()
+    if result.status == mcp_setup.CONFLICT:
+        sys.exit(1)
 
 
 def _add_send_command(sub: argparse._SubParsersAction) -> None:
