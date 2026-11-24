@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,8 @@ from types import SimpleNamespace
 
 from fujimoto.cli import (
     FUJIMOTO_CLI_PROMPT,
+    _reattach_target,
+    _restart_fujimoto,
     CSS,
     ICON_CHAT,
     ICON_EYES,
@@ -79,7 +82,7 @@ from fujimoto.config import (
     write_parent_session,
 )
 from fujimoto.git import GitError
-from fujimoto.tmux import TmuxError
+from fujimoto.tmux import PENDING_RESTART, TmuxError
 
 
 # -- Helpers --
@@ -12539,3 +12542,237 @@ class TestUpdateCommand:
             self._main(monkeypatch, "update", "dismiss", "1.2.0")
         assert exc.value.code == 1
         assert "could not save the dismissal: ro fs" in capsys.readouterr().err
+
+
+class TestRestartCommand:
+    def _main(self, monkeypatch: pytest.MonkeyPatch, *argv: str) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", "restart", *argv])
+        with patch("fujimoto.cli._check_prerequisites") as prereqs:
+            main()
+        prereqs.assert_not_called()
+
+    def test_outside_a_session_explains_itself(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with (
+            patch("fujimoto.cli.current_session", return_value=None),
+            pytest.raises(SystemExit) as exc,
+        ):
+            self._main(monkeypatch)
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "Run it inside a fujimoto session" in err
+        assert "--all" in err
+
+    def test_inside_a_session_restarts_its_loop(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with (
+            patch("fujimoto.cli.current_session", return_value="p/s1"),
+            patch("fujimoto.cli.loop_client", return_value="/dev/t1"),
+            patch("fujimoto.cli.request_restart") as req,
+        ):
+            self._main(monkeypatch)
+        req.assert_called_once_with("p/s1", "/dev/t1")
+        assert capsys.readouterr().out == "Restarting fujimoto for p/s1.\n"
+
+    def test_no_loop_attached_fails_without_detaching(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with (
+            patch("fujimoto.cli.current_session", return_value="p/s1"),
+            patch("fujimoto.cli.loop_client", return_value=None),
+            patch("fujimoto.cli.request_restart") as req,
+            pytest.raises(SystemExit) as exc,
+        ):
+            self._main(monkeypatch)
+        assert exc.value.code == 1
+        req.assert_not_called()
+        assert "no fujimoto is attached to p/s1" in capsys.readouterr().err
+
+    def test_all_restarts_attached_and_lists_skipped(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        clients = {"p/a": "/dev/t1", "p/b": None, "p/c": "/dev/t3"}
+        with (
+            patch("fujimoto.cli.list_all_sessions", return_value=list(clients)),
+            patch("fujimoto.cli.loop_client", side_effect=clients.get),
+            patch("fujimoto.cli.request_restart") as req,
+        ):
+            self._main(monkeypatch, "--all")
+        assert [c.args for c in req.call_args_list] == [
+            ("p/a", "/dev/t1"),
+            ("p/c", "/dev/t3"),
+        ]
+        assert capsys.readouterr().out == (
+            "restarted: p/a, p/c\nskipped:   p/b (no fujimoto attached)\n"
+        )
+
+    def test_all_json_and_a_failed_request_is_skipped(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with (
+            patch("fujimoto.cli.list_all_sessions", return_value=["p/a"]),
+            patch("fujimoto.cli.loop_client", return_value="/dev/t1"),
+            patch(
+                "fujimoto.cli.request_restart",
+                side_effect=subprocess.CalledProcessError(1, "tmux"),
+            ),
+        ):
+            self._main(monkeypatch, "--all", "--json")
+        assert json.loads(capsys.readouterr().out) == {
+            "restarted": [],
+            "skipped": ["p/a"],
+        }
+
+    def test_all_with_nothing_running(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with patch("fujimoto.cli.list_all_sessions", return_value=[]):
+            self._main(monkeypatch, "--all")
+        assert capsys.readouterr().out == "restarted: none\n"
+
+    def test_key_binding_reports_in_the_status_line(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with (
+            patch("fujimoto.cli.loop_client", return_value=None),
+            patch("fujimoto.cli.display_message") as shown,
+        ):
+            self._main(monkeypatch, "--session", "p/s1")
+        assert "no fujimoto is attached to p/s1" in shown.call_args.args[1]
+        out = capsys.readouterr()
+        assert out.out == "" and out.err == ""  # run-shell would show these
+
+    def test_key_binding_success_is_silent(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with (
+            patch("fujimoto.cli.loop_client", return_value="/dev/t1"),
+            patch("fujimoto.cli.request_restart") as req,
+            patch("fujimoto.cli.display_message") as shown,
+        ):
+            self._main(monkeypatch, "--session", "p/s1")
+        req.assert_called_once_with("p/s1", "/dev/t1")
+        shown.assert_not_called()
+        assert capsys.readouterr().out == ""
+
+
+class TestRestartLoop:
+    def test_reattach_target_from_record(self, tmp_path: Path) -> None:
+        record = session_state.SessionRecord(
+            cwd=str(tmp_path), project="p", session_type="direct"
+        )
+        with (
+            patch(
+                "fujimoto.cli.session_state.load_state", return_value={"p/s": record}
+            ),
+            patch("fujimoto.cli.session_exists", return_value=True),
+        ):
+            target = _reattach_target("p/s")
+        assert target == LaunchTarget("p", tmp_path, "p/s", "direct")
+
+    def test_reattach_target_missing(self) -> None:
+        with patch("fujimoto.cli.session_state.load_state", return_value={}):
+            assert _reattach_target("p/s") is None
+
+    def test_restart_execs_with_attach_and_debug_flags(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        program = tmp_path / "fujimoto"
+        program.write_text("")
+        monkeypatch.setattr("sys.argv", [str(program), "--debug", "new", "x"])
+        with patch("fujimoto.cli.os.execv") as execv:
+            _restart_fujimoto("p/s")
+        execv.assert_called_once_with(
+            str(program), [str(program), "--debug", "--attach", "p/s"]
+        )
+
+    def test_restart_falls_back_to_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto"])
+        with (
+            patch("fujimoto.cli.shutil.which", return_value="/bin/fujimoto"),
+            patch("fujimoto.cli.os.execv") as execv,
+        ):
+            _restart_fujimoto("p/s")
+        execv.assert_called_once_with(
+            "/bin/fujimoto", ["/bin/fujimoto", "--attach", "p/s"]
+        )
+
+    def test_restart_not_found_returns(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto"])
+        with (
+            patch("fujimoto.cli.shutil.which", return_value=None),
+            patch("fujimoto.cli.os.execv") as execv,
+        ):
+            _restart_fujimoto("p/s")
+        execv.assert_not_called()
+        assert "not found on PATH" in capsys.readouterr().err
+
+    def test_restart_exec_failure_returns(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto"])
+        with (
+            patch("fujimoto.cli.shutil.which", return_value="/bin/fujimoto"),
+            patch("fujimoto.cli.os.execv", side_effect=OSError("nope")),
+        ):
+            _restart_fujimoto("p/s")
+        assert "restart failed: nope" in capsys.readouterr().err
+
+    def test_pending_restart_after_detach_execs(self) -> None:
+        app1 = SessionApp.__new__(SessionApp)
+        app1._launch_target = LaunchTarget("p", Path("/tmp/r"), "p/s", "direct")
+        app2 = SessionApp.__new__(SessionApp)
+        app2._launch_target = None
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]),
+            patch.object(app1, "run"),
+            patch.object(app2, "run"),
+            patch("fujimoto.cli._start_launch", return_value="p/s"),
+            patch("fujimoto.cli.take_pending_action", return_value=PENDING_RESTART),
+            patch("fujimoto.cli._restart_fujimoto") as restart,
+        ):
+            main()
+        restart.assert_called_once_with("p/s")
+
+    def test_attach_flag_reattaches_without_launch_setup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", "--attach", "p/s"])
+        app = SessionApp.__new__(SessionApp)
+        app._launch_target = None
+        target = LaunchTarget("p", Path("/tmp/r"), "p/s", "direct")
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli._reattach_target", return_value=target),
+            patch("fujimoto.cli.SessionApp", return_value=app),
+            patch.object(app, "run"),
+            patch("fujimoto.cli._start_launch") as start,
+            patch("fujimoto.cli.attach_session") as attach,
+            patch("fujimoto.cli.take_pending_action", return_value=None),
+            patch("fujimoto.cli.set_terminal_title"),
+        ):
+            main()
+        attach.assert_called_once_with("p/s")
+        start.assert_not_called()
+
+    def test_attach_flag_for_a_gone_session_opens_home(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", "--attach", "p/gone"])
+        app = SessionApp.__new__(SessionApp)
+        app._launch_target = None
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli._reattach_target", return_value=None),
+            patch("fujimoto.cli.SessionApp", return_value=app),
+            patch.object(app, "run") as run,
+            patch("fujimoto.cli.attach_session") as attach,
+        ):
+            main()
+        run.assert_called_once()
+        attach.assert_not_called()

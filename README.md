@@ -54,6 +54,15 @@ that version; the next release is offered again.
 `fujimoto update` shows the current and latest versions and the upgrade
 command.
 
+A running fujimoto keeps its old code until it restarts. `Ctrl-A r` (or
+`fujimoto restart` inside a session) reloads it and drops you back into the
+same session in the same terminal; your Claude session never stops. The agent
+offers to do this after upgrading. `fujimoto restart --all`, run anywhere,
+restarts every fujimoto attached to a session and lists the sessions it
+skipped (ones started with `--detach` or attached with plain `tmux attach`,
+where detaching would leave you at a shell). A fujimoto sitting on its home
+screen loads the new version the next time you start it.
+
 ### Installing from source
 
 To pick up unreleased changes, install directly from GitHub:
@@ -271,6 +280,7 @@ via `FUJIMOTO_META_KEY`) to enter a one-shot "fujimoto mode", then:
 | `f` | Fork this session — detaches back to the fujimoto TUI and opens the **Fork session** flow for this worktree, so you get the usual name prompt, base-branch menu and conversation picker. |
 | `s` | Stop this session — closes claude but keeps the session in your list as 🟠, ready to resume. No prompt. |
 | `d` | Detach the tmux session (returns you to the fujimoto TUI). |
+| `r` | Restart fujimoto — reloads it (e.g. after an upgrade) and reattaches to this session in the same terminal. claude keeps running. Same as `fujimoto restart`. |
 | `x` | End this session. With a split open it kills just that pane (with confirmation), as before. With claude alone in the window it detaches to the fujimoto TUI and asks whether to **terminate** (default), **park** 🅿️ or merely **stop** 🟠 it. |
 | `[` | Enter copy mode (scrollback / selection). |
 | `?` | Flash the binding cheatsheet in the status bar. |

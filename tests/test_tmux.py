@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shlex
+import subprocess
 
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -9,6 +10,12 @@ import pytest
 
 from fujimoto import tmux
 from fujimoto.tmux import (
+    LOOP_PID_OPTION,
+    PENDING_ACTION_OPTION,
+    PENDING_RESTART,
+    current_session,
+    loop_client,
+    request_restart,
     TmuxError,
     _configure_session,
     _ensure_extended_keys,
@@ -387,14 +394,26 @@ class TestConfigureSession:
                 for c in cmds
                 if c[:3] == ["tmux", "set-option", "-t"] and c[4] == "status-right"
             )
-            assert "Fujimoto: ^A t/T/w/v/f/s/d/x/[" in status_cmd[5]
+            assert "Fujimoto: ^A t/T/w/v/f/s/d/r/x/[" in status_cmd[5]
             assert "^A t toggles" in status_cmd[5]
             assert "help: ^A ?" in status_cmd[5]
             # fujimoto-table bindings present (server-global, no -t)
             table_keys = [
                 c[4] for c in cmds if c[:4] == ["tmux", "bind-key", "-T", "fujimoto"]
             ]
-            assert set(table_keys) == {"t", "T", "v", "w", "f", "s", "d", "x", "[", "?"}
+            assert set(table_keys) == {
+                "t",
+                "T",
+                "v",
+                "w",
+                "f",
+                "s",
+                "d",
+                "r",
+                "x",
+                "[",
+                "?",
+            }
             # The fork binding must prompt for both name and base branch, and
             # thread the client tty through so switch-client has a target.
             fork_cmd = next(
@@ -579,13 +598,145 @@ class TestCreateSessionWithCommand:
             )
 
 
+def _proc(stdout: str = "", rc: int = 0) -> MagicMock:
+    return MagicMock(returncode=rc, stdout=stdout)
+
+
 class TestAttachSession:
-    def test_calls_subprocess_run(self) -> None:
-        with patch("fujimoto.tmux.subprocess.run") as mock_run:
+    def test_marks_attaches_and_unmarks(self) -> None:
+        def run(cmd: list[str], **kw: object) -> MagicMock:
+            if cmd[1] == "show-options":
+                return _proc("4242\n")
+            return _proc()
+
+        with (
+            patch("fujimoto.tmux.os.getpid", return_value=4242),
+            patch("fujimoto.tmux._refresh_session_config") as refresh,
+            patch("fujimoto.tmux.subprocess.run", side_effect=run) as mock_run,
+        ):
             attach_session("proj/test")
-            mock_run.assert_called_once_with(
-                ["tmux", "attach-session", "-t", "proj/test"]
-            )
+        refresh.assert_called_once_with("proj/test")
+        cmds = [c.args[0] for c in mock_run.call_args_list]
+        assert cmds[0] == [
+            "tmux",
+            "set-option",
+            "-t",
+            "proj/test",
+            LOOP_PID_OPTION,
+            "4242",
+        ]
+        assert cmds[1] == ["tmux", "attach-session", "-t", "proj/test"]
+        assert cmds[-1] == [
+            "tmux",
+            "set-option",
+            "-t",
+            "proj/test",
+            "-u",
+            LOOP_PID_OPTION,
+        ]
+
+    def test_leaves_another_loops_mark(self) -> None:
+        def run(cmd: list[str], **kw: object) -> MagicMock:
+            if cmd[1] == "show-options":
+                return _proc("9999\n")  # a second loop attached meanwhile
+            return _proc()
+
+        with (
+            patch("fujimoto.tmux.os.getpid", return_value=4242),
+            patch("fujimoto.tmux._refresh_session_config"),
+            patch("fujimoto.tmux.subprocess.run", side_effect=run) as mock_run,
+        ):
+            attach_session("proj/test")
+        assert not any("-u" in c.args[0] for c in mock_run.call_args_list)
+
+
+class TestRefreshSessionConfig:
+    def test_reapplies_config_so_new_bindings_reach_running_sessions(self) -> None:
+        with patch("fujimoto.tmux._configure_session") as configure:
+            tmux._refresh_session_config("p/s")
+        configure.assert_called_once_with("p/s")
+
+    @pytest.mark.parametrize(
+        "error",
+        [TmuxError("clash"), subprocess.CalledProcessError(1, "tmux"), OSError()],
+    )
+    def test_failure_does_not_stop_the_attach(self, error: Exception) -> None:
+        with patch("fujimoto.tmux._configure_session", side_effect=error):
+            tmux._refresh_session_config("p/s")  # no raise
+
+
+class TestLoopClient:
+    def _run(
+        self, mark: str | None, clients: str, ps: str
+    ) -> tuple[str | None, MagicMock]:
+        def run(cmd: list[str], **kw: object) -> MagicMock:
+            if cmd[:2] == ["tmux", "show-options"]:
+                return _proc(mark or "", 0 if mark is not None else 1)
+            if cmd[:2] == ["tmux", "list-clients"]:
+                return _proc(clients)
+            if cmd[0] == "ps":
+                return _proc(ps)
+            raise AssertionError(cmd)
+
+        with patch("fujimoto.tmux.subprocess.run", side_effect=run) as mock_run:
+            return loop_client("p/s"), mock_run
+
+    def test_client_whose_parent_is_the_loop(self) -> None:
+        tty, _ = self._run(
+            "100", "201 /dev/ttys001\n202 /dev/ttys002\n", " 201  50\n 202 100\n"
+        )
+        assert tty == "/dev/ttys002"
+
+    def test_unmarked_session(self) -> None:
+        tty, mock_run = self._run(None, "", "")
+        assert tty is None
+        assert mock_run.call_count == 1  # no client lookup needed
+
+    def test_stale_mark_with_only_a_plain_attach(self) -> None:
+        tty, _ = self._run("100", "201 /dev/ttys001\n", " 201 50\n")
+        assert tty is None
+
+    def test_no_clients(self) -> None:
+        tty, mock_run = self._run("100", "", "")
+        assert tty is None
+        assert all(c.args[0][0] != "ps" for c in mock_run.call_args_list)
+
+    def test_garbage_mark(self) -> None:
+        assert self._run("abc", "", "")[0] is None
+
+    def test_ignores_malformed_lines(self) -> None:
+        tty, _ = self._run("100", "junk\n201 /dev/t1\n", "oops\n201 100\n")
+        assert tty == "/dev/t1"
+
+
+class TestRequestRestart:
+    def test_flags_then_detaches_the_client(self) -> None:
+        with patch("fujimoto.tmux.subprocess.run") as mock_run:
+            request_restart("p/s", "/dev/ttys002")
+        assert [c.args[0] for c in mock_run.call_args_list] == [
+            ["tmux", "set-option", "-t", "p/s", PENDING_ACTION_OPTION, PENDING_RESTART],
+            ["tmux", "detach-client", "-t", "/dev/ttys002"],
+        ]
+
+
+class TestCurrentSession:
+    def test_outside_tmux(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("TMUX", raising=False)
+        monkeypatch.delenv("TMUX_PANE", raising=False)
+        assert current_session() is None
+
+    def test_inside_tmux(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TMUX", "/tmp/sock,1,0")
+        monkeypatch.setenv("TMUX_PANE", "%3")
+        with patch("fujimoto.tmux.subprocess.run", return_value=_proc("p/s\n")) as r:
+            assert current_session() == "p/s"
+        assert r.call_args.args[0][-3:] == ["-t", "%3", "#{session_name}"]
+
+    def test_pane_gone(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TMUX", "/tmp/sock,1,0")
+        monkeypatch.setenv("TMUX_PANE", "%3")
+        with patch("fujimoto.tmux.subprocess.run", return_value=_proc("", 1)):
+            assert current_session() is None
 
 
 class TestBuildClaudeCommandSessionAndPrompt:
