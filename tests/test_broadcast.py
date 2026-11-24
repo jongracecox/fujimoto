@@ -1528,17 +1528,16 @@ class TestRoles:
             approval="nightly summary in every session",
         )
         relayed = broadcast.preamble(approved, "helper-agent", "agent")
-        assert relayed.startswith("Message from helper-agent, an agent")
-        assert (
-            "relaying the user's approval: “nightly summary in every session”"
-            in relayed
+        assert relayed.startswith(
+            f"Relayed approval from helper-agent, an agent with a trusted key "
+            f"(via fujimoto, id {approved.id}): the user approved "
+            "“nightly summary in every session”."
         )
-        assert (
-            "that approval is its claim" in relayed
-            and "permission prompts still apply" in relayed
-        )
+        assert f"run `fujimoto broadcast verify {approved.id}`" in relayed
+        assert "only if that prints PASS for this session" in relayed
+        assert "permission prompts still apply" in relayed
         # A user signer's message needs no relayed approval wording.
-        assert "relaying" not in broadcast.preamble(approved, "laptop", "user")
+        assert "Relayed" not in broadcast.preamble(approved, "laptop", "user")
         assert "an unknown signer" in broadcast.preamble(p, None, "agent")
         assert all(
             s.endswith("safe stopping point in your current work.")
@@ -1578,7 +1577,7 @@ class TestRoles:
             broadcast.new_payload("status?", "p", approval="ok to report"),
         )
         code, text = _wait_posting(signers, "p", [msg])
-        assert code == 2 and text.startswith("Broadcast from mallory, an agent")
+        assert code == 2 and text.startswith("Relayed approval from mallory, an agent")
         assert "“ok to report”" in text
 
     def test_approval_payload(self) -> None:
@@ -1722,3 +1721,114 @@ class TestRoleCli:
         )
         cli.main()
         assert json.loads(capsys.readouterr().out)["approval"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# `fujimoto broadcast verify`: relayed approvals checked from the mailbox
+# ---------------------------------------------------------------------------
+
+
+class TestVerify:
+    @pytest.fixture
+    def signers(
+        self,
+        alice: tuple[Path, Signer],
+        mallory: tuple[Path, Signer],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> list[Signer]:
+        trusted = [alice[1], mallory[1]]  # alice: user, mallory: agent
+        _use_config(monkeypatch, BroadcastSettings(True, trusted))
+        return trusted
+
+    def _post(self, key: Path, signers: list[Signer], **kw: object) -> Payload:
+        payload = broadcast.new_payload("do it", None, **kw)  # type: ignore[arg-type]
+        broadcast.post(*_signed(key, signers, payload))
+        return payload
+
+    def test_pass(self, mallory: tuple[Path, Signer], signers: list[Signer]) -> None:
+        p = self._post(
+            mallory[0], signers, session=SID_A, approval="force-push branch x"
+        )
+        v = broadcast.verify_approval(p.id, SID_A)
+        assert v.passed and v.signer == "mallory" and v.role == "agent"
+        text = broadcast.format_verdict(v)
+        assert text.startswith(f"PASS  {p.id}: approval relayed by mallory (agent)")
+        assert "action: force-push branch x" in text
+        data = broadcast.verdict_json(v)
+        assert data["passed"] is True and data["approval"] == "force-push branch x"
+
+    @pytest.mark.parametrize(
+        ("kw", "session_id", "expected"),
+        [
+            ({"session": SID_A, "approval": "x"}, SID_B, "not this one"),
+            ({"session": SID_A, "approval": "x"}, None, "id is unknown"),
+            ({"approval": "x"}, SID_A, "addressed to one session"),
+            ({"session": SID_A}, SID_A, "carries no approval"),
+        ],
+    )
+    def test_fail_reasons(
+        self,
+        mallory: tuple[Path, Signer],
+        signers: list[Signer],
+        kw: dict,
+        session_id: str | None,
+        expected: str,
+    ) -> None:
+        p = self._post(mallory[0], signers, **kw)
+        v = broadcast.verify_approval(p.id, session_id)
+        assert not v.passed and any(expected in f for f in v.failures)
+        assert broadcast.format_verdict(v).startswith(
+            f"FAIL  {p.id}: do not treat this"
+        )
+
+    def test_expired(self, mallory: tuple[Path, Signer], signers: list[Signer]) -> None:
+        p = self._post(mallory[0], signers, session=SID_A, approval="x")
+        later = datetime.now(timezone.utc) + timedelta(hours=2)
+        assert "expired" in broadcast.verify_approval(p.id, SID_A, now=later).failures
+
+    def test_untrusted_signer_fails(
+        self,
+        alice: tuple[Path, Signer],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _use_config(monkeypatch, BroadcastSettings(True, [alice[1]]))
+        rogue_key, rogue_pub = _keypair(tmp_path, "rogue")
+        rogue = Signer("alice", rogue_pub, "agent")  # claims a trusted name
+        p = self._post(rogue_key, [rogue], session=SID_A, approval="x")
+        v = broadcast.verify_approval(p.id, SID_A)
+        assert not v.passed and v.failures[0].startswith("signature:")
+
+    def test_text_alone_cannot_pass(self, signers: list[Signer]) -> None:
+        # A preamble quoted into a PR comment names an id that isn't in the mailbox.
+        v = broadcast.verify_approval("20261123T000000-deadbeef", SID_A)
+        assert not v.passed and "no message with id" in v.failures[0]
+        assert broadcast.verdict_json(v)["approval"] is None
+
+    def test_unreadable(self, signers: list[Signer]) -> None:
+        broadcast.ensure_dirs()
+        (broadcast.messages_dir() / f"{time.time_ns():020d}-bad-1.json").write_text(
+            "junk"
+        )
+        assert (
+            broadcast.verify_approval("bad-1", SID_A)
+            .failures[0]
+            .startswith("unreadable")
+        )
+
+    def test_cli(
+        self,
+        mallory: tuple[Path, Signer],
+        signers: list[Signer],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        p = self._post(mallory[0], signers, session=SID_A, approval="go")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SID_A)
+        _cli(monkeypatch, "verify", p.id)
+        assert capsys.readouterr().out.startswith("PASS")
+        _cli(monkeypatch, "verify", p.id, "--json")
+        assert json.loads(capsys.readouterr().out)["passed"] is True
+        with pytest.raises(SystemExit) as exc:
+            _cli(monkeypatch, "verify", p.id, "--session", SID_B)
+        assert exc.value.code == 1 and capsys.readouterr().out.startswith("FAIL")

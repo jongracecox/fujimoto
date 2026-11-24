@@ -7973,6 +7973,22 @@ def _add_broadcast_command(sub: argparse._SubParsersAction) -> None:
     status = bsub.add_parser("status", help="Recent broadcasts and who received them")
     status.add_argument("id", nargs="?", help="A broadcast id (or part of one)")
     status.add_argument("--json", action="store_true")
+    ver = bsub.add_parser(
+        "verify",
+        help="Check a relayed approval before acting on it (PASS/FAIL)",
+        description=(
+            "Check, from the mailbox itself, that message ID carries an approval "
+            "signed by a trusted key, has not expired, and is addressed to this "
+            "session. Exit 0 on PASS, 1 on FAIL."
+        ),
+    )
+    ver.add_argument("id", help="The message id from the preamble")
+    ver.add_argument(
+        "--session",
+        metavar="ID",
+        help="Check for this session id (default: $CLAUDE_CODE_SESSION_ID)",
+    )
+    ver.add_argument("--json", action="store_true")
     show = bsub.add_parser("show", help="Configuration and listening sessions")
     show.add_argument("--json", action="store_true")
     bsub.add_parser(
@@ -8188,6 +8204,18 @@ def _run_broadcast_command(args: argparse.Namespace) -> None:
                 if args.json
                 else broadcast.format_status(rows)
             )
+        elif cmd == "verify":
+            verdict = broadcast.verify_approval(
+                args.id, args.session or session_query.calling_session_id()
+            )
+            print(
+                json.dumps(broadcast.verdict_json(verdict), indent=2)
+                if args.json
+                else broadcast.format_verdict(verdict)
+            )
+            if not verdict.passed:
+                _finish_debug_log()
+                sys.exit(1)
         elif cmd == "show":
             config = broadcast.load_config(strict=True)
             print(
