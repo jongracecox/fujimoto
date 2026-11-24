@@ -2048,18 +2048,61 @@ def resolve_session(ref: str) -> ClaudeSession:
         raise QueryError(f"cannot read session {path.stem}: {e}") from e
 
 
+@dataclass(frozen=True)
+class PendingSession:
+    """A session fujimoto launched whose transcript doesn't exist yet."""
+
+    session_id: str
+    tmux_session: str
+
+
+def pending_session(
+    ref: str, *, paths: dict[str, Path] | None = None
+) -> PendingSession | None:
+    """The just-launched session `ref` names, while Claude has no transcript yet.
+
+    `new`, `chat` and `resume --detach` report a session id before Claude
+    writes its first transcript line (or, with no prompt, before anyone
+    types), so a lookup by that id finds no log. fujimoto's own session
+    record already holds the id. Matches are exact only, on the full session
+    id or the tmux name, and only for a tmux session that is running, so this
+    can never pick a different session. None once the transcript exists.
+    """
+    paths = list_session_paths() if paths is None else paths
+    for name, record in session_state.load_state().items():
+        session_id = record.claude_session_id
+        if not session_id or name not in paths or ref not in (session_id, name):
+            continue
+        try:
+            find_session_log(session_id)
+        except QueryError:
+            debug.log("query.pending_session", found=True)
+            return PendingSession(session_id, name)
+        return None
+    return None
+
+
 def tmux_for_session(ref: str) -> tuple[str, str | None]:
     """The tmux session running a Claude session: `(tmux name, session id)`.
 
-    `ref` is a tmux session name, or anything `resolve_session` takes. A live
-    Claude session with no tmux session behind it (started outside fujimoto
-    and outside tmux) cannot be stopped from here.
+    `ref` is a tmux session name, or anything `resolve_session` takes. A
+    session launched moments ago, with no transcript yet, is found by its
+    exact id through `pending_session`. A live Claude session with no tmux
+    session behind it (started outside fujimoto and outside tmux) cannot be
+    stopped from here.
     """
     paths = list_session_paths()
     if ref in paths:
         record = session_state.load_state().get(ref)
         return ref, record.claude_session_id if record else None
-    session = resolve_session(ref)
+    try:
+        session = resolve_session(ref)
+    except QueryError:
+        # Just launched: no transcript yet, but fujimoto's record has the id.
+        pending = pending_session(ref, paths=paths)
+        if pending is None:
+            raise
+        return pending.tmux_session, pending.session_id
     activity = ActivityIndex.gather().for_session(session.session_id, session.cwd)
     if not activity.running:
         raise QueryError(f"session {session.session_id} is not running")

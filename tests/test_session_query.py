@@ -1967,3 +1967,59 @@ class TestIncremental:
             clock=lambda: next(ticks2),
         )  # type: ignore[arg-type,return-value]
         assert empty.shown == 0
+
+
+# -- Sessions launched moments ago (no transcript yet) --
+
+
+class TestPendingSession:
+    SID = "0f3c9a2e-1b7d-4c55-9e0a-2d6f8b1c4e77"
+
+    def _launched(self, tmp_path: Path, *, running: bool = True):
+        session_state.save_state(
+            {
+                "proj/chat-1": session_state.SessionRecord(
+                    cwd=str(tmp_path), claude_session_id=self.SID
+                )
+            }
+        )
+        paths = {"proj/chat-1": tmp_path} if running else {}
+        return patch("fujimoto.session_query.list_session_paths", return_value=paths)
+
+    def test_found_by_exact_id_or_tmux_name(self, tmp_path: Path) -> None:
+        with self._launched(tmp_path):
+            for ref in (self.SID, "proj/chat-1"):
+                pending = session_query.pending_session(ref)
+                assert pending == session_query.PendingSession(self.SID, "proj/chat-1")
+
+    def test_prefix_and_peer_names_never_match(self, tmp_path: Path) -> None:
+        with self._launched(tmp_path):
+            assert session_query.pending_session(self.SID[:8]) is None
+            assert session_query.pending_session("chat-1") is None
+
+    def test_stopped_tmux_session_is_not_pending(self, tmp_path: Path) -> None:
+        with self._launched(tmp_path, running=False):
+            assert session_query.pending_session(self.SID) is None
+
+    def test_none_once_the_transcript_exists(self, tmp_path: Path) -> None:
+        _transcript(tmp_path, tmp_path, self.SID, "hello")
+        with self._launched(tmp_path):
+            assert session_query.pending_session(self.SID) is None
+
+    def test_stop_route_by_id_before_the_transcript(self, tmp_path: Path) -> None:
+        with self._launched(tmp_path):
+            assert session_query.tmux_for_session(self.SID) == ("proj/chat-1", self.SID)
+
+    def test_stop_route_still_refuses_unknown(self, tmp_path: Path) -> None:
+        with (
+            self._launched(tmp_path),
+            pytest.raises(QueryError, match="no session log"),
+        ):
+            session_query.tmux_for_session("ffffffff-0000-0000-0000-000000000000")
+
+    def test_stop_route_by_tmux_name(self, tmp_path: Path) -> None:
+        with self._launched(tmp_path):
+            assert session_query.tmux_for_session("proj/chat-1") == (
+                "proj/chat-1",
+                self.SID,
+            )

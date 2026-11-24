@@ -27,9 +27,10 @@ import json
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from fujimoto import broadcast, debug, session_query
 from fujimoto.claude.log_parser import SessionState
@@ -40,6 +41,8 @@ SUBPROCESS_TIMEOUT = 180.0
 # A read with no window would hand the client a whole transcript.
 DEFAULT_TAIL = 40
 MAX_WAIT = 120.0
+# How long a start with a prompt waits for Claude's first transcript line.
+START_WAIT = 10.0
 
 INSTRUCTIONS = """\
 fujimoto manages Claude Code sessions running in tmux, one per git worktree
@@ -148,6 +151,39 @@ def session_id_for(ref: str) -> str:
         return report.sessions[0].session.session_id
 
 
+STARTING_NOTE = (
+    "No transcript yet: Claude writes it with the session's first message. "
+    "Read again in a few seconds; stop_session works by this id or the tmux name."
+)
+
+
+def _starting_row(pending: session_query.PendingSession) -> dict[str, object]:
+    """A list/read row for a session that is running but has no transcript."""
+    return {
+        "session_id": pending.session_id,
+        "state": "starting",
+        "title": None,
+        "active": {"running": True, "tmux_session": pending.tmux_session},
+        "note": STARTING_NOTE,
+    }
+
+
+def _starting_line(pending: session_query.PendingSession) -> str:
+    return (
+        f"◐ {pending.session_id[:8]}  starting · tmux {pending.tmux_session} · "
+        "no transcript yet"
+    )
+
+
+def _pending_or_none(ref: str) -> session_query.PendingSession | None:
+    """`ref`'s pending session, only if it has no transcript (a cheap check first)."""
+    try:
+        session_query.find_session_log(ref)
+    except session_query.QueryError:
+        return session_query.pending_session(ref)
+    return None
+
+
 def list_sessions(
     project: str | None = None,
     all_projects: bool = False,
@@ -167,20 +203,45 @@ def list_sessions(
         if sessions
         else _scope(project, all_projects)
     )
-    try:
-        report = session_query.run_list(
-            scope,
-            limit=limit,
-            running_only=running_only,
-            waiting_only=waiting,
-            states=wanted,
-            refs=tuple(sessions or ()),
-        )
-    except session_query.QueryError as e:
-        raise FujimotoToolError(str(e)) from e
+    refs = tuple(sessions or ())
+    # A session launched moments ago has no transcript for run_list to find;
+    # report it as starting rather than "not found". A filter can't match it.
+    starting: list[session_query.PendingSession] = []
+    if refs and not (waiting or wanted or running_only):
+        for ref in refs:
+            pending = _pending_or_none(ref)
+            if pending is not None:
+                starting.append(pending)
+        found = {p.session_id for p in starting} | {p.tmux_session for p in starting}
+        refs = tuple(r for r in refs if r not in found)
+    report = None
+    if refs or not starting:
+        try:
+            report = session_query.run_list(
+                scope,
+                limit=limit,
+                running_only=running_only,
+                waiting_only=waiting,
+                states=wanted,
+                refs=refs,
+            )
+        except session_query.QueryError as e:
+            raise FujimotoToolError(str(e)) from e
     if format == "json" or picked:
-        return session_query.list_json(report, picked)
-    return _text(session_query.format_list(report))
+        data: dict[str, object] = (
+            session_query.list_json(report, picked)
+            if report is not None
+            else {"refs": list(sessions or ()), "sessions": []}
+        )
+        rows = [_starting_row(p) for p in starting]
+        if picked:
+            rows = [session_query.cut_row(r, picked) for r in rows]
+        data["sessions"] = [*cast("list[object]", data["sessions"]), *rows]
+        return data
+    lines = [_starting_line(p) for p in starting]
+    if report is not None:
+        lines.append(_text(session_query.format_list(report)))
+    return "\n".join(lines)
 
 
 def search_sessions(
@@ -251,7 +312,16 @@ def read_transcript(
         tail = DEFAULT_TAIL
     wait = max(0.0, min(wait, MAX_WAIT))
     extra: dict[str, Any] = {"sleep": sleep} if sleep is not None else {}
-    resolved = session_id_for(session)
+    try:
+        resolved = session_id_for(session)
+    except FujimotoToolError:
+        pending = session_query.pending_session(session)
+        if pending is None:
+            raise
+        row = _starting_row(pending)
+        if format == "json" or picked:
+            return session_query.cut_row(row, picked) if picked else row
+        return f"# session {pending.session_id} · starting\n{_starting_line(pending)}\n{STARTING_NOTE}"
     try:
         report = session_query.load_log_waiting(
             lambda: session_query.load_log(
@@ -333,9 +403,46 @@ def _positional(value: str, what: str) -> str:
 class Commands:
     """The mutating tools: each builds argv, runs the CLI, parses its JSON."""
 
-    def __init__(self, key: str | None = None, run: Runner = _run_cli) -> None:
+    def __init__(
+        self,
+        key: str | None = None,
+        run: Runner = _run_cli,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.key = key
         self._run = run
+        self._sleep = sleep
+        self._clock = clock
+
+    def _await_transcript(
+        self, result: dict[str, object], prompted: bool
+    ) -> dict[str, object]:
+        """Mark a fresh session `transcript_ready`, waiting briefly if it has a prompt.
+
+        Claude writes the transcript with the first message: within seconds
+        when there's a prompt, not until someone types when there isn't. Until
+        then, lookups by id report the session as starting.
+        """
+        session_id = result.get("claude_session_id")
+        if not isinstance(session_id, str) or result.get("session_started") is False:
+            return result
+        deadline = self._clock() + (START_WAIT if prompted else 0.0)
+        while True:
+            try:
+                session_query.find_session_log(session_id)
+                ready = True
+            except session_query.QueryError:
+                ready = False
+            if ready or self._clock() >= deadline:
+                break
+            self._sleep(0.5)
+        result["transcript_ready"] = ready
+        if not ready:
+            result["note"] = STARTING_NOTE
+        debug.log("mcp.start_wait", prompted=prompted, ready=ready)
+        return result
 
     def _call(self, argv: list[str], cwd: Path) -> dict[str, object]:
         command = argv[0] if argv[0] != "broadcast" else "broadcast-" + argv[1]
@@ -387,7 +494,8 @@ class Commands:
             argv.append("--current")
         if prompt:
             argv.append(f"--prompt={prompt}")
-        return self._call(argv, self._project_root(project))
+        result = self._call(argv, self._project_root(project))
+        return self._await_transcript(result, bool(prompt))
 
     def start_chat(
         self,
@@ -409,7 +517,8 @@ class Commands:
             argv.append("--in-scratch")
         if prompt:
             argv.append(f"--prompt={prompt}")
-        return self._call(argv, Path.home())
+        result = self._call(argv, Path.home())
+        return self._await_transcript(result, bool(prompt))
 
     def resume_session(
         self,

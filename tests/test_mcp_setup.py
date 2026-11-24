@@ -750,3 +750,39 @@ class TestSignerName:
         # With a client, failing checks go to stderr and nothing is written.
         err = capsys.readouterr().err
         assert f'add-signer chatgpt "{key}" --role agent' in err
+
+
+class TestCarriedSettings:
+    def test_only_the_allowlist_and_only_when_set(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FUJIMOTO_GIT_ROOT", str(tmp_path / "git"))
+        monkeypatch.delenv("FUJIMOTO_WORKTREE_ROOT", raising=False)
+        monkeypatch.setenv("FUJIMOTO_SECRET_TOKEN", "nope")
+        monkeypatch.setenv("GITHUB_TOKEN", "nope")
+        env = mcp_setup.desktop_entry(None)["env"]
+        assert env["FUJIMOTO_GIT_ROOT"] == str((tmp_path / "git").resolve())
+        assert "FUJIMOTO_WORKTREE_ROOT" not in env
+        assert "FUJIMOTO_SECRET_TOKEN" not in env and "GITHUB_TOKEN" not in env
+
+    def test_tilde_is_expanded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("FUJIMOTO_WORKTREE_ROOT", "~/wt")
+        assert mcp_setup.carried_settings()["FUJIMOTO_WORKTREE_ROOT"] == str(
+            (Path.home() / "wt").resolve()
+        )
+
+    def test_reaches_config_only_and_toml(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from fujimoto import cli
+
+        monkeypatch.setenv("FUJIMOTO_GIT_ROOT", str(tmp_path))
+        with patch("sys.argv", ["fujimoto", "mcp", "setup", "--config-only"]):
+            cli.main()
+        env = json.loads(capsys.readouterr().out)["mcpServers"]["fujimoto"]["env"]
+        assert env["FUJIMOTO_GIT_ROOT"] == str(tmp_path.resolve())
+        block = mcp_setup.toml_block(mcp_setup.desktop_entry(None))
+        assert f'FUJIMOTO_GIT_ROOT = "{tmp_path.resolve()}"' in block

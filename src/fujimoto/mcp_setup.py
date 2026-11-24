@@ -129,12 +129,33 @@ def _stable_dir(tool: str, path: str | None = None) -> str | None:
     return None
 
 
+# fujimoto settings a client must pass on, because GUI apps don't read the
+# shell profile that sets them. An explicit allowlist: nothing else from the
+# environment (tokens, credentials) is ever copied into a client config.
+CARRIED_SETTINGS = ("FUJIMOTO_GIT_ROOT", "FUJIMOTO_WORKTREE_ROOT")
+
+
+def carried_settings() -> dict[str, str]:
+    """The `CARRIED_SETTINGS` that are set, as absolute paths.
+
+    Without them a client-launched server can't resolve a project by name and
+    misses worktrees under the root (and their history). Expanded here, so
+    the config doesn't depend on the client's `HOME` or a shell.
+    """
+    out: dict[str, str] = {}
+    for name in CARRIED_SETTINGS:
+        raw = os.environ.get(name)
+        if raw:
+            out[name] = str(Path(raw).expanduser().resolve())
+    return out
+
+
 def desktop_entry(public_key: str | None) -> dict[str, object]:
     """The `mcpServers.fujimoto` entry for claude_desktop_config.json."""
     args = ["mcp"]
     if public_key:
         args += ["--key", public_key]
-    env = {"PATH": server_path()}
+    env = {"PATH": server_path(), **carried_settings()}
     sock = os.environ.get("SSH_AUTH_SOCK")
     if public_key and sock:
         env["SSH_AUTH_SOCK"] = sock

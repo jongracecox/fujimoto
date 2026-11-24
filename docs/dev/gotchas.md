@@ -127,3 +127,12 @@ Verified with live sessions while building `fujimoto broadcast` (Claude Code
 - **mcp 2.x renamed `FastMCP` to `MCPServer`** (`mcp.server.mcpserver`).
   `MCPServer.call_tool` *raises* `ToolError`, and the protocol layer turns
   it into an `is_error` result, so in-process tests expect the raise.
+- **A new session has an id before it has a transcript.** `claude
+  --session-id` names the transcript, but Claude writes it only with the
+  first message, so a chat started without a prompt has none until someone
+  types. Look such a session up through fujimoto's session record
+  (`session_query.pending_session`), not the transcript.
+- **Clients don't get your shell's `FUJIMOTO_*` settings.** A server started
+  by Claude Desktop or ChatGPT saw no `FUJIMOTO_GIT_ROOT` or
+  `FUJIMOTO_WORKTREE_ROOT`: project names didn't resolve, and worktree
+  history was missing. `mcp setup` now writes them into the client config.
