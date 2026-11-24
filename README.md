@@ -1054,7 +1054,7 @@ uv tool install --force 'fujimoto[mcp]'
 | `list_sessions` | Sessions, newest first; `running_only`, `waiting` (needs you), `states`, `sessions` (by id, prefix or peer name), `fields` | `fujimoto list` |
 | `search_sessions` | Full-text transcript search | `fujimoto search` |
 | `read_transcript` | One transcript (by id, prefix or peer name): `summary`, `grep`, `tail`, `after` cursor, `reply_to` + `wait`, `fields` | `fujimoto log` |
-| `listening_sessions` | Sessions that can receive a message now | `fujimoto broadcast show` |
+| `listening_sessions` | Sessions that can receive a message now, and the server's fujimoto `version` | `fujimoto broadcast show` (`fujimoto --version`) |
 | `message_status` | Recent messages and their delivery receipts | `fujimoto broadcast status` |
 | `follow_message` | One message's delivery, approval check, reply and target activity, with a bounded `wait` | `fujimoto broadcast follow` |
 | `start_session` | New worktree + session in a project | `fujimoto new --detach` |

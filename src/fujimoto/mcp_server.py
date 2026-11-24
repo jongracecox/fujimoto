@@ -350,12 +350,16 @@ def read_transcript(
 
 
 def listening_sessions() -> dict[str, object]:
-    """Broadcast settings and the sessions that can receive a message now."""
+    """Broadcast settings, the sessions that can receive a message now, and
+    the version of the fujimoto serving this (the server's own, not whatever
+    `fujimoto` is on PATH)."""
+    from fujimoto.version import get_version
+
     try:
         config = broadcast.load_config(strict=True)
     except broadcast.BroadcastError as e:
         raise FujimotoToolError(str(e)) from e
-    return broadcast.show_json(config)
+    return {"version": get_version(), **broadcast.show_json(config)}
 
 
 def message_status(message_id: str | None = None) -> dict[str, object]:
@@ -779,8 +783,9 @@ def build_server(key: str | None = None, run: Runner = _run_cli) -> Any:
 
     @server.tool(name="listening_sessions", annotations=read_only)
     async def _listening_sessions() -> dict[str, object]:
-        """Whether broadcast is on, the trusted signers, and the running
-        sessions that can receive a message right now."""
+        """Whether broadcast is on, the trusted signers, the running
+        sessions that can receive a message right now, and `version`: the
+        fujimoto version this server runs."""
         return await call("listening_sessions", listening_sessions)
 
     @server.tool(name="message_status", annotations=read_only)

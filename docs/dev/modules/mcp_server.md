@@ -28,7 +28,9 @@ install command when the extra is missing.
   name into a full id (`find_session_log`, else `run_list(refs=…)`, since the
   peer lookup is private to `session_query`); `read_transcript` and
   `resume_session` use it. The other read tools return `show_json` /
-  `status_json`. `read_transcript` with no window (summary, grep, head, tail,
+  `status_json`; `listening_sessions` adds `version` (`get_version()` of
+  the process serving, so a client can tell a stale server from the
+  `fujimoto` on PATH). `read_transcript` with no window (summary, grep, head, tail,
   after, reply_to) gets `tail=DEFAULT_TAIL` (40), and `wait` is capped at
   `MAX_WAIT` (120s). A tool error is `FujimotoToolError`, turned into the
   SDK's `ToolError` (an `is_error` result) in `build_server`'s `call`.
