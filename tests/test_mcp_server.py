@@ -13,6 +13,7 @@ from fujimoto.claude.log_parser import encode_project_path
 from fujimoto.claude.search import ContentMode
 from fujimoto.global_config import update_global_key
 from fujimoto.mcp_server import Commands, FujimotoToolError
+from fujimoto.version import get_version
 
 pytest.importorskip("mcp")
 
@@ -264,6 +265,7 @@ class TestReadTools:
         with patch.object(broadcast, "list_listeners", return_value=[]):
             data = mcp_server.listening_sessions()
         assert data["enabled"] is True and data["listening"] == []
+        assert data["version"] == get_version()
         with patch.object(broadcast, "status", return_value=[]):
             assert mcp_server.message_status("abc") == {"messages": []}
 
