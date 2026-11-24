@@ -515,6 +515,8 @@ class TestSelfChecks:
     ) -> None:
         names = [c.name for c in mcp_doctor.self_checks(None, env={"PATH": "/usr/bin"})]
         assert names == ["version", "tools on PATH", "signing"]
+        no_key = mcp_doctor.self_checks(None, env={"PATH": "/usr/bin"})[-1]
+        assert no_key.detail.startswith("this server was started without --key")
 
         priv = tmp_path / "k"
         subprocess.run(
