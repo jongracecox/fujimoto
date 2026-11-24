@@ -472,17 +472,29 @@ fujimoto list                       # current project + its worktrees
 fujimoto list --all-projects        # every session on the machine
 fujimoto list --project myproject   # a project under $FUJIMOTO_GIT_ROOT (or a path)
 fujimoto list --running             # only sessions running now
+fujimoto list --waiting             # running sessions waiting on you (approval, question, idle prompt)
+fujimoto list --state waiting_for_user  # by the transcript's last entry
+fujimoto list 8f0e2c1a my-peer      # just these sessions: id, id prefix or peer name
 fujimoto list -n 0 --json           # all of them, as JSON
+fujimoto list --running --json --fields active.peer_name,active.waiting
 ```
 
+`--fields` (with `--json`) keeps only the named keys of each session, plus
+`session_id`, which is always included, so an agent polling for status
+doesn't pay for the whole record. `active.<key>`
+selects inside the `active` object. A running session's `active.waiting`
+says why it is blocked on you (`permission`, `question`, `dialog`, `other`),
+taken from Claude Code's own session registry, and `active.waiting_for` gives
+Claude's own wording.
+
 ```
-● myproject/20261013-fix-flaky-test  2h ago  8f0e2c1a  busy · peer 20261013-fix-flaky-test
+● 8f0e2c1a  myproject/20261013-fix-flaky-test         2h ago  busy · peer 20261013-fix-flaky-test
     Fix the flaky test in test_api.py
-○ other-project/20261001-old-work (deleted)  3w ago  1c9d77b0
+○ 1c9d77b0  other-project/20261001-old-work (deleted)  3w ago
     Investigate CI timeouts
 
 2 sessions · all projects · 1 running
-Next: fujimoto log <id> --summary · fujimoto resume <id> · fujimoto search QUERY
+Next: fujimoto list <id> --json --fields … · fujimoto log <id> --summary · fujimoto resume <id> (a peer name works too)
 ```
 
 Run outside any git repo, `list` and `search` cover every project, since

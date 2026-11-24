@@ -7492,15 +7492,26 @@ def _run_search_command(args: argparse.Namespace) -> None:
 def _run_list_command(args: argparse.Namespace) -> None:
     """`fujimoto list`: the sessions in a project, or on the whole machine."""
     try:
-        scope = session_query.resolve_scope(
-            project=args.project,
-            all_projects=args.all_projects,
-            outside_repo_all=True,
+        fields = session_query.parse_fields(args.fields) if args.fields else None
+        if fields and not args.json:
+            raise session_query.QueryError("--fields needs --json")
+        # Named sessions are found wherever they are, so the scope is moot.
+        scope = (
+            session_query.Scope(all_projects=True)
+            if args.sessions
+            else session_query.resolve_scope(
+                project=args.project,
+                all_projects=args.all_projects,
+                outside_repo_all=True,
+            )
         )
         report = session_query.run_list(
             scope,
             limit=args.limit,
             running_only=args.running,
+            waiting_only=args.waiting,
+            states=args.state,
+            refs=args.sessions,
             calling_session=session_query.calling_session_id(),
         )
     except session_query.QueryError as e:
@@ -7508,7 +7519,7 @@ def _run_list_command(args: argparse.Namespace) -> None:
         print(f"fujimoto: {e}", file=sys.stderr)
         sys.exit(1)
     if args.json:
-        print(session_query.dump_json(session_query.list_json(report)))
+        print(session_query.dump_json(session_query.list_json(report, fields)))
     else:
         print(session_query.format_list(report))
     _finish_debug_log()
@@ -7908,6 +7919,16 @@ def _run_log_command(args: argparse.Namespace) -> None:
     else:
         print(session_query.format_log(report))
     _finish_debug_log()
+
+
+def _session_states(value: str) -> tuple[SessionState, ...]:
+    """`--state working,waiting_for_user` as states, rejecting unknown names."""
+    names = [name.strip() for name in value.split(",") if name.strip()]
+    try:
+        return tuple(SessionState(name) for name in names)
+    except ValueError:
+        valid = ", ".join(state.value for state in SessionState)
+        raise argparse.ArgumentTypeError(f"choose from: {valid}") from None
 
 
 def _non_negative(value: str) -> int:
@@ -8380,7 +8401,17 @@ def _add_query_commands(sub: argparse._SubParsersAction) -> None:
             "the current directory, plus its worktrees), newest first; outside "
             "any repo, every project. Each row gives the project/worktree, when "
             "it was last used, the session id, whether it is running (with its "
-            "peer name), and its title."
+            "peer name and what it is waiting for), and its title. Name "
+            "sessions to list just those."
+        ),
+    )
+    listing.add_argument(
+        "sessions",
+        nargs="*",
+        metavar="SESSION",
+        help=(
+            "List only these sessions: an id, a unique id prefix, a .jsonl path, "
+            "or a running session's peer name (scope flags and -n are ignored)"
         ),
     )
     list_where = listing.add_mutually_exclusive_group()
@@ -8404,6 +8435,32 @@ def _add_query_commands(sub: argparse._SubParsersAction) -> None:
     )
     listing.add_argument(
         "--running", action="store_true", help="Only sessions that are running now"
+    )
+    listing.add_argument(
+        "--waiting",
+        action="store_true",
+        help=(
+            "Only running sessions waiting on the user: a permission prompt, a "
+            "question, a dialog, or an idle prompt"
+        ),
+    )
+    listing.add_argument(
+        "--state",
+        type=_session_states,
+        default=(),
+        metavar="STATE[,STATE]",
+        help=(
+            "Only sessions whose transcript ends in one of these states: "
+            + ", ".join(state.value for state in SessionState)
+        ),
+    )
+    listing.add_argument(
+        "--fields",
+        metavar="FIELD[,FIELD]",
+        help=(
+            "With --json, return only these fields of each session "
+            "(e.g. session_id,state,active.peer_name,active.waiting)"
+        ),
     )
     listing.add_argument("--json", action="store_true", help="Print JSON")
 

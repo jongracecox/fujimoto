@@ -12,12 +12,18 @@ import pytest
 
 from fujimoto import debug, session_query, session_state
 from fujimoto.claude.live import LiveSession
-from fujimoto.claude.log_parser import ClaudeLogError, encode_project_path
+from fujimoto.claude.log_parser import (
+    ClaudeLogError,
+    SessionState,
+    encode_project_path,
+    parse_session,
+)
 from fujimoto.claude.search import ContentMode, Snippet
 from fujimoto.session_query import (
     NOT_RUNNING,
     SOURCE_REGISTRY,
     SOURCE_TMUX,
+    LIST_FIELDS,
     Activity,
     ActivityIndex,
     Location,
@@ -28,15 +34,18 @@ from fujimoto.session_query import (
     format_log,
     format_list,
     format_search,
+    is_waiting,
     list_json,
     load_log,
     load_log_waiting,
     log_json,
+    parse_fields,
     relative_time,
     resolve_scope,
     run_list,
     run_search,
     search_json,
+    select_fields,
     use_color,
 )
 
@@ -1408,12 +1417,13 @@ class TestFormatList:
     def test_rows(self, tmp_path: Path) -> None:
         out = format_list(self._report(tmp_path, calling_session="aaaaaaaa-1111"))
         lines = out.splitlines()
-        assert lines[0].startswith(f"● {tmp_path / 'w'}")
-        assert lines[0].endswith("aaaaaaaa  busy · peer w-ab · this session")
+        assert lines[0].startswith(f"● aaaaaaaa  {tmp_path / 'w'}")
+        assert lines[0].endswith("busy · peer w-ab · this session")
         assert lines[1] == "    fix the login bug"
-        assert lines[2].startswith(f"○ {tmp_path / 'gone'} (deleted)")
-        assert lines[2].endswith("bbbbbbbb")
+        assert lines[2].startswith(f"○ bbbbbbbb  {tmp_path / 'gone'} (deleted)")
+        assert lines[2].endswith("ago")
         assert "2 sessions · all projects · 1 running" in out
+        assert "Next: fujimoto list <id> --json --fields" in out
         assert "fujimoto resume <id>" in out
 
     def test_truncated_footer(self, tmp_path: Path) -> None:
@@ -1460,6 +1470,255 @@ class TestFormatList:
         assert format_list(running).startswith("No running sessions")
 
 
+def _ended(tmp_path: Path, cwd: Path, session_id: str, *, age: int, stop: str | None):
+    """A transcript ending on an assistant reply with this `stop_reason`.
+
+    `end_turn` reads as waiting_for_user, `tool_use` (no result yet) as
+    waiting_for_tool_approval.
+    """
+    log = _transcript(tmp_path, cwd, session_id, f"prompt {session_id}", age=age)
+    entry = {
+        "type": "assistant",
+        "cwd": str(cwd),
+        "timestamp": "2026-10-20T12:00:00Z",
+        "message": {"content": [{"type": "text", "text": "ok"}], "stop_reason": stop},
+    }
+    mtime = log.stat().st_mtime
+    with log.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
+    os.utime(log, (mtime, mtime))
+    return log
+
+
+class TestIsWaiting:
+    def _session(self, tmp_path: Path, stop: str | None = None):
+        cwd = tmp_path / "w"
+        if stop:
+            log = _ended(tmp_path, cwd, "s-1", age=0, stop=stop)
+        else:
+            log = _transcript(tmp_path, cwd, "s-1", "hi")
+        return parse_session(log)
+
+    def test_not_running_never_waits(self, tmp_path: Path) -> None:
+        assert not is_waiting(self._session(tmp_path, "end_turn"), NOT_RUNNING)
+
+    @pytest.mark.parametrize(
+        ("status", "waiting_for", "expected"),
+        [
+            ("busy", None, False),
+            ("idle", None, True),
+            ("busy", "permission prompt", True),
+            (None, "input needed", True),
+        ],
+    )
+    def test_registry_decides(
+        self,
+        tmp_path: Path,
+        status: str | None,
+        waiting_for: str | None,
+        expected: bool,
+    ) -> None:
+        # The transcript says "working"; the registry overrides it either way.
+        session = self._session(tmp_path)
+        activity = Activity(
+            running=True,
+            source=SOURCE_REGISTRY,
+            status=status,
+            waiting_for=waiting_for,
+        )
+        assert is_waiting(session, activity) is expected
+
+    @pytest.mark.parametrize(
+        ("stop", "expected"),
+        [(None, False), ("end_turn", True), ("tool_use", True)],
+    )
+    def test_falls_back_to_the_transcript(
+        self, tmp_path: Path, stop: str | None, expected: bool
+    ) -> None:
+        session = self._session(tmp_path, stop)
+        tmux_only = Activity(running=True, source=SOURCE_TMUX, tmux_session="p/x")
+        assert is_waiting(session, tmux_only) is expected
+        silent_registry = Activity(running=True, source=SOURCE_REGISTRY)
+        assert is_waiting(session, silent_registry) is expected
+
+
+class TestListFilters:
+    def _setup(self, tmp_path: Path) -> ActivityIndex:
+        cwd = tmp_path / "w"
+        _transcript(tmp_path, cwd, "busy-1", "a", age=1)
+        _ended(tmp_path, cwd, "idle-2", age=2, stop="end_turn")
+        _transcript(tmp_path, cwd, "perm-3", "c", age=3)
+        _ended(tmp_path, cwd, "gone-4", age=4, stop="end_turn")
+        return _index(
+            [
+                _live("busy-1", cwd, status="busy", peer_name="p-busy"),
+                _live("idle-2", cwd, status="idle", peer_name="p-idle"),
+                _live(
+                    "perm-3",
+                    cwd,
+                    status="busy",
+                    peer_name="p-perm",
+                    waiting_for="permission prompt",
+                ),
+            ]
+        )
+
+    def _ids(self, report) -> list[str]:
+        return [s.session.session_id for s in report.sessions]
+
+    def test_waiting(self, tmp_path: Path) -> None:
+        index = self._setup(tmp_path)
+        report = run_list(Scope(all_projects=True), waiting_only=True, activity=index)
+        assert self._ids(report) == ["idle-2", "perm-3"]
+        perm = report.sessions[1].activity
+        assert (perm.waiting_for, perm.waiting) == ("permission prompt", "permission")
+        out = format_list(report)
+        assert "busy · waiting: permission prompt · peer p-perm" in out
+        assert "2 waiting sessions · all projects" in out
+        assert "running" not in out.splitlines()[-2]
+
+    def test_waiting_keeps_reading_to_the_limit(self, tmp_path: Path) -> None:
+        index = self._setup(tmp_path)
+        report = run_list(
+            Scope(all_projects=True), limit=1, waiting_only=True, activity=index
+        )
+        assert self._ids(report) == ["idle-2"]
+        assert report.scanned == 2
+
+    def test_states(self, tmp_path: Path) -> None:
+        index = self._setup(tmp_path)
+        report = run_list(
+            Scope(all_projects=True),
+            states=[SessionState.WAITING_FOR_USER],
+            activity=index,
+        )
+        assert self._ids(report) == ["idle-2", "gone-4"]
+        assert "· state waiting_for_user" in format_list(report)
+        both = run_list(
+            Scope(all_projects=True),
+            running_only=True,
+            states=[SessionState.WAITING_FOR_USER],
+            activity=index,
+        )
+        assert self._ids(both) == ["idle-2"]
+
+    def test_empty_filtered(self, tmp_path: Path) -> None:
+        report = run_list(
+            Scope(all_projects=True), waiting_only=True, activity=_index()
+        )
+        assert format_list(report).startswith("No waiting sessions in 0 transcripts")
+
+
+class TestListRefs:
+    def test_ids_prefixes_and_peers_in_the_order_given(self, tmp_path: Path) -> None:
+        cwd = tmp_path / "w"
+        _transcript(tmp_path, cwd, "aaaa-1111", "a", age=1)
+        _transcript(tmp_path, cwd, "bbbb-2222", "b", age=2)
+        _transcript(tmp_path, cwd, "cccc-3333", "c", age=3)
+        index = _index([_live("cccc-3333", cwd, peer_name="helper")])
+        report = run_list(
+            # The scope and limit don't narrow named sessions.
+            Scope(all_projects=False, project="other", root=tmp_path / "x"),
+            limit=1,
+            refs=["helper", "bbbb", "aaaa-1111", "cccc"],
+            activity=index,
+        )
+        ids = [s.session.session_id for s in report.sessions]
+        assert ids == ["cccc-3333", "bbbb-2222", "aaaa-1111"]  # cccc deduplicated
+        assert report.sessions[0].activity.peer_name == "helper"
+        assert not report.truncated
+        out = format_list(report)
+        assert "3 sessions · 4 named" in out
+
+    def test_filters_still_apply(self, tmp_path: Path) -> None:
+        cwd = tmp_path / "w"
+        _transcript(tmp_path, cwd, "aaaa-1111", "a")
+        report = run_list(
+            Scope(all_projects=True),
+            refs=["aaaa"],
+            running_only=True,
+            activity=_index(),
+        )
+        assert report.sessions == ()
+        assert format_list(report) == "None of the 1 named sessions match (running)."
+
+    def test_unknown_ref(self, tmp_path: Path) -> None:
+        with pytest.raises(QueryError, match="no session log found for 'nope'"):
+            run_list(Scope(all_projects=True), refs=["nope"], activity=_index())
+
+    def test_ambiguous_peer(self, tmp_path: Path) -> None:
+        index = _index(
+            [
+                _live("s-1", tmp_path, peer_name="twin"),
+                _live("s-2", tmp_path, peer_name="twin"),
+            ]
+        )
+        with pytest.raises(QueryError, match="peer 'twin' is running 2 sessions"):
+            run_list(Scope(all_projects=True), refs=["twin"], activity=index)
+
+    def test_unreadable_ref(self, tmp_path: Path) -> None:
+        empty = _projects(tmp_path) / "-w" / "empty-1.jsonl"
+        empty.parent.mkdir(parents=True)
+        empty.write_text("")
+        with pytest.raises(QueryError, match="cannot read session empty-1"):
+            run_list(Scope(all_projects=True), refs=["empty-1"], activity=_index())
+
+
+class TestFields:
+    def test_parse(self) -> None:
+        assert parse_fields("session_id,active.waiting, session_id") == (
+            "session_id",
+            "active.waiting",
+        )
+
+    @pytest.mark.parametrize("text", ["", " , ", "nope", "active.nope", "state.x"])
+    def test_parse_rejects(self, text: str) -> None:
+        with pytest.raises(QueryError):
+            parse_fields(text)
+
+    def test_every_field_name_is_a_real_key(self, tmp_path: Path) -> None:
+        cwd = tmp_path / "w"
+        _transcript(tmp_path, cwd, "s-1", "hi")
+        report = run_list(
+            Scope(all_projects=True), activity=_index([_live("s-1", cwd)])
+        )
+        (row,) = list_json(report)["sessions"]
+        for field in LIST_FIELDS:
+            head, _, rest = field.partition(".")
+            assert head in row
+            if rest:
+                assert rest in row[head]
+
+    def test_select_keeps_nesting_and_nulls_missing(self) -> None:
+        row = {"session_id": "s", "title": "t", "active": {"running": False}}
+        assert select_fields(row, ["active.peer_name", "session_id"]) == {
+            "active": {"peer_name": None},
+            "session_id": "s",
+        }
+
+    def test_whole_object_wins_over_its_paths(self) -> None:
+        row = {"active": {"running": True, "pid": 1}}
+        assert select_fields(row, ["active.pid", "active"]) == {
+            "active": {"running": True, "pid": 1}
+        }
+
+    def test_list_json_with_fields(self, tmp_path: Path) -> None:
+        cwd = tmp_path / "w"
+        _transcript(tmp_path, cwd, "s-1", "hi")
+        index = _index([_live("s-1", cwd, waiting_for="input needed")])
+        report = run_list(Scope(all_projects=True), activity=index)
+        data = list_json(report, ["session_id", "active.waiting"])
+        assert data["sessions"] == [
+            {"session_id": "s-1", "active": {"waiting": "question"}}
+        ]
+        # session_id always leads, asked for or not, and only once.
+        for fields in (["active.waiting"], ["active.waiting", "session_id"]):
+            (row,) = list_json(report, fields)["sessions"]
+            assert list(row) == ["session_id", "active"]
+            assert row["session_id"] == "s-1"
+        assert data["truncated"] is False  # the envelope is untouched
+
+
 class TestListJson:
     def test_shape(self, tmp_path: Path) -> None:
         _transcript(tmp_path, tmp_path / "w", "s-1", "hello")
@@ -1481,6 +1740,7 @@ class TestListJson:
         assert row["cwd_exists"] is False
         assert row["this_session"] is True
         assert row["active"] == {"running": False}
+        assert (data["waiting_only"], data["states"], data["refs"]) == (False, [], [])
 
 
 # -- Incremental reads: --after, --reply-to, --wait --

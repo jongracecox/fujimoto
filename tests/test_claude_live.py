@@ -81,6 +81,18 @@ class TestListLiveSessions:
             tmux_session="proj/20261020-x",
         )
 
+    def test_reads_waiting_for(self, tmp_path: Path) -> None:
+        _write(tmp_path, "1.json", _entry(os.getpid(), waitingFor="permission prompt"))
+        [entry] = live.list_live_sessions(tmp_path)
+        assert entry.waiting_for == "permission prompt"
+        assert live.waiting_category(entry.waiting_for) == live.WAITING_PERMISSION
+
+    @pytest.mark.parametrize("value", ["", 7, None])
+    def test_blank_waiting_for_is_none(self, tmp_path: Path, value: object) -> None:
+        _write(tmp_path, "1.json", _entry(os.getpid(), waitingFor=value))
+        [entry] = live.list_live_sessions(tmp_path)
+        assert entry.waiting_for is None
+
     def test_optional_fields_may_be_missing(self, tmp_path: Path) -> None:
         _write(tmp_path, "1.json", {"pid": os.getpid(), "sessionId": "s"})
         [entry] = live.list_live_sessions(tmp_path)
@@ -88,6 +100,7 @@ class TestListLiveSessions:
         assert entry.peer_name is None
         assert entry.status is None
         assert entry.tmux_session is None
+        assert entry.waiting_for is None
 
     def test_skips_stale_and_malformed_files(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -111,3 +124,22 @@ class TestListLiveSessions:
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
         _write(tmp_path / "sessions", "1.json", _entry(os.getpid()))
         assert len(live.list_live_sessions()) == 1
+
+
+class TestWaitingCategory:
+    @pytest.mark.parametrize(
+        ("reason", "category"),
+        [
+            ("permission prompt", "permission"),
+            ("sandbox request", "permission"),
+            ("worker request", "permission"),
+            ("goal proposal", "permission"),
+            ("input needed", "question"),
+            ("dialog open", "dialog"),
+            ("a reason from a newer Claude", "other"),
+            (None, None),
+            ("", None),
+        ],
+    )
+    def test_categories(self, reason: str | None, category: str | None) -> None:
+        assert live.waiting_category(reason) == category
