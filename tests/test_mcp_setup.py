@@ -295,3 +295,240 @@ class TestConfigOnly:
         )
         entry = mcp_setup.client_config(report)["mcpServers"]["fujimoto"]
         assert entry["args"] == ["mcp", "--key", key]
+
+
+ENTRY = {"command": "/x/fujimoto", "args": ["mcp"], "env": {"PATH": "/usr/bin"}}
+
+
+def _desktop_file(tmp_path: Path, data: object, indent: int = 2) -> Path:
+    path = tmp_path / "Claude" / "claude_desktop_config.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=indent) + "\n")
+    path.chmod(0o600)
+    return path
+
+
+class TestInstallDesktopConfig:
+    EXISTING = {
+        "preferences": {"theme": "dark"},
+        "mcpServers": {"other": {"command": "other-server", "args": ["--x"]}},
+        "coworkUserFilesPath": "/somewhere",
+    }
+
+    def test_adds_entry_keeps_everything_else(self, tmp_path: Path) -> None:
+        path = _desktop_file(tmp_path, self.EXISTING, indent=4)
+        result = mcp_setup.install_desktop_config(ENTRY, path=path, stamp="20261124")
+        assert result.status == mcp_setup.ADDED
+        after = json.loads(path.read_text())
+        assert after["mcpServers"] == {**self.EXISTING["mcpServers"], "fujimoto": ENTRY}
+        assert {k: v for k, v in after.items() if k != "mcpServers"} == {
+            "preferences": {"theme": "dark"},
+            "coworkUserFilesPath": "/somewhere",
+        }
+        assert list(after) == list(self.EXISTING)  # key order kept
+        assert path.read_text().splitlines()[1].startswith('    "')  # indent kept
+        assert path.read_text().endswith("\n")
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert result.backup == path.with_name(path.name + ".bak-20261124")
+        assert json.loads(result.backup.read_text()) == self.EXISTING
+
+    def test_identical_entry_is_a_no_op(self, tmp_path: Path) -> None:
+        path = _desktop_file(tmp_path, {"mcpServers": {"fujimoto": ENTRY}})
+        before = path.read_text()
+        result = mcp_setup.install_desktop_config(ENTRY, path=path)
+        assert result.status == mcp_setup.UNCHANGED
+        assert result.backup is None
+        assert path.read_text() == before
+        assert list(path.parent.glob("*.bak-*")) == []
+
+    def test_own_entry_is_updated_without_replace(self, tmp_path: Path) -> None:
+        """Re-running with --key later updates what an earlier setup wrote."""
+        old = {"command": "/x/fujimoto", "args": ["mcp"], "env": {"PATH": "/usr/bin"}}
+        path = _desktop_file(tmp_path, {"mcpServers": {"fujimoto": old}})
+        keyed = {**ENTRY, "args": ["mcp", "--key", "ssh-ed25519 AAAA"]}
+        result = mcp_setup.install_desktop_config(keyed, path=path, stamp="1")
+        assert result.status == mcp_setup.REPLACED
+        assert '+    "--key",' in result.diff
+        assert json.loads(path.read_text())["mcpServers"]["fujimoto"] == keyed
+        assert json.loads(result.backup.read_text())["mcpServers"]["fujimoto"] == old
+
+    def test_global_flags_before_mcp_are_kept(self, tmp_path: Path) -> None:
+        old = {"command": "/x/fujimoto", "args": ["--debug-redacted", "mcp"]}
+        path = _desktop_file(tmp_path, {"mcpServers": {"fujimoto": old}})
+        keyed = {**ENTRY, "args": ["mcp", "--key", "K"]}
+        mcp_setup.install_desktop_config(keyed, path=path, stamp="1")
+        args = json.loads(path.read_text())["mcpServers"]["fujimoto"]["args"]
+        assert args == ["--debug-redacted", "mcp", "--key", "K"]
+        # And with the flags kept, a re-run is a no-op.
+        again = mcp_setup.install_desktop_config(keyed, path=path)
+        assert again.status == mcp_setup.UNCHANGED
+
+    @pytest.mark.parametrize(
+        "foreign",
+        [
+            {"command": "node", "args": ["fujimoto-bridge.js"]},
+            {"command": "/x/fujimoto", "args": ["list"]},
+            {"command": "/x/fujimoto"},
+            "not even an object",
+        ],
+    )
+    def test_foreign_entry_needs_replace(self, tmp_path: Path, foreign: object) -> None:
+        path = _desktop_file(tmp_path, {"mcpServers": {"fujimoto": foreign}})
+        before = path.read_text()
+        result = mcp_setup.install_desktop_config(ENTRY, path=path)
+        assert result.status == mcp_setup.CONFLICT
+        assert result.diff.startswith("--- current fujimoto entry")
+        assert path.read_text() == before
+        assert list(path.parent.glob("*.bak-*")) == []
+        result = mcp_setup.install_desktop_config(
+            ENTRY, path=path, replace=True, stamp="1"
+        )
+        assert result.status == mcp_setup.REPLACED
+        assert json.loads(path.read_text())["mcpServers"]["fujimoto"] == ENTRY
+        assert (
+            json.loads(result.backup.read_text())["mcpServers"]["fujimoto"] == foreign
+        )
+
+    def test_missing_file_is_created_private(self, tmp_path: Path) -> None:
+        path = tmp_path / "Claude" / "claude_desktop_config.json"
+        path.parent.mkdir()
+        result = mcp_setup.install_desktop_config(ENTRY, path=path)
+        assert result.status == mcp_setup.ADDED and result.backup is None
+        assert json.loads(path.read_text()) == {"mcpServers": {"fujimoto": ENTRY}}
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    def test_empty_file(self, tmp_path: Path) -> None:
+        path = tmp_path / "c.json"
+        path.write_text("")
+        mcp_setup.install_desktop_config(ENTRY, path=path, stamp="1")
+        assert json.loads(path.read_text()) == {"mcpServers": {"fujimoto": ENTRY}}
+
+    def test_missing_claude_dir(self, tmp_path: Path) -> None:
+        with pytest.raises(mcp_setup.InstallError, match="Claude Desktop installed"):
+            mcp_setup.install_desktop_config(ENTRY, path=tmp_path / "no" / "c.json")
+
+    @pytest.mark.parametrize(
+        ("text", "match"),
+        [
+            ("{not json", "not valid JSON"),
+            ("[1, 2]", "not a JSON object"),
+            ('{"mcpServers": []}', '"mcpServers"'),
+        ],
+    )
+    def test_bad_file_is_left_alone(
+        self, tmp_path: Path, text: str, match: str
+    ) -> None:
+        path = tmp_path / "c.json"
+        path.write_text(text)
+        with pytest.raises(mcp_setup.InstallError, match=match):
+            mcp_setup.install_desktop_config(ENTRY, path=path)
+        assert path.read_text() == text
+        assert list(tmp_path.glob("*.bak-*")) == []
+
+    def test_unreadable_file(self, tmp_path: Path) -> None:
+        path = tmp_path / "c.json"
+        path.write_bytes(b"\xff\xfe")
+        with pytest.raises(mcp_setup.InstallError, match="cannot read"):
+            mcp_setup.install_desktop_config(ENTRY, path=path)
+
+    def test_write_failure_leaves_original(self, tmp_path: Path) -> None:
+        path = _desktop_file(tmp_path, self.EXISTING)
+        before = path.read_text()
+        with (
+            patch("os.replace", side_effect=OSError("disk full")),
+            pytest.raises(mcp_setup.InstallError, match="cannot write"),
+        ):
+            mcp_setup.install_desktop_config(ENTRY, path=path, stamp="1")
+        assert path.read_text() == before
+        assert [p.name for p in path.parent.iterdir() if p.name.startswith(".")] == []
+
+    def test_messages(self, tmp_path: Path) -> None:
+        p = tmp_path / "c.json"
+        added = mcp_setup.InstallResult(mcp_setup.ADDED, p, tmp_path / "c.json.bak-1")
+        assert "Backup of the previous file" in mcp_setup.format_install(added)
+        assert "⌘Q" in mcp_setup.format_install(added)
+        same = mcp_setup.InstallResult(mcp_setup.UNCHANGED, p)
+        assert "nothing changed" in mcp_setup.format_install(same)
+        conflict = mcp_setup.InstallResult(mcp_setup.CONFLICT, p, diff="-a\n+b")
+        assert "--replace" in mcp_setup.format_install(conflict)
+        assert "doesn't look like one fujimoto wrote" in mcp_setup.format_install(
+            conflict
+        )
+        replaced = mcp_setup.InstallResult(mcp_setup.REPLACED, p, None, "-a\n+b")
+        assert "Updated" in mcp_setup.format_install(replaced)
+        assert mcp_setup.install_json(same) == {
+            "status": "unchanged",
+            "path": str(p),
+            "backup": None,
+            "diff": None,
+        }
+
+
+class TestInstallCli:
+    def _main(self, *argv: str) -> None:
+        from fujimoto import cli
+
+        with patch("sys.argv", ["fujimoto", *argv]):
+            cli.main()
+
+    def test_writes_the_checked_entry(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        path = _desktop_file(tmp_path, {"mcpServers": {}})
+        with patch.object(mcp_setup, "desktop_config_path", return_value=path):
+            self._main("mcp", "setup", "claude-desktop")
+        assert "Added the fujimoto entry" in capsys.readouterr().out
+        entry = json.loads(path.read_text())["mcpServers"]["fujimoto"]
+        assert entry["args"] == ["mcp"]
+
+    def test_failing_check_writes_nothing(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        path = _desktop_file(tmp_path, {"mcpServers": {}})
+        before = path.read_text()
+        with (
+            patch.object(mcp_setup, "desktop_config_path", return_value=path),
+            patch.object(broadcast, "_agent_keys", return_value=[]),
+            pytest.raises(SystemExit) as exc,
+        ):
+            self._main("mcp", "setup", "claude-desktop", "--key", "nonsense")
+        assert exc.value.code == 1
+        assert path.read_text() == before
+        assert "no config was printed" in capsys.readouterr().err
+
+    def test_conflict_exits_1_and_json(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        path = _desktop_file(tmp_path, {"mcpServers": {"fujimoto": {"command": "old"}}})
+        with (
+            patch.object(mcp_setup, "desktop_config_path", return_value=path),
+            pytest.raises(SystemExit) as exc,
+        ):
+            self._main("mcp", "setup", "claude-desktop", "--json")
+        assert exc.value.code == 1
+        assert json.loads(capsys.readouterr().out)["status"] == "conflict"
+
+    def test_install_error(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with (
+            patch.object(
+                mcp_setup, "desktop_config_path", return_value=tmp_path / "x" / "c.json"
+            ),
+            pytest.raises(SystemExit) as exc,
+        ):
+            self._main("mcp", "setup", "claude-desktop")
+        assert exc.value.code == 1
+        assert "Claude Desktop installed" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ("mcp", "setup", "claude-desktop", "--config-only"),
+            ("mcp", "setup", "--replace"),
+        ],
+    )
+    def test_misuse(self, argv: tuple[str, ...]) -> None:
+        with pytest.raises(SystemExit) as exc:
+            self._main(*argv)
+        assert exc.value.code == 2

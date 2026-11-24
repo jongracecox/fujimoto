@@ -1024,15 +1024,26 @@ knowingly. Re-run it until there are no ✗ lines.
    "<public key>" --role agent`, and `fujimoto broadcast enable` if broadcast
    is off. Sessions fix their trusted keys at launch, so restart the ones that
    should receive this agent's messages.
-5. **Add the printed JSON** (or just that part, with
-   `fujimoto mcp setup [--key …] --config-only`, which prints only
-   `{"mcpServers": {"fujimoto": …}}` and nothing if a check fails) under `mcpServers` in
-   `~/Library/Application Support/Claude/claude_desktop_config.json` and
-   restart Claude Desktop. It holds an absolute path to `fujimoto`, a `PATH`
-   that finds tmux, git and claude (GUI apps get a minimal one), the public
-   key, and your current `SSH_AUTH_SOCK` so the server reaches the same agent.
-   If your agent's socket changes (a different key manager, a new login), run
-   setup again.
+5. **Add the entry to Claude Desktop.** `fujimoto mcp setup claude-desktop`
+   (with the same `--key`) writes it for you, only if every check passes. It
+   copies `claude_desktop_config.json` to `claude_desktop_config.json.bak-<time>`
+   first, changes nothing but `mcpServers.fujimoto`, keeps the file's
+   indentation and permissions, and reads it back to check. Re-running it
+   updates the entry it wrote before (e.g. adding `--key` later), showing the
+   diff and keeping any global flags you put before `mcp`, such as
+   `--debug-redacted`. A `fujimoto` entry it didn't write is only overwritten
+   with `--replace`. Then quit Claude Desktop (⌘Q) and reopen it.
+
+   To edit the file yourself instead, `fujimoto mcp setup [--key …] --config-only`
+   prints just `{"mcpServers": {"fujimoto": …}}` (nothing if a check fails) to
+   merge into `~/Library/Application Support/Claude/claude_desktop_config.json`.
+
+   The entry holds an absolute path to `fujimoto`, a `PATH` that finds tmux,
+   git and claude (GUI apps get a minimal one), the public key, and your
+   current `SSH_AUTH_SOCK` so the server reaches the same agent: GUI apps don't
+   read your shell profile, and `ssh-keygen` ignores `~/.ssh/config`'s
+   `IdentityAgent`. If your agent's socket changes (a different key manager, a
+   new login), run `setup claude-desktop` again.
 
 #### What it can and can't do
 

@@ -26,6 +26,7 @@ import sys
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import cast
 
 from fujimoto import broadcast, debug
 
@@ -414,4 +415,222 @@ def report_json(report: SetupReport) -> dict[str, object]:
         "checks": [asdict(c) for c in report.checks],
         "desktop_config_path": report.desktop_config_path,
         "desktop_config": {SERVER_NAME: report.desktop_config},
+    }
+
+
+# --------------------------------------------------------------------------
+# `fujimoto mcp setup claude-desktop`: write the entry into the client config
+# --------------------------------------------------------------------------
+
+CLIENTS = ("claude-desktop",)
+ADDED, UNCHANGED, REPLACED, CONFLICT = "added", "unchanged", "replaced", "conflict"
+
+
+class InstallError(Exception):
+    """The client config could not be read or written; nothing was changed."""
+
+
+@dataclass
+class InstallResult:
+    status: str  # added | unchanged | replaced | conflict
+    path: Path
+    backup: Path | None = None
+    # A unified diff of the old entry against the new one (conflict/replaced).
+    diff: str = ""
+
+
+def _entry_diff(old: object, new: object) -> str:
+    import difflib
+
+    a = json.dumps(old, indent=2, sort_keys=True).splitlines()
+    b = json.dumps(new, indent=2, sort_keys=True).splitlines()
+    return "\n".join(
+        difflib.unified_diff(
+            a, b, "current fujimoto entry", "new fujimoto entry", lineterm=""
+        )
+    )
+
+
+def _our_args(entry: object) -> list[object] | None:
+    """The args of an entry `setup` wrote, or None if it isn't one.
+
+    Ours runs a `fujimoto` launcher with `mcp` in its args. Those are updated
+    in place on a re-run (e.g. adding `--key` later); any other `fujimoto`
+    entry is the user's own and needs `--replace`.
+    """
+    if not isinstance(entry, dict):
+        return None
+    fields = cast("dict[str, object]", entry)
+    command, args = fields.get("command"), fields.get("args")
+    if not (isinstance(command, str) and Path(command).name == "fujimoto"):
+        return None
+    if not isinstance(args, list) or "mcp" not in args:
+        return None
+    return cast("list[object]", args)
+
+
+def _is_ours(entry: object) -> bool:
+    return _our_args(entry) is not None
+
+
+def _keep_global_flags(current: object, entry: dict[str, object]) -> dict[str, object]:
+    """`entry`, keeping global flags the user put before `mcp` (`--debug-redacted`)."""
+    old_args = _our_args(current)
+    new_args = entry.get("args")
+    if old_args is None or not isinstance(new_args, list):
+        return entry
+    leading = old_args[: old_args.index("mcp")]
+    if not leading:
+        return entry
+    return {**entry, "args": [*leading, *new_args]}
+
+
+def _indent_of(raw: str) -> int:
+    for line in raw.splitlines()[1:]:
+        stripped = line.lstrip(" ")
+        if stripped and len(stripped) < len(line):
+            return len(line) - len(stripped)
+    return 2
+
+
+def install_desktop_config(
+    entry: dict[str, object],
+    *,
+    path: Path | None = None,
+    replace: bool = False,
+    stamp: str | None = None,
+) -> InstallResult:
+    """Add or update `mcpServers.fujimoto` in Claude Desktop's config.
+
+    An entry fujimoto wrote before (`_is_ours`) is updated in place, keeping
+    any global flags before `mcp`; any other `fujimoto` entry is only
+    overwritten with `replace`.
+
+    Every other key is kept as it was. An existing file is copied to
+    `<name>.bak-<stamp>` before anything is written, the new file replaces
+    the old atomically with the same permissions, and it is read back: if
+    anything but `mcpServers.fujimoto` differs, the backup is restored.
+    A missing file is created; a missing Claude directory is an error,
+    since it means Claude Desktop isn't installed for this user.
+    """
+    import tempfile
+    from datetime import datetime
+
+    path = path or desktop_config_path()
+    if not path.parent.is_dir():
+        raise InstallError(
+            f"{path.parent} does not exist: is Claude Desktop installed and run once?"
+        )
+    raw: str | None = None
+    if path.exists():
+        try:
+            raw = path.read_text()
+            data = json.loads(raw) if raw.strip() else {}
+        except (OSError, UnicodeDecodeError) as e:
+            raise InstallError(f"cannot read {path}: {e}") from e
+        except json.JSONDecodeError as e:
+            raise InstallError(
+                f"{path} is not valid JSON ({e}); fix it by hand, nothing was changed"
+            ) from e
+        if not isinstance(data, dict):
+            raise InstallError(f"{path} is not a JSON object; nothing was changed")
+    else:
+        data = {}
+    servers = data.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        raise InstallError(
+            f'"mcpServers" in {path} is not an object; nothing was changed'
+        )
+
+    current = servers.get(SERVER_NAME)
+    entry = _keep_global_flags(current, entry)
+    if current == entry:
+        debug.log("mcp.desktop_install", status=UNCHANGED)
+        return InstallResult(UNCHANGED, path)
+    diff = _entry_diff(current, entry) if current is not None else ""
+    if current is not None and not replace and not _is_ours(current):
+        debug.log("mcp.desktop_install", status=CONFLICT)
+        return InstallResult(CONFLICT, path, diff=diff)
+
+    before = json.loads(json.dumps(data))
+    servers = dict(servers)
+    servers[SERVER_NAME] = entry
+    data["mcpServers"] = servers
+    indent = _indent_of(raw) if raw else 2
+    text = json.dumps(data, indent=indent, ensure_ascii=False)
+    if raw is None or raw.endswith("\n"):
+        text += "\n"
+
+    backup: Path | None = None
+    mode = 0o600
+    if raw is not None:
+        stamp = stamp or datetime.now().strftime("%Y%m%d%H%M%S")
+        backup = path.with_name(f"{path.name}.bak-{stamp}")
+        shutil.copy2(path, backup)
+        mode = path.stat().st_mode & 0o777
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except OSError as e:
+        Path(tmp).unlink(missing_ok=True)
+        raise InstallError(f"cannot write {path}: {e}") from e
+
+    # Read back: only mcpServers.fujimoto may differ from what was there.
+    after = json.loads(path.read_text())
+    others_after = {k: v for k, v in after.items() if k != "mcpServers"}
+    others_before = {k: v for k, v in before.items() if k != "mcpServers"}
+    servers_after = {
+        k: v for k, v in after.get("mcpServers", {}).items() if k != SERVER_NAME
+    }
+    servers_before = {
+        k: v for k, v in before.get("mcpServers", {}).items() if k != SERVER_NAME
+    }
+    if (
+        others_after != others_before
+        or servers_after != servers_before
+        or after["mcpServers"].get(SERVER_NAME) != entry
+    ):  # pragma: no cover - would need a racing writer
+        if backup is not None:
+            shutil.copy2(backup, path)
+        raise InstallError(f"{path} did not read back as written; restored the backup")
+
+    status = REPLACED if current is not None else ADDED
+    debug.log("mcp.desktop_install", status=status, backup=backup is not None)
+    return InstallResult(status, path, backup, diff)
+
+
+def format_install(result: InstallResult) -> str:
+    restart = "Quit Claude Desktop (⌘Q) and reopen it to load the server."
+    if result.status == UNCHANGED:
+        return f"Claude Desktop already has this fujimoto entry ({result.path}); nothing changed."
+    if result.status == CONFLICT:
+        return "\n".join(
+            [
+                f"Claude Desktop already has a different fujimoto entry in {result.path}:",
+                "",
+                result.diff,
+                "",
+                "It doesn't look like one fujimoto wrote, so nothing changed. "
+                "Re-run with --replace to use the new entry.",
+            ]
+        )
+    verb = "Added" if result.status == ADDED else "Updated"
+    lines = [f"{verb} the fujimoto entry in {result.path}."]
+    if result.backup is not None:
+        lines.append(f"Backup of the previous file: {result.backup}")
+    if result.diff:
+        lines += ["", result.diff]
+    lines += ["", restart]
+    return "\n".join(lines)
+
+
+def install_json(result: InstallResult) -> dict[str, object]:
+    return {
+        "status": result.status,
+        "path": str(result.path),
+        "backup": str(result.backup) if result.backup else None,
+        "diff": result.diff or None,
     }
