@@ -185,7 +185,9 @@ def _launcher_checks(
     return checks, path
 
 
-def _path_check(env: Mapping[str, str], key: str | None) -> Check:
+def _path_check(
+    env: Mapping[str, str], key: str | None, owner: str = "the entry's"
+) -> Check:
     wanted = ["tmux", "git", "claude"] + (["ssh-keygen"] if key else [])
     missing = [t for t in wanted if shutil.which(t, path=env.get("PATH")) is None]
     if not missing:
@@ -193,7 +195,7 @@ def _path_check(env: Mapping[str, str], key: str | None) -> Check:
     return Check(
         "tools on PATH",
         WARN,
-        f"not on the entry's PATH: {', '.join(missing)} (start/resume"
+        f"not on {owner} PATH: {', '.join(missing)} (start/resume"
         + (", signing" if "ssh-keygen" in missing else "")
         + " will fail)",
         ["fujimoto mcp setup <client>   (rewrites PATH from where they are now)"],
@@ -414,14 +416,14 @@ def _agent_keys_at(sock: str | None) -> list[str]:
 
 
 def _signing_checks(
-    client: str, key: str | None, env: Mapping[str, str]
+    client: str, key: str | None, env: Mapping[str, str], where: str = "the entry"
 ) -> list[Check]:
     if key is None:
         return [
             Check(
                 "signing",
                 OK,
-                "no --key in the entry: a read-only server, messaging off by design",
+                f"no --key in {where}: a read-only server, messaging off by design",
             )
         ]
     try:
@@ -440,12 +442,78 @@ def _signing_checks(
         name=name,
         agent_keys=_agent_keys_at(sock),
         config=config,
-        agent_sock=sock or "(SSH_AUTH_SOCK not in the entry)",
+        agent_sock=sock or f"(SSH_AUTH_SOCK not in {where})",
     )
     return [c for c in report.checks if c.name not in _LOCAL_ONLY]
 
 
 # -- Report ---------------------------------------------------------------------
+
+
+def _drift_check(
+    env: Mapping[str, str], run: Callable[..., subprocess.CompletedProcess[str]]
+) -> Check:
+    """This process's version against the `fujimoto` on its PATH.
+
+    A server keeps the code it started with; after an upgrade the client
+    must restart it. Can't compare → WARN, never FAIL: the server works.
+    """
+    ours = get_version()
+    found = shutil.which("fujimoto", path=env.get("PATH"))
+    if found is None:
+        return Check(
+            "version",
+            WARN,
+            f"this server runs fujimoto {ours}; no `fujimoto` on its PATH to compare with",
+        )
+    try:
+        result = run(
+            [found, "--version"],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            env=dict(env),
+            timeout=15,
+        )
+        out = (result.stdout or "").strip()
+    except (OSError, subprocess.TimeoutExpired):
+        out = ""
+    if not out.startswith("fujimoto "):
+        return Check(
+            "version",
+            WARN,
+            f"this server runs fujimoto {ours}; {found} --version gave no version",
+        )
+    installed = out.removeprefix("fujimoto ").strip()
+    if installed == ours:
+        return Check("version", OK, f"fujimoto {ours}, same as {found}")
+    return Check(
+        "version",
+        WARN,
+        f"this server runs fujimoto {ours}, but {found} is {installed}",
+        ["Restart the MCP client (quit and reopen it) to run the installed version"],
+    )
+
+
+def self_checks(
+    key: str | None,
+    *,
+    env: Mapping[str, str] | None = None,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> list[Check]:
+    """The checks a running server can make of itself (MCP `server_health`).
+
+    Version drift, tools on its own PATH, and signing readiness for its own
+    `--key` against its own SSH agent. Read-only: nothing is signed.
+    """
+    env = os.environ if env is None else env
+    checks = [_drift_check(env, run), _path_check(env, key, "this server's")]
+    checks += _signing_checks(PREVIEW, key, env, "this server's environment")
+    debug.log(
+        "mcp.server_health",
+        checks=",".join(f"{c.name.replace(' ', '_')}={c.status}" for c in checks),
+    )
+    return checks
 
 
 def check_entry(

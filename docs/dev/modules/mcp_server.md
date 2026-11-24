@@ -12,7 +12,8 @@ install command when the extra is missing.
 - **Read tools, in-process.** `list_sessions`, `search_sessions`,
   `read_transcript`, `listening_sessions`, `message_status`,
   `follow_message` (`follow.follow`, `wait` capped at `MAX_WAIT`, text or
-  JSON; see [follow.md](follow.md)) call
+  JSON; see [follow.md](follow.md)), `server_health`
+  (`mcp_doctor.self_checks` with the server's own key and environment) call
   `session_query` / `broadcast`. The first three take `format: "text" |
   "json"` (default text): text is the CLI's own `format_list` /
   `format_search` / `format_log`, minus their "Next: fujimoto …" CLI hint
@@ -174,5 +175,12 @@ extra in this process (the server it starts needs it, which is the point).
   `agent_keys` from `ssh-add -L` run against the entry's `SSH_AUTH_SOCK`
   (`_agent_keys_at`) and that socket named in the detail (`agent_sock`).
   Without a key: an OK "messaging off by design" line.
+- **`self_checks(key)`** is the subset a running server can make of itself,
+  behind MCP `server_health`: `_drift_check` (its own `get_version()` vs
+  the `fujimoto` on its PATH; WARN with "restart the client" on a
+  mismatch, WARN when there is nothing to compare, never FAIL), the PATH
+  tools, and signing readiness for its `--key` against its own
+  `SSH_AUTH_SOCK`. The launcher and startup checks are left out: a server
+  answering the call has started. Logged as `mcp.server_health`.
 - Logged as `mcp.doctor` (target:check=status list) and `mcp.doctor_probe`
   (client, ok, tools, elapsed).

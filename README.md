@@ -1056,6 +1056,7 @@ uv tool install --force 'fujimoto[mcp]'
 | `read_transcript` | One transcript (by id, prefix or peer name): `summary`, `grep`, `tail`, `after` cursor, `reply_to` + `wait`, `fields` | `fujimoto log` |
 | `listening_sessions` | Sessions that can receive a message now, and the server's fujimoto `version` | `fujimoto broadcast show` (`fujimoto --version`) |
 | `message_status` | Recent messages and their delivery receipts | `fujimoto broadcast status` |
+| `server_health` | This server's own health: version drift (restart the client?), tmux/git/claude on its PATH, and signing readiness for its key; ok/warn/fail with fixes | `fujimoto mcp doctor` |
 | `follow_message` | One message's delivery, approval check, reply and target activity, with a bounded `wait` | `fujimoto broadcast follow` |
 | `start_session` | New worktree + session in a project | `fujimoto new --detach` |
 | `start_chat` | Chat session, no worktree | `fujimoto chat --detach` |

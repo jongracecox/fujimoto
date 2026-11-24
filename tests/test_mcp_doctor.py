@@ -470,3 +470,64 @@ def test_probe_runs_in_root_with_the_given_env(server: Path, tmp_path: Path) -> 
     assert seen["cwd"] == "/"
     assert "CLAUDE_CODE_SESSION_ID" not in seen["env"]
     assert (seen["env"]["X"], seen["env"]["PATH"]) == ("1", "/usr/bin")
+
+
+class TestSelfChecks:
+    """MCP `server_health`: what a running server can check about itself."""
+
+    def _bin(self, tmp_path: Path, version: str | None) -> str:
+        d = tmp_path / "selfbin"
+        d.mkdir()
+        if version is not None:
+            f = d / "fujimoto"
+            f.write_text(f"#!/bin/sh\necho 'fujimoto {version}'\n")
+            f.chmod(0o755)
+        return f"{d}:/usr/bin:/bin"
+
+    def _drift(self, tmp_path: Path, version: str | None) -> mcp_setup.Check:
+        env = {"PATH": self._bin(tmp_path, version)}
+        return mcp_doctor.self_checks(None, env=env)[0]
+
+    def test_same_version(self, tmp_path: Path) -> None:
+        check = self._drift(tmp_path, get_version())
+        assert check.name == "version" and check.status == OK
+
+    def test_drift_says_restart(self, tmp_path: Path) -> None:
+        check = self._drift(tmp_path, "99.0")
+        assert check.status == WARN and "but" in check.detail and "99.0" in check.detail
+        assert "Restart the MCP client" in check.fix[0]
+
+    def test_no_fujimoto_on_path(self, tmp_path: Path) -> None:
+        check = self._drift(tmp_path, None)
+        assert check.status == WARN and "no `fujimoto` on its PATH" in check.detail
+
+    def test_launcher_without_version(self, tmp_path: Path) -> None:
+        env = {"PATH": self._bin(tmp_path, get_version())}
+
+        def run(argv, **kw):
+            raise OSError("boom")
+
+        check = mcp_doctor.self_checks(None, env=env, run=run)[0]
+        assert check.status == WARN and "gave no version" in check.detail
+
+    def test_no_key_and_signing_with_own_agent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        names = [c.name for c in mcp_doctor.self_checks(None, env={"PATH": "/usr/bin"})]
+        assert names == ["version", "tools on PATH", "signing"]
+
+        priv = tmp_path / "k"
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "t", "-f", str(priv)],
+            check=True,
+        )
+        key = broadcast.normalize_public_key(priv.with_suffix(".pub").read_text())
+        config = broadcast.BroadcastSettings(
+            True, [broadcast.Signer("a", key, "agent")]
+        )
+        monkeypatch.setattr(broadcast, "load_config", lambda **kw: config)
+        monkeypatch.setattr(mcp_doctor, "_agent_keys_at", lambda sock: [])
+        checks = mcp_doctor.self_checks(key, env={"PATH": "/usr/bin"})
+        agent = next(c for c in checks if c.name == "SSH agent")
+        assert agent.status == FAIL
+        assert "(SSH_AUTH_SOCK not in this server's environment)" in agent.detail

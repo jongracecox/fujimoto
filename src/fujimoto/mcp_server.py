@@ -69,6 +69,8 @@ and to steer them.
   rejected as "not signed by a configured signer" means the session predates
   this agent's key, not that signing failed: suggest stopping and resuming it
   through fujimoto, or message a newer session.
+- If a tool fails in a way that looks like setup (signing, tmux, a stale
+  version), call server_health: it says which and how to fix it.
 - start_session creates a worktree and session; stop_session ends one.
   Confirm with the user before stopping a session or broadcasting.
 """
@@ -368,6 +370,23 @@ def message_status(message_id: str | None = None) -> dict[str, object]:
     except (broadcast.BroadcastError, OSError) as e:
         raise FujimotoToolError(str(e)) from e
     return {"messages": broadcast.status_json(rows)}
+
+
+def server_health(key: str | None) -> dict[str, object]:
+    """`mcp_doctor.self_checks` for this server: version drift, tools on its
+    PATH, and signing readiness for its own key."""
+    from dataclasses import asdict
+
+    from fujimoto import mcp_doctor
+    from fujimoto.version import get_version
+
+    checks = mcp_doctor.self_checks(key)
+    return {
+        "ok": all(c.status != "fail" for c in checks),
+        "version": get_version(),
+        "messaging": key is not None,
+        "checks": [asdict(c) for c in checks],
+    }
 
 
 def follow_message(
@@ -780,6 +799,17 @@ def build_server(key: str | None = None, run: Runner = _run_cli) -> Any:
                 format,
             ),
         )
+
+    @server.tool(name="server_health", annotations=read_only)
+    async def _server_health() -> dict[str, object]:
+        """This server's own health: whether it runs the installed fujimoto
+        version (if not, the client must be restarted), whether tmux, git
+        and claude are on its PATH (start/resume need them), and, when it
+        can send messages, whether its SSH agent still holds its key and the
+        key is still a trusted agent signer. Each check is ok/warn/fail with
+        the fix. Read-only: nothing is signed or changed. Use it when a tool
+        fails unexpectedly, before guessing at the cause."""
+        return await call("server_health", lambda: server_health(key))
 
     @server.tool(name="listening_sessions", annotations=read_only)
     async def _listening_sessions() -> dict[str, object]:
