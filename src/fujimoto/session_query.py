@@ -1101,7 +1101,7 @@ _ACTIVE_FIELDS = (
     "waiting",
     "tmux_session",
 )
-LIST_FIELDS = (
+_SESSION_FIELDS = (
     "session_id",
     "project",
     "project_root",
@@ -1116,12 +1116,39 @@ LIST_FIELDS = (
     "log_path",
     "active",
     *(f"active.{key}" for key in _ACTIVE_FIELDS),
-    "this_session",
+)
+LIST_FIELDS = (*_SESSION_FIELDS, "this_session")
+# `log --json --fields`: the same session header, plus the log's own keys.
+# Into `summary` down to a summary message's keys; a link, or an entry of
+# `messages`, is returned whole.
+_SUMMARY_MESSAGES = ("first_prompt", "replied_to", "last_user", "last_assistant")
+_MESSAGE_KEYS = ("index", "role", "text", "timestamp", "tool_id")
+_SUMMARY_FIELDS = (*_SUMMARY_MESSAGES, "role_counts", "links")
+LOG_FIELDS = (
+    *_SESSION_FIELDS,
+    "format",
+    "parse_error",
+    "total",
+    "matched",
+    "cursor",
+    "reply_to",
+    "delivered_index",
+    "messages",
+    "lines",
+    "summary",
+    *(f"summary.{key}" for key in _SUMMARY_FIELDS),
+    *(
+        f"summary.{message}.{key}"
+        for message in _SUMMARY_MESSAGES
+        for key in _MESSAGE_KEYS
+    ),
 )
 
 
-def parse_fields(text: str) -> tuple[str, ...]:
+def parse_fields(text: str, valid: Sequence[str] = LIST_FIELDS) -> tuple[str, ...]:
     """A `--fields` value as a tuple of field paths, in the order given.
+
+    `valid` is `LIST_FIELDS` for `list`, `LOG_FIELDS` for `log`.
 
     >>> parse_fields("session_id, active.status")
     ('session_id', 'active.status')
@@ -1134,11 +1161,21 @@ def parse_fields(text: str) -> tuple[str, ...]:
     if not fields:
         raise QueryError("--fields needs at least one field name")
     for field in fields:
-        if field not in LIST_FIELDS:
+        if field not in valid:
             raise QueryError(
-                f"unknown field {field!r}; choose from: {', '.join(LIST_FIELDS)}"
+                f"unknown field {field!r}; choose from: {', '.join(valid)}"
             )
     return fields
+
+
+def cut_row(row: dict[str, object], fields: Sequence[str]) -> dict[str, object]:
+    """`select_fields` with `session_id` always first, asked for or not.
+
+    A status or a reply with no session to act on is no use, and filtered
+    rows come back in activity order, not the order they were asked for.
+    """
+    keep = ("session_id", *(f for f in fields if f != "session_id"))
+    return select_fields(row, keep)
 
 
 def select_fields(row: dict[str, object], fields: Sequence[str]) -> dict[str, object]:
@@ -1148,27 +1185,37 @@ def select_fields(row: dict[str, object], fields: Sequence[str]) -> dict[str, ob
     `active` is just `{"running": false}` — comes back as null, so every row
     has the same keys.
 
+    Paths go as deep as the row does (`summary.last_assistant.text`). A path
+    whose ancestor is also asked for is dropped: the whole object wins.
+
     >>> row = {"session_id": "s", "title": "t", "active": {"running": False}}
     >>> select_fields(row, ["session_id", "active.pid", "active.running"])
     {'session_id': 's', 'active': {'pid': None, 'running': False}}
+    >>> deep = {"summary": {"last_user": {"text": "yes", "index": 4}}}
+    >>> select_fields(deep, ["summary.last_user.text", "summary.links"])
+    {'summary': {'last_user': {'text': 'yes'}, 'links': None}}
     """
+    wanted = set(fields)
     picked: dict[str, object] = {}
-    nested: dict[str, dict[str, object]] = {}
     for field in fields:
-        head, _, rest = field.partition(".")
-        value = row.get(head)
-        if not rest:
-            picked[head] = value
-            continue
-        if head in fields:  # the whole object was asked for too
-            continue
-        inner: object = None
-        if isinstance(value, dict):
-            inner = cast("dict[str, object]", value).get(rest)
-        if head not in nested:
-            nested[head] = {}
-            picked[head] = nested[head]
-        nested[head][rest] = inner
+        parts = field.split(".")
+        if any(".".join(parts[:i]) in wanted for i in range(1, len(parts))):
+            continue  # the whole object was asked for too
+        value: object = row
+        for part in parts:
+            value = (
+                cast("dict[str, object]", value).get(part)
+                if isinstance(value, dict)
+                else None
+            )
+        target = picked
+        for part in parts[:-1]:
+            inner = target.get(part)
+            if not isinstance(inner, dict):
+                inner = {}
+                target[part] = inner
+            target = cast("dict[str, object]", inner)
+        target[parts[-1]] = value
     return picked
 
 
@@ -1177,8 +1224,7 @@ def list_json(
 ) -> dict[str, object]:
     """The listing as JSON; `fields` cuts each session row down to those.
 
-    `session_id` always leads a cut-down row: a status with no session to
-    act on is no use, and filtered rows come back in activity order.
+    `session_id` always leads a cut-down row (`cut_row`).
     """
     rows: list[dict[str, object]] = [
         {
@@ -1188,8 +1234,7 @@ def list_json(
         for s in report.sessions
     ]
     if fields:
-        keep = ("session_id", *(f for f in fields if f != "session_id"))
-        rows = [select_fields(row, keep) for row in rows]
+        rows = [cut_row(row, fields) for row in rows]
     return {
         "scope": _scope_json(report.scope),
         "total_logs": report.total_logs,
@@ -1811,7 +1856,15 @@ def _message_json(index: int, m: TranscriptMessage) -> dict[str, object]:
     }
 
 
-def log_json(report: LogReport) -> dict[str, object]:
+def log_json(
+    report: LogReport, fields: Sequence[str] | None = None
+) -> dict[str, object]:
+    """The log as JSON; `fields` (from `LOG_FIELDS`) cuts it down to those.
+
+    `session_id` always comes first (`cut_row`). A raw fallback carries
+    `lines` instead of `messages`, so `format` is worth asking for when the
+    caller can't rule that out.
+    """
     if report.session is not None and report.location is not None:
         header = _session_json(report.session, report.location, report.activity)
     else:
@@ -1852,7 +1905,8 @@ def log_json(report: LogReport) -> dict[str, object]:
         body["messages"] = [_message_json(i, m) for i, m in report.messages]
     else:
         body["lines"] = [{"index": i, "text": line} for i, line in report.lines or ()]
-    return {**header, **body}
+    data = {**header, **body}
+    return cut_row(data, fields) if fields else data
 
 
 def _local_time(dt: datetime) -> str:

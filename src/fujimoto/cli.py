@@ -7894,6 +7894,13 @@ def _run_log_command(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
     try:
+        fields = (
+            session_query.parse_fields(args.fields, session_query.LOG_FIELDS)
+            if args.fields
+            else None
+        )
+        if fields and not args.json:
+            raise session_query.QueryError("--fields needs --json")
         report = session_query.load_log_waiting(
             lambda: session_query.load_log(
                 args.session,
@@ -7915,7 +7922,7 @@ def _run_log_command(args: argparse.Namespace) -> None:
         print(f"fujimoto: {e}", file=sys.stderr)
         sys.exit(1)
     if args.json:
-        print(session_query.dump_json(session_query.log_json(report)))
+        print(session_query.dump_json(session_query.log_json(report, fields)))
     else:
         print(session_query.format_log(report))
     _finish_debug_log()
@@ -8552,6 +8559,14 @@ def _add_query_commands(sub: argparse._SubParsersAction) -> None:
         default=0.0,
         metavar="SECS",
         help="Re-read until something matches, for up to SECS seconds",
+    )
+    log.add_argument(
+        "--fields",
+        metavar="FIELD[,FIELD]",
+        help=(
+            "With --json, return only these fields "
+            "(e.g. summary.last_assistant,active.status,cursor)"
+        ),
     )
     log.add_argument("--json", action="store_true", help="Print JSON")
 

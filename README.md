@@ -595,6 +595,7 @@ fujimoto log 8f0e2c1a --head 10               # first 10 messages (or --tail 10)
 fujimoto log 8f0e2c1a --roles user,assistant  # just the conversation, no tool calls
 fujimoto log 8f0e2c1a                         # whole transcript
 fujimoto log 8f0e2c1a --json
+fujimoto log 8f0e2c1a --summary --json --fields summary.last_assistant.text,summary.links
 ```
 
 `--summary` prints a session's first prompt and its final exchange: the

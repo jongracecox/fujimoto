@@ -24,6 +24,7 @@ from fujimoto.session_query import (
     SOURCE_REGISTRY,
     SOURCE_TMUX,
     LIST_FIELDS,
+    LOG_FIELDS,
     Activity,
     ActivityIndex,
     Location,
@@ -1717,6 +1718,123 @@ class TestFields:
             assert list(row) == ["session_id", "active"]
             assert row["session_id"] == "s-1"
         assert data["truncated"] is False  # the envelope is untouched
+
+
+class TestLogFields:
+    def test_summary_fields(self, tmp_path: Path, repo: Path) -> None:
+        _conversation(tmp_path, repo)
+        report = load_log("conv", summary=True, activity=_index())
+        data = log_json(report, ["summary.last_user", "active.status", "cursor"])
+        assert list(data) == ["session_id", "summary", "active", "cursor"]
+        assert data["session_id"] == "conv"
+        assert data["summary"] == {"last_user": report_last_user(report)}
+        assert data["active"] == {"status": None}
+        assert data["cursor"] == report.cursor
+
+    def test_messages_and_missing_keys(self, tmp_path: Path, repo: Path) -> None:
+        _conversation(tmp_path, repo)
+        report = load_log("conv", after=2, activity=_index())
+        data = log_json(report, ["messages", "cursor", "delivered_index"])
+        assert [m["index"] for m in data["messages"]] == [3]
+        # Not a --reply-to read: the key is absent, so it comes back null.
+        assert data["delivered_index"] is None
+
+    def test_summary_message_keys(self, tmp_path: Path, repo: Path) -> None:
+        _conversation(tmp_path, repo)
+        report = load_log("conv", summary=True, activity=_index())
+        data = log_json(
+            report,
+            [
+                "summary.first_prompt.text",
+                "summary.first_prompt.index",
+                "summary.links",
+            ],
+        )
+        assert data == {
+            "session_id": "conv",
+            "summary": {
+                "first_prompt": {"text": "fix the bug", "index": 0},
+                "links": [],
+            },
+        }
+        # A message the summary doesn't have reads as nulls, not an error.
+        assert log_json(report, ["summary.replied_to.text"])["summary"] == {
+            "replied_to": {"text": None}
+        }
+
+    def test_deeper_than_the_row_is_null(self) -> None:
+        row: dict[str, object] = {"summary": {"links": []}, "title": "t"}
+        assert select_fields(row, ["title.x", "summary.links.y"]) == {
+            "title": {"x": None},
+            "summary": {"links": {"y": None}},
+        }
+
+    def test_whole_object_wins_at_any_depth(self) -> None:
+        row: dict[str, object] = {"summary": {"last_user": {"text": "t", "index": 1}}}
+        assert select_fields(row, ["summary.last_user.text", "summary"]) == {
+            "summary": {"last_user": {"text": "t", "index": 1}}
+        }
+
+    def test_no_fields_is_unchanged(self, tmp_path: Path, repo: Path) -> None:
+        _conversation(tmp_path, repo)
+        report = load_log("conv", activity=_index())
+        assert log_json(report, None) == log_json(report)
+
+    def test_valid_names(self, tmp_path: Path, repo: Path) -> None:
+        assert parse_fields("summary.links,messages", LOG_FIELDS) == (
+            "summary.links",
+            "messages",
+        )
+        with pytest.raises(QueryError, match="unknown field 'this_session'"):
+            parse_fields("this_session", LOG_FIELDS)
+        assert parse_fields("summary.last_assistant.text", LOG_FIELDS) == (
+            "summary.last_assistant.text",
+        )
+        with pytest.raises(QueryError, match="unknown field 'summary.links.url'"):
+            parse_fields("summary.links.url", LOG_FIELDS)
+        with pytest.raises(QueryError, match="unknown field 'summary.nope'"):
+            parse_fields("summary.nope", LOG_FIELDS)
+        with pytest.raises(QueryError, match="unknown field 'messages'"):
+            parse_fields("messages")  # a list field set by default
+
+    def test_every_log_field_is_a_real_key(self, tmp_path: Path, repo: Path) -> None:
+        _conversation(tmp_path, repo)
+        keys: set[str] = set()
+        running = _index([_live("conv", repo)])
+        for kwargs in ({}, {"summary": True}, {"reply_to": "x"}):
+            data = log_json(load_log("conv", activity=running, **kwargs))
+            for key, value in data.items():
+                keys.add(key)
+                if isinstance(value, dict):
+                    for inner, deeper in value.items():
+                        keys.add(f"{key}.{inner}")
+                        if isinstance(deeper, dict):
+                            keys.update(f"{key}.{inner}.{k}" for k in deeper)
+        # A full exchange, so every summary message (replied_to too) is there.
+        _chat(
+            tmp_path,
+            ("user", "a"),
+            ("assistant", "b"),
+            ("user", "c"),
+            ("assistant", "d"),
+        )
+        summary = log_json(load_log("chat", summary=True, activity=_index()))["summary"]
+        assert isinstance(summary, dict)
+        for name, message in summary.items():
+            if isinstance(message, dict):
+                keys.update(f"summary.{name}.{k}" for k in message)
+        raw = tmp_path / "broken.jsonl"
+        raw.write_text('{"type": "user", "message": "not a dict"}\n')
+        raw_report = load_log(str(raw), activity=_index())
+        assert raw_report.format == "raw"
+        keys.update(log_json(raw_report))
+        assert set(LOG_FIELDS) <= keys
+
+
+def report_last_user(report) -> object:
+    summary = log_json(report)["summary"]
+    assert isinstance(summary, dict)
+    return summary["last_user"]
 
 
 class TestListJson:

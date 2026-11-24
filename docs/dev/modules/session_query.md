@@ -61,7 +61,19 @@
   acted on, and filtered rows arrive in activity order. JSON keeps the full id
   because Claude's own `--resume`, transcript names and
   `$CLAUDE_CODE_SESSION_ID` need it, and a prefix is only unique for now. The
-  envelope keeps its keys and adds `waiting_only`, `states` and `refs`. The
+  envelope keeps its keys and adds `waiting_only`, `states` and `refs`.
+  `log_json(report, fields)` does the same for a log, against `LOG_FIELDS`:
+  the session header's fields (no `this_session`), the log's own keys
+  (`cursor`, `messages`, `lines`, `delivered_index`, ...) and one level into
+  `summary`, and down to a summary message's keys
+  (`summary.last_assistant.text`). A link or a `messages` entry comes back
+  whole. `select_fields` walks any depth, drops a path whose ancestor is also
+  asked for, and returns null for a valid path the row lacks (a summary with
+  no `replied_to`). Both go
+  through `cut_row`, which puts `session_id` first. `parse_fields(text,
+  valid)` defaults to `LIST_FIELDS`. A test builds every log shape (plain,
+  summary, reply-to, raw) and checks that every `LOG_FIELDS` name is a real
+  key. The
   MCP server calls these directly, so none of them may print or exit.
 - `--sort relevance` (`SortOrder.RELEVANCE`) disables the early stop, sorts
   every hit by `relevance_key` — `(message matches, tool matches,

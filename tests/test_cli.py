@@ -11558,6 +11558,27 @@ class TestQueryCommands:
         assert code == 0
         assert [m["text"] for m in json.loads(out)["messages"]] == ["find the needle"]
 
+    def test_log_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        code, out, _ = self._main(
+            monkeypatch,
+            "log",
+            "sess-1",
+            "--summary",
+            "--json",
+            "--fields",
+            "summary.links",
+        )
+        assert code == 0
+        assert json.loads(out) == {"session_id": "sess-1", "summary": {"links": []}}
+        code, _, err = self._main(monkeypatch, "log", "sess-1", "--fields", "cursor")
+        assert code == 1
+        assert "--fields needs --json" in err
+        code, _, err = self._main(
+            monkeypatch, "log", "sess-1", "--json", "--fields", "this_session"
+        )
+        assert code == 1
+        assert "unknown field 'this_session'" in err
+
     def test_log_unknown_role(self, monkeypatch: pytest.MonkeyPatch) -> None:
         code, _, err = self._main(monkeypatch, "log", "sess-1", "--roles", "user,bot")
         assert code == 1
