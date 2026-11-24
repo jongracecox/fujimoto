@@ -269,6 +269,26 @@ class TestReadTools:
         with patch.object(broadcast, "status", return_value=[]):
             assert mcp_server.message_status("abc") == {"messages": []}
 
+    def test_server_health(self) -> None:
+        from fujimoto import mcp_doctor
+        from fujimoto.mcp_setup import Check
+
+        seen: list[str | None] = []
+
+        def checks(key: str | None) -> list[Check]:
+            seen.append(key)
+            return [
+                Check("version", "ok", "same"),
+                Check("SSH agent", "fail", "no key"),
+            ]
+
+        with patch.object(mcp_doctor, "self_checks", side_effect=checks):
+            data = mcp_server.server_health("ssh-ed25519 AAAA")
+        assert seen == ["ssh-ed25519 AAAA"]
+        assert data["ok"] is False and data["messaging"] is True
+        assert data["version"] == get_version()
+        assert [c["name"] for c in data["checks"]] == ["version", "SSH agent"]
+
     def test_status_error(self) -> None:
         with (
             patch.object(broadcast, "status", side_effect=OSError("denied")),
