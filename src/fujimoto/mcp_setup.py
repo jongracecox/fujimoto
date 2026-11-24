@@ -388,6 +388,26 @@ def format_report(report: SetupReport) -> str:
     return "\n".join(out)
 
 
+def client_config(report: SetupReport) -> dict[str, object]:
+    """Just the copy-pasteable client config: `{"mcpServers": {"fujimoto": …}}`.
+
+    The shape Claude Desktop's config file and most MCP clients use, so it
+    can be merged in as is.
+    """
+    return {"mcpServers": {SERVER_NAME: report.desktop_config}}
+
+
+def format_failures(report: SetupReport) -> str:
+    """The failing checks and their fixes, for stderr when config is withheld."""
+    out = ["fujimoto: setup has failing checks, so no config was printed:"]
+    for c in report.checks:
+        if c.status == FAIL:
+            out.append(f"{_MARK[c.status]} {c.name}: {c.detail}")
+            out.extend(f"    {line}" for line in c.fix)
+    out.append("Run `fujimoto mcp setup` for the full report.")
+    return "\n".join(out)
+
+
 def report_json(report: SetupReport) -> dict[str, object]:
     return {
         "ok": report.ok,

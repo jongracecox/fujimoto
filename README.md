@@ -1024,7 +1024,9 @@ knowingly. Re-run it until there are no ✗ lines.
    "<public key>" --role agent`, and `fujimoto broadcast enable` if broadcast
    is off. Sessions fix their trusted keys at launch, so restart the ones that
    should receive this agent's messages.
-5. **Add the printed JSON** under `mcpServers` in
+5. **Add the printed JSON** (or just that part, with
+   `fujimoto mcp setup [--key …] --config-only`, which prints only
+   `{"mcpServers": {"fujimoto": …}}` and nothing if a check fails) under `mcpServers` in
    `~/Library/Application Support/Claude/claude_desktop_config.json` and
    restart Claude Desktop. It holds an absolute path to `fujimoto`, a `PATH`
    that finds tmux, git and claude (GUI apps get a minimal one), the public

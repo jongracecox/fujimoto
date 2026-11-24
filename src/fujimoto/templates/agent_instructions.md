@@ -316,15 +316,23 @@ fujimoto log 8f0e2c1a --after 140 --wait 15 --json --fields messages,cursor   # 
 ### Claude Desktop: `fujimoto mcp setup`
 
 If the user wants these tools in Claude Desktop (or another MCP client), walk
-them through `fujimoto mcp setup`. It is read-only: it checks each step and
-prints the next command and the Desktop config. Re-run it until nothing
-fails. Let the user create the signing key and run the `add-signer` it prints
-themselves, and never use their own (`user`) key for it.
+them through `fujimoto mcp setup`. No checkout is needed: it works from the
+uv-installed `fujimoto`, once the `mcp` extra is installed
+(`uv tool install --force 'fujimoto[mcp]'`). It is read-only: it checks each
+step and prints the next command and the client config. Re-run it until
+nothing fails. Let the user create the signing key and run the `add-signer` it
+prints themselves, never use their own (`user`) key for it, and let them edit
+their client's config file themselves.
 
 ```sh
 fujimoto mcp setup                                        # read-only server, no messaging
 fujimoto mcp setup --key ~/.ssh/fujimoto_claude_desktop.pub   # with messaging
+fujimoto mcp setup --config-only                          # just the JSON to paste
 ```
+
+`--config-only` prints only `{"mcpServers": {"fujimoto": …}}`, pointing at the
+installed launcher with the `PATH` (and, with `--key`, the `SSH_AUTH_SOCK`)
+the server needs. It prints nothing and exits 1 if a check fails.
 
 ## When to use them
 

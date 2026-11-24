@@ -8115,7 +8115,16 @@ def _add_mcp_command(sub: argparse._SubParsersAction) -> None:
     setup.add_argument(
         "--name", default="claude-desktop", help="Signer name (default claude-desktop)"
     )
-    setup.add_argument("--json", action="store_true", help="Print JSON")
+    output = setup.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true", help="Print JSON")
+    output.add_argument(
+        "--config-only",
+        action="store_true",
+        help=(
+            'Print only the client config ({"mcpServers": {"fujimoto": …}}) to '
+            "paste into Claude Desktop's config; nothing, and exit 1, if a check fails"
+        ),
+    )
 
 
 def _run_mcp_command(args: argparse.Namespace) -> None:
@@ -8124,7 +8133,13 @@ def _run_mcp_command(args: argparse.Namespace) -> None:
         from fujimoto import mcp_setup
 
         report = mcp_setup.check_setup(args.key, name=args.name)
-        if args.json:
+        if args.config_only:
+            # stdout is only ever pasteable JSON; a failing setup gets none.
+            if report.ok:
+                print(json.dumps(mcp_setup.client_config(report), indent=2))
+            else:
+                print(mcp_setup.format_failures(report), file=sys.stderr)
+        elif args.json:
             print(json.dumps(mcp_setup.report_json(report), indent=2))
         else:
             print(mcp_setup.format_report(report))
