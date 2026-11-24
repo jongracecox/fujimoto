@@ -14,9 +14,9 @@
 [![buymeacoffee](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/jongracecox)
 
 
-Running one Claude Code session is easy. Running ten is chaos. I'll come
-back to my desk, open the wrong terminal twice, and find that the session I
-was looking for has been waiting for a yes the whole time.
+Running one Claude Code session is easy. Running ten is chaos. You know the
+drill. You get back from lunch, open the wrong terminal twice, and finally
+find Claude still waiting for you to say yes.
 
 That's why I built Fujimoto. I can see which sessions are still working and
 which ones are waiting for me. If all I've got is an old Jira ticket number,
