@@ -119,3 +119,23 @@ dotted-key definition, which the text edit can't see, is caught.
 `toml_block` writes strings as JSON strings, which are valid TOML basic
 strings for anything setup produces. Logged as `mcp.client_install` (client,
 status, backup).
+
+**Sessions with no transcript yet.** `new`, `chat` and `resume --detach`
+report a session id before Claude writes its transcript, which happens with
+the first message: seconds later with a prompt, never until someone types
+without one. `start_chat` and `start_session` wait up to `START_WAIT` (10s)
+for it when given a prompt, return at once without one, and report
+`transcript_ready` (plus `note` when false). Until it exists,
+`read_transcript` and `list_sessions(sessions=…)` answer with a `starting`
+row (`_starting_row` / `_starting_line`) from
+`session_query.pending_session` instead of "not found", and `stop_session`
+works by id through `tmux_for_session`'s pending fallback. A `waiting`,
+`states` or `running_only` filter never matches a starting session. Logged as
+`mcp.start_wait` (prompted, ready).
+
+**Carried settings.** GUI clients don't read the shell profile, so
+`desktop_entry` adds `CARRIED_SETTINGS` (`FUJIMOTO_GIT_ROOT`,
+`FUJIMOTO_WORKTREE_ROOT`) to the entry's `env` when set, expanded to absolute
+paths (`carried_settings`). It is an explicit allowlist: no other variable,
+and never a token or credential, is copied. Without them a client-launched
+server can't resolve a project by name and misses worktrees under the root.

@@ -156,3 +156,12 @@
   counts — `unreadable` climbing is what a registry format change looks like.
 
 - `wait_for_registration(tmux_session, timeout=)` polls `live.list_live_sessions()` for the entry whose `tmux` pane is in that session (injectable `sleep`/`clock` for tests; `timeout=0` checks once); `resolve_session(ref)` and `tmux_for_session(ref)` back `resume` and `stop`.
+
+- **`pending_session(ref)`** — a session fujimoto launched whose transcript
+  doesn't exist yet (`PendingSession(session_id, tmux_session)`), from the
+  session records: exact match on the full id or the tmux name, only while
+  that tmux session runs, and None once the transcript exists. Prefixes and
+  peer names never match, so it can't pick the wrong session.
+  `tmux_for_session` falls back to it when `resolve_session` finds no log,
+  which is how `fujimoto stop <id>` (and MCP `stop_session`) stops a session
+  launched moments ago. Logged as `query.pending_session`.

@@ -616,3 +616,164 @@ class TestSessionIdFor:
             pytest.raises(FujimotoToolError, match="no session log found for 'zz'"),
         ):
             mcp_server.session_id_for("zz")
+
+
+# -- Sessions launched moments ago --
+
+PENDING = session_query.PendingSession(
+    "0f3c9a2e-1b7d-4c55-9e0a-2d6f8b1c4e77", "proj/chat-1"
+)
+NOT_FOUND = session_query.QueryError("no session log found")
+
+
+class TestStartingSessions:
+    def _no_log(self):
+        return patch.object(session_query, "find_session_log", side_effect=NOT_FOUND)
+
+    def test_read_reports_starting_not_not_found(self) -> None:
+        with (
+            patch.object(
+                mcp_server, "session_id_for", side_effect=FujimotoToolError("no log")
+            ),
+            patch.object(session_query, "pending_session", return_value=PENDING),
+        ):
+            text = mcp_server.read_transcript(PENDING.session_id)
+            data = mcp_server.read_transcript(PENDING.session_id, format="json")
+            cut = mcp_server.read_transcript(PENDING.session_id, fields=["state"])
+        assert isinstance(text, str) and "starting" in text and "proj/chat-1" in text
+        assert isinstance(data, dict) and data["state"] == "starting"
+        assert data["active"] == {"running": True, "tmux_session": "proj/chat-1"}
+        assert cut == {"session_id": PENDING.session_id, "state": "starting"}
+
+    def test_read_unknown_still_errors(self) -> None:
+        with (
+            patch.object(
+                mcp_server, "session_id_for", side_effect=FujimotoToolError("no log")
+            ),
+            patch.object(session_query, "pending_session", return_value=None),
+            pytest.raises(FujimotoToolError, match="no log"),
+        ):
+            mcp_server.read_transcript("zz")
+
+    def test_list_by_id_shows_starting_row(self) -> None:
+        with (
+            self._no_log(),
+            patch.object(session_query, "pending_session", return_value=PENDING),
+            patch.object(session_query, "run_list") as run,
+        ):
+            text = mcp_server.list_sessions(sessions=[PENDING.session_id])
+            data = mcp_server.list_sessions(
+                sessions=[PENDING.session_id], format="json"
+            )
+        run.assert_not_called()  # nothing left for run_list to look up
+        assert isinstance(text, str) and text.startswith("◐ 0f3c9a2e  starting")
+        assert isinstance(data, dict)
+        assert data["sessions"][0]["state"] == "starting"
+
+    def test_list_mixes_starting_and_found(self) -> None:
+        def pending(ref: str):
+            return PENDING if ref == PENDING.session_id else None
+
+        with (
+            self._no_log(),
+            patch.object(session_query, "pending_session", side_effect=pending),
+            patch.object(session_query, "run_list") as run,
+            patch.object(session_query, "format_list", return_value="● other  row"),
+        ):
+            text = mcp_server.list_sessions(sessions=[PENDING.session_id, "peer-1"])
+        assert run.call_args.kwargs["refs"] == ("peer-1",)
+        assert text.splitlines() == [
+            "◐ 0f3c9a2e  starting · tmux proj/chat-1 · no transcript yet",
+            "● other  row",
+        ]
+
+    def test_filters_never_match_a_starting_session(self) -> None:
+        with (
+            patch.object(session_query, "pending_session") as pending,
+            patch.object(session_query, "run_list"),
+            patch.object(session_query, "list_json", return_value={"sessions": []}),
+        ):
+            mcp_server.list_sessions(
+                sessions=[PENDING.session_id], waiting=True, format="json"
+            )
+        pending.assert_not_called()
+
+
+class TestStartWait:
+    def _commands(self, result: dict, ticks: list[float]):
+        clock = iter(ticks)
+        return Commands(
+            run=FakeRun(result), sleep=lambda s: None, clock=lambda: next(clock)
+        )
+
+    def test_with_prompt_waits_until_ready(self, tmp_path: Path) -> None:
+        sid = "0f3c9a2e-1b7d-4c55-9e0a-2d6f8b1c4e77"
+        seen = iter([NOT_FOUND, NOT_FOUND, tmp_path / f"{sid}.jsonl"])
+
+        def find(ref: str):
+            item = next(seen)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        c = self._commands({"claude_session_id": sid}, [0.0, 0.5, 1.0, 1.5])
+        with patch.object(session_query, "find_session_log", side_effect=find):
+            out = c.start_chat("proj", scratch=True, prompt="hi")
+        assert out["transcript_ready"] is True and "note" not in out
+
+    def test_with_prompt_gives_up_after_start_wait(self) -> None:
+        c = self._commands(
+            {"claude_session_id": "s"}, [0.0, 5.0, mcp_server.START_WAIT + 1]
+        )
+        with patch.object(session_query, "find_session_log", side_effect=NOT_FOUND):
+            out = c.start_chat("proj", prompt="hi")
+        assert out["transcript_ready"] is False
+        assert "No transcript yet" in str(out["note"])
+
+    def test_without_prompt_returns_at_once(self) -> None:
+        c = self._commands({"claude_session_id": "s"}, [0.0, 0.0])
+        with patch.object(
+            session_query, "find_session_log", side_effect=NOT_FOUND
+        ) as find:
+            out = c.start_chat("proj")
+        assert find.call_count == 1
+        assert out["transcript_ready"] is False
+
+    def test_already_running_session_is_left_alone(self) -> None:
+        c = self._commands({"claude_session_id": "s", "session_started": False}, [])
+        assert "transcript_ready" not in c.start_chat("proj", prompt="x")
+
+    def test_start_session_waits_too(self, tmp_path: Path) -> None:
+        scope = session_query.Scope(all_projects=False, project="p", root=tmp_path)
+        c = self._commands({"claude_session_id": "s"}, [0.0, 0.0])
+        with (
+            patch.object(session_query, "resolve_scope", return_value=scope),
+            patch.object(
+                session_query, "find_session_log", return_value=tmp_path / "s.jsonl"
+            ),
+        ):
+            assert c.start_session("p", "t", prompt="go")["transcript_ready"] is True
+
+
+def test_resume_detach_skips_the_repo_check() -> None:
+    """A scratch chat runs outside any repo, so `resume --detach` can't need one."""
+    from fujimoto import cli
+
+    with (
+        patch.object(cli, "_check_prerequisites", side_effect=AssertionError),
+        patch.object(cli, "_prepare_resume", return_value=None) as prep,
+        patch("sys.argv", ["fujimoto", "resume", "8f0e2c1a", "--detach"]),
+    ):
+        cli.main()
+    prep.assert_called_once()
+
+
+def test_pending_check_skips_sessions_with_a_transcript(tmp_path: Path) -> None:
+    with (
+        patch.object(
+            session_query, "find_session_log", return_value=tmp_path / "s.jsonl"
+        ),
+        patch.object(session_query, "pending_session") as pending,
+    ):
+        assert mcp_server._pending_or_none("s") is None
+    pending.assert_not_called()

@@ -8988,6 +8988,12 @@ def main() -> None:
         _prepare_chat(args, claude_args)
         _finish_debug_log()
         return
+    if args.command == "resume" and args.detach:
+        # The session says where it runs (a scratch chat is outside any repo),
+        # and its project comes from that, not from the cwd.
+        _prepare_resume(args, claude_args)
+        _finish_debug_log()
+        return
 
     try:
         issues = _check_prerequisites()
