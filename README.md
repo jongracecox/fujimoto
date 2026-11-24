@@ -45,6 +45,15 @@ Upgrade to the latest release:
 uv tool upgrade fujimoto
 ```
 
+When a newer release is out, the home screen shows a banner (`d` dismisses
+it), and each new Claude session is asked to offer you the upgrade once,
+using the command that matches how fujimoto was installed. You can say yes,
+not now (a later session asks again), or don't ask again, which has the
+agent run `fujimoto update dismiss <version>` so sessions stop asking about
+that version; the next release is offered again.
+`fujimoto update` shows the current and latest versions and the upgrade
+command.
+
 ### Installing from source
 
 To pick up unreleased changes, install directly from GitHub:
