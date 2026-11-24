@@ -1,4 +1,4 @@
-# `mcp_server.py` and `mcp_setup.py`
+# `mcp_server.py`, `mcp_setup.py` and `mcp_doctor.py`
 
 User-facing docs: README, "Claude Desktop and other MCP clients". Why it is
 built this way: [design decisions](../design-decisions.md) ("MCP server").
@@ -10,7 +10,9 @@ and `serve`, so the rest of fujimoto never pays for it. `serve` prints the
 install command when the extra is missing.
 
 - **Read tools, in-process.** `list_sessions`, `search_sessions`,
-  `read_transcript`, `listening_sessions`, `message_status` call
+  `read_transcript`, `listening_sessions`, `message_status`,
+  `follow_message` (`follow.follow`, `wait` capped at `MAX_WAIT`, text or
+  JSON; see [follow.md](follow.md)) call
   `session_query` / `broadcast`. The first three take `format: "text" |
   "json"` (default text): text is the CLI's own `format_list` /
   `format_search` / `format_log`, minus their "Next: fujimoto …" CLI hint
@@ -139,3 +141,36 @@ works by id through `tmux_for_session`'s pending fallback. A `waiting`,
 paths (`carried_settings`). It is an explicit allowlist: no other variable,
 and never a token or credential, is copied. Without them a client-launched
 server can't resolve a project by name and misses worktrees under the root.
+
+**`mcp_doctor.py`**: `fujimoto mcp doctor [claude-desktop|chatgpt|codex]
+[--timeout SECS] [--json]`. Read-only. `setup` checks a key you propose;
+`doctor` checks what each client is *configured* with, run the way the
+client runs it. Stdlib + `mcp_setup` + `broadcast`, so it works without the
+extra in this process (the server it starts needs it, which is the point).
+
+- `diagnose(clients)`: for each client (`codex` folds into `chatgpt`,
+  one file) `mcp_setup.read_client_entry` (read-only twin of the install
+  parse; a bad file is a FAIL check, a missing entry a WARN with the `mcp
+  setup CLIENT` fix). With no client named and none configured, it adds a
+  `setup-preview` target for `desktop_entry(None)`.
+- `check_entry`: `server_env(entry)` is a GUI-like base (`HOME`, `USER`,
+  `LOGNAME`, `TMPDIR`, `LANG`, `SHELL`, `PATH=/usr/bin:/bin:/usr/sbin:/sbin`)
+  plus the entry's own env, never this shell's `PATH` or `FUJIMOTO_*`, so a
+  missing carried setting shows up. Launcher: absolute path, or found on the
+  entry's `PATH`; executable; `--version` prints `fujimoto X` (WARN if X
+  differs from this one). `tools on PATH`: tmux, git, claude (+ ssh-keygen
+  with a key) on the entry's `PATH`.
+- `probe_server`: starts `[command, *args]` in `/` with that env and speaks
+  newline-delimited JSON-RPC itself (`_Reader`, `selectors` over stdout and
+  stderr with a deadline): `initialize`, `notifications/initialized`,
+  `tools/list`, then closes stdin and waits (terminate, then kill). Only
+  the tool list is asked for, so no tool runs. Failure detail is the exit
+  code and the last stderr line (300 chars). `messaging tools` FAILs when
+  the entry has `--key` but `send_message`/`broadcast` aren't listed.
+- Signing readiness only when the entry has `--key` (`entry_key`): setup's
+  `check_setup` minus its local-process checks (`mcp package`, `tmux`), with
+  `agent_keys` from `ssh-add -L` run against the entry's `SSH_AUTH_SOCK`
+  (`_agent_keys_at`) and that socket named in the detail (`agent_sock`).
+  Without a key: an OK "messaging off by design" line.
+- Logged as `mcp.doctor` (target:check=status list) and `mcp.doctor_probe`
+  (client, ok, tools, elapsed).

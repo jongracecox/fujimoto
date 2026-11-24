@@ -59,8 +59,10 @@ and to steer them.
   then tail/grep for detail. `cursor` in a result can be passed back as
   `after` to read only what is new.
 - send_message reaches one running session; it acts on it at its next safe
-  stopping point. Note the returned id, then read_transcript(reply_to=id,
-  wait=60) for its answer. Prefer it over broadcast.
+  stopping point. Note the returned id, then follow_message(id, wait=60) for
+  delivery, reply and whether the session is blocked on the user (or
+  read_transcript(reply_to=id, wait=60) for just the reply). Prefer it over
+  broadcast. list_sessions shows "listening" for sessions it can reach.
 - Messages are signed as an agent: sessions see them as from this agent,
   never as typed by the user. Don't claim the user approved something.
 - A session trusts only signers that existed when it launched. A receipt
@@ -362,6 +364,21 @@ def message_status(message_id: str | None = None) -> dict[str, object]:
     except (broadcast.BroadcastError, OSError) as e:
         raise FujimotoToolError(str(e)) from e
     return {"messages": broadcast.status_json(rows)}
+
+
+def follow_message(
+    message_id: str, wait: float = 0.0, format: Format = "text"
+) -> Result:
+    """`fujimoto broadcast follow`, in-process, with `wait` capped at MAX_WAIT."""
+    from fujimoto import follow
+
+    try:
+        report = follow.follow(message_id, wait=min(max(wait, 0.0), MAX_WAIT))
+    except (broadcast.BroadcastError, session_query.QueryError, OSError) as e:
+        raise FujimotoToolError(str(e)) from e
+    if format == "json":
+        return follow.follow_json(report)
+    return _text(follow.format_follow(report))
 
 
 # --------------------------------------------------------------------------
@@ -772,6 +789,22 @@ def build_server(key: str | None = None, run: Runner = _run_cli) -> Any:
         a delivery receipt per session. A reply is in the transcript: use
         read_transcript(reply_to=id)."""
         return await call("message_status", lambda: message_status(message_id))
+
+    @server.tool(name="follow_message", annotations=read_only)
+    async def _follow_message(
+        message_id: str, wait: float = 30.0, format: Format = "text"
+    ) -> Result:
+        """What became of a message sent to one session, waiting up to
+        `wait` seconds (max 120) for an outcome. Reports separately: the
+        delivery receipt; for a relayed approval, whether it verifies for
+        the target and whether the target's transcript shows it running
+        `fujimoto broadcast verify` (only that is evidence the recipient
+        checked); the reply text; and the target's activity, including a
+        wait on the user (outcome "blocked"). `reply.cursor` can be passed
+        to read_transcript(after=...) for what follows."""
+        return await call(
+            "follow_message", lambda: follow_message(message_id, wait, format)
+        )
 
     @server.tool(name="start_session", annotations=starts)
     async def _start_session(

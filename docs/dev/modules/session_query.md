@@ -97,13 +97,22 @@
   (project, no worktree). The project root is filled in from
   `$FUJIMOTO_GIT_ROOT/<project>` when that exists.
 - `ActivityIndex` is gathered once per command (`live.list_live_sessions()`,
-  one `tmux.list_session_paths()` call, `session_state.load_state()`) and
+  one `tmux.list_session_paths()` call, `session_state.load_state()`,
+  `broadcast.listening_session_ids()`) and
   matched per transcript: (1) the registry has a process writing this session
   id → running, source `claude-registry`, with pid/peer name/status/tmux
   session; (2) the registry has a process in this cwd writing a *different*
   conversation → not running, whatever tmux says; (3) a tmux session in this
   cwd whose record's `claude_session_id` is this id — or, with no recorded id,
   this is the cwd's newest transcript by mtime → running, source `tmux`.
+- **`active.listening`** (`Activity.listening`): whether a signed message
+  can reach a running session now (a live broadcast waiter for its id). Set
+  only on running activities, so a stopped row stays `{"running": false}`;
+  None (JSON null) when the index was built without listeners (tests,
+  direct `ActivityIndex(...)`). `format_list` and `describe()` append
+  `listening` only when true: "not listening" on every row would be noise
+  when broadcast is off. In `LIST_FIELDS`/`LOG_FIELDS` as
+  `active.listening`.
 - `find_session_log(ref)` — a `.jsonl` path, an exact id, or a unique id
   prefix (glob-escaped); ambiguity is a `QueryError` listing candidates.
 - **The calling session is excluded from `search`.** `calling_session_id()`

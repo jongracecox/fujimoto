@@ -224,7 +224,14 @@ def check_setup(
     name: str = DEFAULT_SIGNER,
     agent_keys: Sequence[str] | None = None,
     config: broadcast.BroadcastSettings | None = None,
+    agent_sock: str | None = None,
 ) -> SetupReport:
+    """Each step of a secure setup, as `Check`s. Read-only.
+
+    `agent_keys` / `agent_sock` describe the SSH agent to check against
+    (default: this process's `SSH_AUTH_SOCK`); `mcp doctor` passes the
+    agent a client's config points the server at.
+    """
     checks: list[Check] = []
 
     has_mcp = importlib.util.find_spec("mcp") is not None
@@ -323,7 +330,7 @@ def check_setup(
             )
 
         held = list(agent_keys) if agent_keys is not None else broadcast._agent_keys()
-        sock = os.environ.get("SSH_AUTH_SOCK")
+        sock = agent_sock or os.environ.get("SSH_AUTH_SOCK")
         if public_key in held:
             checks.append(Check("SSH agent", OK, f"holds the key ({sock})"))
         else:
@@ -697,6 +704,35 @@ _FORMATS = {
     ),
 }
 _FORMATS[CODEX] = _FORMATS[CHATGPT]
+
+
+def read_client_entry(
+    client: str, path: Path | None = None
+) -> tuple[Path, dict[str, object] | None]:
+    """The client config's `fujimoto` server entry, read-only.
+
+    None when the file or the entry is missing. A file that doesn't parse,
+    or an entry that isn't a table, is an `InstallError`.
+    """
+    fmt = _FORMATS[client]
+    path = path or config_path(client)
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return path, None
+    except (OSError, UnicodeDecodeError) as e:
+        raise InstallError(f"cannot read {path}: {e}") from e
+    servers = fmt.parse(raw, path).get(fmt.table)
+    if servers is None:
+        return path, None
+    if not isinstance(servers, dict):
+        raise InstallError(f'"{fmt.table}" in {path} is not a table/object')
+    entry = cast("dict[str, object]", servers).get(SERVER_NAME)
+    if entry is None:
+        return path, None
+    if not isinstance(entry, dict):
+        raise InstallError(f"the fujimoto entry in {path} is not a table/object")
+    return path, cast("dict[str, object]", entry)
 
 
 def install_client_config(

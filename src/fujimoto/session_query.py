@@ -29,7 +29,7 @@ import json
 import os
 import re
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -37,7 +37,7 @@ from importlib import resources
 from pathlib import Path
 from typing import TextIO, TypeVar, cast
 
-from fujimoto import debug, session_state
+from fujimoto import broadcast, debug, session_state
 from fujimoto.claude import live
 from fujimoto.claude import search as claude_search
 from fujimoto.claude.log_parser import (
@@ -430,6 +430,9 @@ class Activity:
     tmux_session: str | None = None
     # Why the process is blocked on the user (registry `waitingFor`).
     waiting_for: str | None = None
+    # Whether a signed message (`fujimoto send`) can reach it now: it has a
+    # live broadcast waiter. None when that wasn't looked up.
+    listening: bool | None = None
 
     @property
     def waiting(self) -> str | None:
@@ -449,6 +452,7 @@ class Activity:
             "waiting_for": self.waiting_for,
             "waiting": self.waiting,
             "tmux_session": self.tmux_session,
+            "listening": self.listening,
         }
 
     def describe(self) -> str:
@@ -463,6 +467,8 @@ class Activity:
             parts.append(f"tmux {self.tmux_session}")
         if self.pid is not None:
             parts.append(f"pid {self.pid}")
+        if self.listening:
+            parts.append("listening")
         return " · ".join(parts)
 
 
@@ -516,8 +522,11 @@ class ActivityIndex:
         live_sessions: Sequence[live.LiveSession],
         tmux_paths: dict[str, Path],
         records: dict[str, session_state.SessionRecord],
+        listening: Collection[str] | None = None,
     ) -> None:
         self._by_id = {entry.session_id: entry for entry in live_sessions}
+        # Session ids with a live broadcast waiter; None = not looked up.
+        self._listening = frozenset(listening) if listening is not None else None
         self._by_peer: dict[str, list[live.LiveSession]] = {}
         for entry in live_sessions:
             if entry.peer_name:
@@ -535,6 +544,7 @@ class ActivityIndex:
             live.list_live_sessions(),
             list_session_paths(),
             session_state.load_state(),
+            broadcast.listening_session_ids(),
         )
 
     def session_ids_for_peer(self, name: str) -> list[str]:
@@ -543,6 +553,8 @@ class ActivityIndex:
 
     def for_session(self, session_id: str, cwd: Path) -> Activity:
         activity, reason = self._match(session_id, cwd)
+        if activity.running and self._listening is not None:
+            activity = replace(activity, listening=session_id in self._listening)
         debug.log_capped(
             "query.activity",
             "query.activity",
@@ -1100,6 +1112,7 @@ _ACTIVE_FIELDS = (
     "waiting_for",
     "waiting",
     "tmux_session",
+    "listening",
 )
 _SESSION_FIELDS = (
     "session_id",
@@ -1264,6 +1277,9 @@ def _list_activity(activity: Activity) -> str:
     >>> _list_activity(Activity(running=True, status="busy", peer_name="p",
     ...                         waiting_for="permission prompt"))
     'busy · waiting: permission prompt · peer p'
+    >>> _list_activity(Activity(running=True, status="idle", peer_name="p",
+    ...                         listening=True))
+    'idle · peer p · listening'
     >>> _list_activity(NOT_RUNNING)
     ''
     """
@@ -1281,6 +1297,8 @@ def _list_activity(activity: Activity) -> str:
         parts.append(f"waiting: {activity.waiting_for}")
     if where:
         parts.append(where)
+    if activity.listening:
+        parts.append("listening")
     return " · ".join(parts)
 
 

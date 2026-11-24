@@ -2023,3 +2023,62 @@ class TestPendingSession:
                 "proj/chat-1",
                 self.SID,
             )
+
+
+# -- Signed-message reachability (`active.listening`) --
+
+
+class TestListening:
+    def _report(self, tmp_path: Path, listening: tuple[str, ...] | None):
+        cwd = tmp_path / "w"
+        cwd.mkdir()
+        _transcript(tmp_path, cwd, "aaaaaaaa-1111", "listening one", age=1)
+        _transcript(tmp_path, cwd, "cccccccc-3333", "deaf one", age=2)
+        _transcript(tmp_path, tmp_path / "gone", "bbbbbbbb-2222", "stopped", age=3)
+        index = ActivityIndex(
+            [
+                _live("aaaaaaaa-1111", cwd, peer_name="w-ab", status="idle"),
+                _live("cccccccc-3333", tmp_path / "other", peer_name="w-cd"),
+            ],
+            {},
+            {},
+            listening=listening,
+        )
+        return run_list(Scope(all_projects=True), activity=index)
+
+    def test_json_running_rows_only(self, tmp_path: Path) -> None:
+        # A listener for the stopped session's id must not change its row.
+        data = list_json(self._report(tmp_path, ("aaaaaaaa-1111", "bbbbbbbb-2222")))
+        by_id = {r["session_id"]: r["active"] for r in data["sessions"]}
+        assert by_id["aaaaaaaa-1111"]["listening"] is True
+        assert by_id["cccccccc-3333"]["listening"] is False
+        assert by_id["bbbbbbbb-2222"] == {"running": False}
+
+    def test_fields(self, tmp_path: Path) -> None:
+        fields = session_query.parse_fields("active.listening")
+        rows = list_json(self._report(tmp_path, ("aaaaaaaa-1111",)), fields)["sessions"]
+        assert [r["active"]["listening"] for r in rows] == [True, False, None]
+
+    def test_text(self, tmp_path: Path) -> None:
+        lines = format_list(self._report(tmp_path, ("aaaaaaaa-1111",))).splitlines()
+        assert lines[0].endswith("idle · peer w-ab · listening")
+        assert lines[2].endswith("idle · peer w-cd")  # not listening: no mark
+        assert "listening" not in lines[4]
+
+    def test_not_looked_up_is_null(self, tmp_path: Path) -> None:
+        report = self._report(tmp_path, None)
+        assert list_json(report)["sessions"][0]["active"]["listening"] is None
+        assert "· listening" not in format_list(report)
+
+    def test_describe(self) -> None:
+        activity = Activity(running=True, status="idle", listening=True)
+        assert activity.describe() == "idle · listening"
+
+    def test_gather_reads_the_listeners(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            session_query.broadcast, "listening_session_ids", lambda: frozenset({"s1"})
+        )
+        monkeypatch.setattr(session_query.live, "list_live_sessions", lambda: [])
+        monkeypatch.setattr(session_query.session_state, "load_state", lambda: {})
+        index = ActivityIndex.gather()
+        assert index._listening == frozenset({"s1"})

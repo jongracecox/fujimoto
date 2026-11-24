@@ -1832,3 +1832,27 @@ class TestVerify:
         with pytest.raises(SystemExit) as exc:
             _cli(monkeypatch, "verify", p.id, "--session", SID_B)
         assert exc.value.code == 1 and capsys.readouterr().out.startswith("FAIL")
+
+
+def test_listening_session_ids_reads_live_locks() -> None:
+    _listen("1", SID_A)
+    broadcast.ensure_dirs()
+    (broadcast.state_dir() / "2.lock").write_text(
+        json.dumps({"pid": 999_999_999, "session_id": SID_B})  # a dead waiter
+    )
+    (broadcast.state_dir() / "3.lock").write_text("not json")
+    assert broadcast.listening_session_ids() == frozenset({SID_A})
+
+
+def test_listening_session_ids_without_a_mailbox() -> None:
+    assert broadcast.listening_session_ids() == frozenset()
+
+
+def test_find_entry_is_exact(alice: tuple[Path, Signer]) -> None:
+    signers = [alice[1]]
+    p = _payload()
+    broadcast.post(*_signed(alice[0], signers, p))
+    assert broadcast.find_entry(p.id).name.endswith(p.id)
+    assert broadcast.read_payload(broadcast.find_entry(p.id)) == p
+    with pytest.raises(BroadcastError, match="no message with id"):
+        broadcast.find_entry(p.id[:-2])  # a substring is not the id

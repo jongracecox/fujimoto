@@ -24,8 +24,10 @@ src/fujimoto/
 ├── launch_options.py  # extra claude CLI args per session (resolve / save / replay)
 ├── session_query.py   # `fujimoto search` / `fujimoto log`: scope, location, liveness, output
 ├── broadcast.py       # `fujimoto broadcast` / `send`: signed messages, mailbox, per-session waiter hook
+├── follow.py          # `fujimoto broadcast follow`: one message's delivery, approval check, reply, target activity
 ├── mcp_server.py      # `fujimoto mcp`: stdio MCP server (optional `mcp` extra) over the session commands
 ├── mcp_setup.py       # `fujimoto mcp setup`: read-only secure-setup checks + Claude Desktop config
+├── mcp_doctor.py      # `fujimoto mcp doctor`: read-only check of the installed server (launcher, startup, signing)
 ├── __main__.py        # `python -m fujimoto` (how the MCP server runs the CLI)
 ├── templates/
 │   ├── __init__.py
