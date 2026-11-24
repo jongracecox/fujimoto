@@ -112,6 +112,30 @@ fujimoto log 8f0e2c1a --after 140 --wait 15 --json   # only what's new since cur
 - If the transcript can't be parsed, the raw lines are printed with a
   warning instead.
 
+**Reading only what you need.** A `--summary --json` is several thousand
+characters, most of it message text and a header that repeats `list`. Ask for
+the parts you will use (`session_id` is always included):
+
+```sh
+fujimoto log 8f0e2c1a --summary --json --fields summary.last_assistant.text,active.status,active.waiting
+fujimoto log 8f0e2c1a --summary --json --fields summary.links
+fujimoto log 8f0e2c1a --summary --json --fields summary.replied_to.text,summary.last_user.text
+fujimoto log 8f0e2c1a --summary --json --fields first_prompt,summary.last_assistant.timestamp
+fujimoto log 8f0e2c1a --after 140 --wait 15 --json --fields messages,cursor
+```
+
+- Field names: everything `list --fields` takes (except `this_session`), plus
+  `format`, `parse_error`, `total`, `matched`, `cursor`, `messages`, `lines`,
+  `reply_to`, `delivered_index`, `summary` and `summary.<key>` (`first_prompt`,
+  `replied_to`, `last_user`, `last_assistant`, `role_counts`, `links`).
+- The four summary messages go one level deeper: `summary.last_assistant.text`
+  (or `.index`, `.role`, `.timestamp`, `.tool_id`) drops the rest of the
+  message. Links and `messages` entries come back whole.
+- `first_prompt` (top level) is the first prompt as a plain string.
+- Fields choose which parts come back; they don't shorten a long message.
+- An unparseable transcript returns `lines`, not `messages`. Add `format`
+  (`parsed` or `raw`) if you need to tell which one you got.
+
 ### Talk to a session
 
 - **Running:** `SendMessage` to the peer name from `search` or `log`.
@@ -278,8 +302,8 @@ fujimoto broadcast send --signed msg.json                # a payload you signed 
 
 ```sh
 fujimoto broadcast status 20261123T010203-aaaa1111         # delivered or rejected, per session
-fujimoto log 8f0e2c1a --reply-to 20261123T010203-aaaa1111 --wait 60 --json   # what answered it
-fujimoto log 8f0e2c1a --after 140 --wait 15 --json          # or everything since a saved cursor
+fujimoto log 8f0e2c1a --reply-to 20261123T010203-aaaa1111 --wait 60 --json --fields messages,delivered_index,cursor
+fujimoto log 8f0e2c1a --after 140 --wait 15 --json --fields messages,cursor   # or everything since a saved cursor
 ```
 
   `--reply-to` finds that exact delivery in the transcript and returns what
