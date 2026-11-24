@@ -3,8 +3,10 @@
 Claude Code writes one `<pid>.json` per running interactive process under
 `$CLAUDE_CONFIG_DIR/sessions/` (default `~/.claude/sessions/`), recording the
 conversation id it is writing (`sessionId`), its `cwd`, its peer address
-(`name`, what `SendMessage` takes), a `status` (`busy`/`idle`) and, when it
-runs inside tmux, the pane it runs in (`tmux`, `<session>:@<window>.%<pane>`).
+(`name`, what `SendMessage` takes), a `status` (`busy`/`idle`), while it is
+blocked on the user the reason why (`waitingFor`: `"permission prompt"`,
+`"input needed"`, `"dialog open"`, ...) and, when it runs inside tmux, the pane
+it runs in (`tmux`, `<session>:@<window>.%<pane>`).
 
 That is a far more exact answer to "is this transcript live?" than tmux alone,
 which only knows that *something* runs in a directory. It is also undocumented,
@@ -41,6 +43,49 @@ class LiveSession:
     peer_name: str | None
     status: str | None
     tmux_session: str | None
+    # Why the process is blocked on the user, as Claude wrote it; None when
+    # it isn't. See `waiting_category`.
+    waiting_for: str | None = None
+
+
+# Claude Code's own grouping of its `waitingFor` reasons (the table its UI
+# uses to pick a notification). A reason missing from it is still a wait:
+# `waiting_category` reads it as "other" rather than dropping it.
+WAITING_PERMISSION = "permission"
+WAITING_QUESTION = "question"
+WAITING_DIALOG = "dialog"
+WAITING_OTHER = "other"
+_WAITING_CATEGORIES = {
+    "permission prompt": WAITING_PERMISSION,
+    "sandbox request": WAITING_PERMISSION,
+    "worker request": WAITING_PERMISSION,
+    "goal proposal": WAITING_PERMISSION,
+    "input needed": WAITING_QUESTION,
+    "dialog open": WAITING_DIALOG,
+}
+WAITING_CATEGORY_NAMES = (
+    WAITING_PERMISSION,
+    WAITING_QUESTION,
+    WAITING_DIALOG,
+    WAITING_OTHER,
+)
+
+
+def waiting_category(waiting_for: str | None) -> str | None:
+    """The stable category for a registry `waitingFor` reason, or None.
+
+    >>> waiting_category("permission prompt")
+    'permission'
+    >>> waiting_category("input needed")
+    'question'
+    >>> waiting_category("something new")
+    'other'
+    >>> waiting_category(None) is None
+    True
+    """
+    if not waiting_for:
+        return None
+    return _WAITING_CATEGORIES.get(waiting_for, WAITING_OTHER)
 
 
 def get_claude_sessions_dir() -> Path:
@@ -114,6 +159,7 @@ def _parse_entry(path: Path) -> LiveSession | None:
         peer_name=_optional_str(data.get("name")),
         status=_optional_str(data.get("status")),
         tmux_session=tmux_session_from_pane(data.get("tmux")),
+        waiting_for=_optional_str(data.get("waitingFor")),
     )
 
 
@@ -125,6 +171,7 @@ def list_live_sessions(sessions_dir: Path | None = None) -> list[LiveSession]:
     except OSError:  # pragma: no cover - glob on an unreadable dir
         files = []
     live: list[LiveSession] = []
+    waiting = 0
     unreadable = 0
     stale = 0
     for path in files:
@@ -135,6 +182,7 @@ def list_live_sessions(sessions_dir: Path | None = None) -> list[LiveSession]:
             stale += 1
         else:
             live.append(entry)
+            waiting += entry.waiting_for is not None
     # Both skip counts matter: `unreadable` climbing is what a registry format
     # change looks like, and `stale` explains a session that reads as stopped.
     debug.log(
@@ -143,6 +191,7 @@ def list_live_sessions(sessions_dir: Path | None = None) -> list[LiveSession]:
         exists=directory.is_dir(),
         files=len(files),
         live=len(live),
+        waiting=waiting,
         stale=stale,
         unreadable=unreadable,
     )

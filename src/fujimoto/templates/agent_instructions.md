@@ -18,12 +18,45 @@ default and JSON with `--json`, and exit 1 on error (0 for "no matches").
 fujimoto list                                  # this project and its worktrees, newest first
 fujimoto list --all-projects -n 50             # every project on the machine
 fujimoto list --running                        # only sessions running now
+fujimoto list --waiting                        # running sessions waiting on the user
+fujimoto list 8f0e2c1a my-peer                 # just these sessions (id, prefix or peer name)
 ```
 
-Each row gives the project/worktree, when it was last used, the session id
-(first 8 characters, which `log` and `resume` accept), the peer name of a
-running session, and its first prompt or title. Use it when you know roughly
-when something happened but not which words to search for.
+Each row starts with the session id (first 8 characters, which `list`, `log`
+and `resume` accept), then gives the project/worktree, when it was last used, the peer name of a
+running session and what it is waiting for, and its first prompt or title.
+Use it when you know roughly when something happened but not which words to
+search for.
+
+**Checking on sessions cheaply.** A full `--json` row has around 20 keys.
+When you only need a status, name the session (or filter) and ask for just
+the fields you will use:
+
+```sh
+fujimoto list my-peer --json --fields active.status,active.waiting
+fujimoto list --waiting --all-projects --json --fields active.peer_name,active.waiting_for
+fujimoto list --running --json --fields title,active.peer_name,active.status
+fujimoto list --state waiting_for_user -n 5 --json --fields cwd,last_activity
+```
+
+- Naming sessions skips the scope and `-n`, and lists them in the order
+  given. An unknown name is an error (exit 1).
+- `--waiting` means running and blocked on the user. `active.waiting` says
+  why: `permission` (a tool or sandbox approval), `question` (Claude asked
+  something), `dialog`, or `other`. It is null when the session is not
+  blocked: an `idle` status with no `waiting` just means its turn is over.
+  `active.waiting_for` is Claude Code's own wording (`"permission prompt"`).
+- `--state` filters on the transcript's last entry: `working`,
+  `waiting_for_user`, `waiting_for_tool_approval`, `idle`, `unknown`. It
+  works for finished sessions too, but it is a guess: an unanswered tool call
+  reads as `waiting_for_tool_approval` even while the tool is still running.
+  For a running session, trust `active.status` / `active.waiting`.
+- `--fields` takes top-level keys (`session_id`, `title`, `state`, `cwd`,
+  `branch`, `last_activity`, ...) and `active.<key>` (`running`, `peer_name`,
+  `status`, `waiting`, `waiting_for`, `tmux_session`, `pid`). An unknown name
+  is an error that lists the valid ones. `session_id` (the full id) is always
+  included, first. Every row gets every field you asked for, null when it has
+  no value (a stopped session's `active.peer_name`).
 
 ### Find sessions: `fujimoto search QUERY`
 

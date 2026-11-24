@@ -30,11 +30,39 @@
   reading until `limit` *running* ones are found. Unparseable (empty)
   transcripts are counted as `unreadable`, not listed. The calling session is
   *marked* (`this session`, `"this_session"`), not left out as `search` does:
-  a listing missing the newest session would just look wrong. Text rows show
-  an 8-character id prefix (`find_session_log` accepts it) and the running
+  a listing missing the newest session would just look wrong. Text rows lead
+  with an 8-character id prefix in its own column (`find_session_log` accepts
+  it, so `list`, `log` and `resume` do), and show the running
   session's address (`_list_activity`: status + peer, else tmux). The label
   column is padded to at most `_LABEL_WIDTH_CAP`, because one scratch-dir path
   padded every row past the screen edge.
+- **`list` filters and named sessions.** `run_list(scope, *, limit,
+  running_only, waiting_only, states, refs, calling_session, activity)`.
+  `waiting_only` uses `is_waiting(session, activity)`: for a registry
+  match, `waiting_for` set or `status == "idle"`. The transcript `state`
+  (`waiting_for_user`/`waiting_for_tool_approval`) is only the fallback for a
+  tmux-only match or a registry entry with neither field, because an
+  unanswered `tool_use` looks the same whether it awaits approval or is still
+  running. `states` filters on `ClaudeSession.state`. Filters, like
+  `running_only`, keep reading until `limit` matches. `refs` replaces the
+  scope walk: each ref goes through `_resolve_ref` (an exact running peer name
+  via `ActivityIndex.session_ids_for_peer`, else `find_session_log`), is
+  deduplicated, and is listed in the order given with no `limit` and no sort.
+  An unknown, ambiguous or unreadable ref is a `QueryError`, not a skipped
+  row. `query.list_ref` logs `via=peer|log`.
+- **`--fields`.** `parse_fields(text)` validates against `LIST_FIELDS` (the
+  session row's keys plus `active.<key>`; a test checks that every name is a
+  real key) and raises `QueryError` naming the valid ones.
+  `select_fields(row, fields)` is pure: it keeps the nesting, returns null
+  for a valid field the row lacks (`active` of a stopped session is only
+  `{"running": false}`), and lets a whole `active` win over its sub-paths.
+  `list_json(report, fields)` applies it to the session rows only, always
+  putting `session_id` (the full id) first: a cut-down row with no id can't be
+  acted on, and filtered rows arrive in activity order. JSON keeps the full id
+  because Claude's own `--resume`, transcript names and
+  `$CLAUDE_CODE_SESSION_ID` need it, and a prefix is only unique for now. The
+  envelope keeps its keys and adds `waiting_only`, `states` and `refs`. The
+  MCP server calls these directly, so none of them may print or exit.
 - `--sort relevance` (`SortOrder.RELEVANCE`) disables the early stop, sorts
   every hit by `relevance_key` — `(message matches, tool matches,
   last_activity)` — and *then* applies `limit`, so `truncated` means "more

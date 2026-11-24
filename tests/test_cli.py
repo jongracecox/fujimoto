@@ -11469,6 +11469,62 @@ class TestQueryCommands:
         )
         assert json.loads(out)["sessions"] == []
 
+    def test_list_named_session_with_fields(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        code, out, _ = self._main(
+            monkeypatch,
+            "list",
+            "sess",
+            "--json",
+            "--fields",
+            "session_id,active.status",
+        )
+        assert code == 0
+        data = json.loads(out)
+        assert data["refs"] == ["sess"]
+        assert data["sessions"] == [
+            {"session_id": "sess-1", "active": {"status": None}}
+        ]
+        code, out, _ = self._main(
+            monkeypatch, "list", "sess", "--json", "--fields", "title"
+        )
+        assert json.loads(out)["sessions"] == [{"session_id": "sess-1", "title": None}]
+
+    def test_list_filters_reach_the_query(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        code, out, _ = self._main(
+            monkeypatch,
+            "list",
+            "--all-projects",
+            "--waiting",
+            "--state",
+            "working,waiting_for_user",
+            "--json",
+        )
+        assert code == 0
+        data = json.loads(out)
+        assert data["waiting_only"] is True
+        assert data["states"] == ["working", "waiting_for_user"]
+        assert data["sessions"] == []  # nothing is running
+
+    def test_list_filter_and_field_errors(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        code, _, err = self._main(monkeypatch, "list", "--state", "sleepy")
+        assert code == 2
+        assert "choose from: working" in err
+        code, _, err = self._main(monkeypatch, "list", "--fields", "session_id")
+        assert code == 1
+        assert "--fields needs --json" in err
+        code, _, err = self._main(monkeypatch, "list", "--json", "--fields", "bogus")
+        assert code == 1
+        assert "unknown field 'bogus'" in err
+        code, _, err = self._main(monkeypatch, "list", "no-such-session")
+        assert code == 1
+        assert "no session log found" in err
+
     def test_list_errors(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         code, _, err = self._main(monkeypatch, "list", "--project", str(tmp_path))
         assert code == 1

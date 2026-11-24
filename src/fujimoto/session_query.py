@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from importlib import resources
 from pathlib import Path
-from typing import TextIO, TypeVar
+from typing import TextIO, TypeVar, cast
 
 from fujimoto import debug, session_state
 from fujimoto.claude import live
@@ -44,6 +44,7 @@ from fujimoto.claude.log_parser import (
     INJECTED_PREFIXES,
     ClaudeLogError,
     ClaudeSession,
+    SessionState,
     TranscriptMessage,
     get_claude_projects_dir,
     parse_session,
@@ -427,6 +428,13 @@ class Activity:
     peer_name: str | None = None
     status: str | None = None
     tmux_session: str | None = None
+    # Why the process is blocked on the user (registry `waitingFor`).
+    waiting_for: str | None = None
+
+    @property
+    def waiting(self) -> str | None:
+        """`waiting_for` as a stable category: permission, question, ..."""
+        return live.waiting_category(self.waiting_for)
 
     def as_json(self) -> dict[str, object]:
         if not self.running:
@@ -438,6 +446,8 @@ class Activity:
             "pid": self.pid,
             "peer_name": self.peer_name,
             "status": self.status,
+            "waiting_for": self.waiting_for,
+            "waiting": self.waiting,
             "tmux_session": self.tmux_session,
         }
 
@@ -445,6 +455,8 @@ class Activity:
         if not self.running:
             return "no"
         parts = [self.status or "running"]
+        if self.waiting_for:
+            parts.append(f"waiting: {self.waiting_for}")
         if self.peer_name:
             parts.append(f"peer {self.peer_name}")
         if self.tmux_session:
@@ -455,6 +467,31 @@ class Activity:
 
 
 NOT_RUNNING = Activity(running=False)
+
+# What `--waiting` takes from the transcript when the registry has nothing to
+# say. The transcript can't tell "awaiting approval" from "a tool is still
+# running" (both end on an unanswered `tool_use`), so it is only the fallback.
+_TRANSCRIPT_WAITING = frozenset(
+    {SessionState.WAITING_FOR_USER, SessionState.WAITING_FOR_TOOL_APPROVAL}
+)
+
+
+def is_waiting(session: ClaudeSession, activity: Activity) -> bool:
+    """Whether a running session is waiting on the user.
+
+    Claude Code's registry is exact: a `waitingFor` reason (a permission
+    prompt, a question, a dialog) or an `idle` status (the turn is over, the
+    prompt is empty). A session the registry doesn't describe (found through
+    tmux, or a Claude that writes no status) falls back to the transcript's
+    last entry.
+    """
+    if not activity.running:
+        return False
+    if activity.source == SOURCE_REGISTRY and (
+        activity.waiting_for is not None or activity.status is not None
+    ):
+        return activity.waiting_for is not None or activity.status == "idle"
+    return session.state in _TRANSCRIPT_WAITING
 
 
 def _latest_session_id(cwd: Path) -> str | None:
@@ -481,6 +518,10 @@ class ActivityIndex:
         records: dict[str, session_state.SessionRecord],
     ) -> None:
         self._by_id = {entry.session_id: entry for entry in live_sessions}
+        self._by_peer: dict[str, list[live.LiveSession]] = {}
+        for entry in live_sessions:
+            if entry.peer_name:
+                self._by_peer.setdefault(entry.peer_name, []).append(entry)
         self._live_cwds = {_resolved(e.cwd) for e in live_sessions if e.cwd}
         self._tmux_by_cwd: dict[Path, list[str]] = {}
         for name, path in tmux_paths.items():
@@ -495,6 +536,10 @@ class ActivityIndex:
             list_session_paths(),
             session_state.load_state(),
         )
+
+    def session_ids_for_peer(self, name: str) -> list[str]:
+        """The conversations running processes with this peer name write."""
+        return [entry.session_id for entry in self._by_peer.get(name, [])]
 
     def for_session(self, session_id: str, cwd: Path) -> Activity:
         activity, reason = self._match(session_id, cwd)
@@ -525,6 +570,7 @@ class ActivityIndex:
                 peer_name=entry.peer_name,
                 status=entry.status,
                 tmux_session=tmux_name,
+                waiting_for=entry.waiting_for,
             )
             return activity, "registry-id"
 
@@ -930,6 +976,15 @@ class ListReport:
     # The session running this command, marked in the listing (not left out:
     # unlike a search, a listing that skipped it would just look incomplete).
     calling_session: str | None = None
+    waiting_only: bool = False
+    # Transcript states asked for with `--state` (empty: any).
+    states: tuple[SessionState, ...] = ()
+    # The sessions asked for by name; empty for a scope listing.
+    refs: tuple[str, ...] = ()
+
+    @property
+    def filtered(self) -> bool:
+        return self.running_only or self.waiting_only or bool(self.states)
 
 
 def run_list(
@@ -937,6 +992,9 @@ def run_list(
     *,
     limit: int = DEFAULT_LIMIT,
     running_only: bool = False,
+    waiting_only: bool = False,
+    states: Sequence[SessionState] = (),
+    refs: Sequence[str] = (),
     calling_session: str | None = None,
     activity: ActivityIndex | None = None,
 ) -> ListReport:
@@ -944,28 +1002,45 @@ def run_list(
 
     Transcripts are read in mtime order, so the first `limit` that parse are
     the newest and the rest are never opened. `limit=0` lists everything.
-    `running_only` keeps only sessions `ActivityIndex` says are live — it still
-    reads transcripts in order until `limit` of those are found.
+    The filters (`running_only`, `waiting_only`, `states`) keep reading
+    transcripts in order until `limit` matching ones are found.
+
+    `refs` lists just those sessions (ids, id prefixes, `.jsonl` paths or
+    running peer names) in the order given, whatever the scope; the filters
+    still apply and `limit` does not. An unknown ref is a `QueryError`.
     """
-    logs = _scope_logs(scope)
     index = activity or ActivityIndex.gather()
     locator = Locator(scope)
+    wanted = frozenset(states)
     listed: list[ListedSession] = []
     scanned = unreadable = 0
+    logs = (
+        # Two refs to one session (its id and its peer name) list it once.
+        list(dict.fromkeys(_resolve_ref(ref, index) for ref in refs))
+        if refs
+        else _scope_logs(scope)
+    )
     for log in logs:
-        if limit and len(listed) >= limit:
+        if not refs and limit and len(listed) >= limit:
             break
         scanned += 1
         try:
             session = parse_session(log)
-        except ClaudeLogError:
+        except ClaudeLogError as e:
+            if refs:
+                raise QueryError(f"cannot read session {log.stem}: {e}") from e
             unreadable += 1
             continue
         state = index.for_session(session.session_id, session.cwd)
         if running_only and not state.running:
             continue
+        if waiting_only and not is_waiting(session, state):
+            continue
+        if wanted and session.state not in wanted:
+            continue
         listed.append(ListedSession(session, locator.locate(session.cwd), state))
-    listed.sort(key=lambda s: s.session.last_activity, reverse=True)
+    if not refs:
+        listed.sort(key=lambda s: s.session.last_activity, reverse=True)
     truncated = scanned < len(logs)
     debug.log(
         "query.list",
@@ -978,6 +1053,9 @@ def run_list(
         truncated=truncated,
         limit=limit,
         running_only=running_only,
+        waiting_only=waiting_only,
+        states=",".join(sorted(wanted)),
+        refs=len(refs),
         running=sum(1 for s in listed if s.activity.running),
     )
     return ListReport(
@@ -989,10 +1067,129 @@ def run_list(
         running_only=running_only,
         sessions=tuple(listed),
         calling_session=calling_session,
+        waiting_only=waiting_only,
+        states=tuple(states),
+        refs=tuple(refs),
     )
 
 
-def list_json(report: ListReport) -> dict[str, object]:
+def _resolve_ref(ref: str, index: ActivityIndex) -> Path:
+    """A `list` argument's transcript: a running peer name, else an id/path.
+
+    A peer name is matched exactly and first, since it is what an agent has
+    for a session it talks to; anything else goes to `find_session_log`.
+    """
+    ids = index.session_ids_for_peer(ref)
+    if len(ids) > 1:
+        raise QueryError(
+            f"peer {ref!r} is running {len(ids)} sessions: {', '.join(sorted(ids))}"
+        )
+    debug.log("query.list_ref", via="peer" if ids else "log")
+    return find_session_log(ids[0] if ids else ref)
+
+
+# `--fields` names: every key of a session row, and `active.<key>` for the
+# keys of its `active` object.
+_ACTIVE_FIELDS = (
+    "running",
+    "source",
+    "claude_session_id",
+    "pid",
+    "peer_name",
+    "status",
+    "waiting_for",
+    "waiting",
+    "tmux_session",
+)
+LIST_FIELDS = (
+    "session_id",
+    "project",
+    "project_root",
+    "worktree",
+    "cwd",
+    "cwd_exists",
+    "branch",
+    "title",
+    "first_prompt",
+    "last_activity",
+    "state",
+    "log_path",
+    "active",
+    *(f"active.{key}" for key in _ACTIVE_FIELDS),
+    "this_session",
+)
+
+
+def parse_fields(text: str) -> tuple[str, ...]:
+    """A `--fields` value as a tuple of field paths, in the order given.
+
+    >>> parse_fields("session_id, active.status")
+    ('session_id', 'active.status')
+    >>> parse_fields("nope")
+    Traceback (most recent call last):
+    ...
+    fujimoto.session_query.QueryError: unknown field 'nope'; choose from: ...
+    """
+    fields = tuple(dict.fromkeys(f.strip() for f in text.split(",") if f.strip()))
+    if not fields:
+        raise QueryError("--fields needs at least one field name")
+    for field in fields:
+        if field not in LIST_FIELDS:
+            raise QueryError(
+                f"unknown field {field!r}; choose from: {', '.join(LIST_FIELDS)}"
+            )
+    return fields
+
+
+def select_fields(row: dict[str, object], fields: Sequence[str]) -> dict[str, object]:
+    """`row` cut down to `fields`, keeping its nesting (`active.status`).
+
+    A field the row doesn't have — `active.pid` of a stopped session, whose
+    `active` is just `{"running": false}` — comes back as null, so every row
+    has the same keys.
+
+    >>> row = {"session_id": "s", "title": "t", "active": {"running": False}}
+    >>> select_fields(row, ["session_id", "active.pid", "active.running"])
+    {'session_id': 's', 'active': {'pid': None, 'running': False}}
+    """
+    picked: dict[str, object] = {}
+    nested: dict[str, dict[str, object]] = {}
+    for field in fields:
+        head, _, rest = field.partition(".")
+        value = row.get(head)
+        if not rest:
+            picked[head] = value
+            continue
+        if head in fields:  # the whole object was asked for too
+            continue
+        inner: object = None
+        if isinstance(value, dict):
+            inner = cast("dict[str, object]", value).get(rest)
+        if head not in nested:
+            nested[head] = {}
+            picked[head] = nested[head]
+        nested[head][rest] = inner
+    return picked
+
+
+def list_json(
+    report: ListReport, fields: Sequence[str] | None = None
+) -> dict[str, object]:
+    """The listing as JSON; `fields` cuts each session row down to those.
+
+    `session_id` always leads a cut-down row: a status with no session to
+    act on is no use, and filtered rows come back in activity order.
+    """
+    rows: list[dict[str, object]] = [
+        {
+            **_session_json(s.session, s.location, s.activity),
+            "this_session": s.session.session_id == report.calling_session,
+        }
+        for s in report.sessions
+    ]
+    if fields:
+        keep = ("session_id", *(f for f in fields if f != "session_id"))
+        rows = [select_fields(row, keep) for row in rows]
     return {
         "scope": _scope_json(report.scope),
         "total_logs": report.total_logs,
@@ -1000,13 +1197,10 @@ def list_json(report: ListReport) -> dict[str, object]:
         "unreadable": report.unreadable,
         "truncated": report.truncated,
         "running_only": report.running_only,
-        "sessions": [
-            {
-                **_session_json(s.session, s.location, s.activity),
-                "this_session": s.session.session_id == report.calling_session,
-            }
-            for s in report.sessions
-        ],
+        "waiting_only": report.waiting_only,
+        "states": [state.value for state in report.states],
+        "refs": list(report.refs),
+        "sessions": rows,
     }
 
 
@@ -1022,6 +1216,9 @@ def _list_activity(activity: Activity) -> str:
     'idle · peer p'
     >>> _list_activity(Activity(running=True, tmux_session="proj/wt"))
     'running · tmux proj/wt'
+    >>> _list_activity(Activity(running=True, status="busy", peer_name="p",
+    ...                         waiting_for="permission prompt"))
+    'busy · waiting: permission prompt · peer p'
     >>> _list_activity(NOT_RUNNING)
     ''
     """
@@ -1035,17 +1232,24 @@ def _list_activity(activity: Activity) -> str:
         else None
     )
     parts = [activity.status or "running"]
+    if activity.waiting_for:
+        parts.append(f"waiting: {activity.waiting_for}")
     if where:
         parts.append(where)
     return " · ".join(parts)
 
 
 def format_list(report: ListReport) -> str:
-    """One row per session (where, when, id, address) and its title under it."""
+    """One row per session (id, where, when, address) and its title under it.
+
+    The short id leads, in a fixed-width column: it is what every other
+    command takes, and a long label must not push it around.
+    """
     scope = report.scope.describe()
     if not report.sessions:
-        what = "running sessions" if report.running_only else "sessions"
-        return f"No {what} in {report.total_logs} transcripts ({scope})."
+        if report.refs:
+            return f"None of the {len(report.refs)} named sessions match ({_describe_filters(report)})."
+        return f"No {_list_noun(report)}s in {report.total_logs} transcripts ({scope})."
 
     rows: list[tuple[str, str, str, str, str]] = []
     for item in report.sessions:
@@ -1071,14 +1275,17 @@ def format_list(report: ListReport) -> str:
 
     lines: list[str] = []
     for item, (marker, label, when, short_id, note) in zip(report.sessions, rows):
-        line = f"{marker} {label:<{label_width}}  {when:<{when_width}}  {short_id}"
+        line = f"{marker} {short_id}  {label:<{label_width}}  {when:<{when_width}}"
         lines.append(f"{line}  {note}" if note else line)
         lines.append(f"    {_title(item.session) or '(no prompt yet)'}")
 
     count = len(report.sessions)
-    noun = "running session" if report.running_only else "session"
-    footer = f"{count} {noun}{'s' if count != 1 else ''} · {scope}"
-    if not report.running_only:
+    noun = _list_noun(report)
+    where = f"{len(report.refs)} named" if report.refs else scope
+    footer = f"{count} {noun}{'s' if count != 1 else ''} · {where}"
+    if report.states:
+        footer += f" · state {', '.join(state.value for state in report.states)}"
+    if not report.filtered:
         running = sum(1 for s in report.sessions if s.activity.running)
         if running:
             footer += f" · {running} running"
@@ -1092,10 +1299,29 @@ def format_list(report: ListReport) -> str:
     lines.append("")
     lines.append(footer)
     lines.append(
-        "Next: fujimoto log <id> --summary · fujimoto resume <id> · "
-        "fujimoto search QUERY"
+        "Next: fujimoto list <id> --json --fields … · fujimoto log <id> --summary"
+        " · fujimoto resume <id> (a peer name works too)"
     )
     return "\n".join(lines)
+
+
+def _list_noun(report: ListReport) -> str:
+    if report.waiting_only:
+        return "waiting session"
+    if report.running_only:
+        return "running session"
+    return "session"
+
+
+def _describe_filters(report: ListReport) -> str:
+    """The filters in force, for a footer: `waiting · working`."""
+    parts = []
+    if report.waiting_only:
+        parts.append("waiting")
+    elif report.running_only:
+        parts.append("running")
+    parts.extend(state.value for state in report.states)
+    return " · ".join(parts) or "no filter"
 
 
 # --------------------------------------------------------------------------
