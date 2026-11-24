@@ -119,6 +119,7 @@ Preferences that apply to every project live in
 ```yaml
 model: opus            # default Claude model for every session
 quick_terminal: true   # the global quick-terminal binding (see below)
+page_step: 50%         # PageUp/PageDown step: share of the visible rows, or a row count
 broadcast:             # `fujimoto broadcast` (managed by its own commands)
   enabled: true
   signers:
@@ -153,6 +154,7 @@ fujimoto config set claude_args --project -- --plugin-dir ./plugins
 |---|---|---|
 | `model` | global, project | model alias or id, passed as `--model` |
 | `quick_terminal` | global | `true` / `false` |
+| `page_step` | global | how far PageUp/PageDown move in lists: `50%` of the visible rows (default) or a row count such as `8` |
 | `claude_args` | project | extra claude arguments (shell-style) |
 | `on_error` | project | `abort` / `continue` |
 | `copy`, `link`, `init` | project | shown, but edited in `.fujimoto.yaml` itself |

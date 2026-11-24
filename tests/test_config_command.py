@@ -131,6 +131,17 @@ class TestGetSetUnset:
         assert cc.get_value("model") == ("sonnet", cc.Scope.PROJECT)
         assert cc.get_value("model", cc.Scope.GLOBAL) == (None, None)
 
+    def test_set_page_step(self, no_repo: None) -> None:
+        cc.set_value("page_step", "25%", cc.Scope.GLOBAL)
+        assert cc.get_value("page_step") == ("25%", cc.Scope.GLOBAL)
+        cc.set_value("page_step", " 6 ", cc.Scope.GLOBAL)
+        assert yaml.safe_load(global_config_path().read_text()) == {"page_step": "6"}
+
+    def test_set_page_step_rejects_bad_value(self, no_repo: None) -> None:
+        with pytest.raises(ConfigError, match="page_step"):
+            cc.set_value("page_step", "half", cc.Scope.GLOBAL)
+        assert not global_config_path().exists()
+
     def test_unset(self, repo: Path) -> None:
         cc.set_value("model", "opus", cc.Scope.PROJECT)
         assert cc.unset_value("model", cc.Scope.PROJECT).changed

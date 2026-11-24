@@ -2,7 +2,7 @@
 
 **`config_command.py`** — `fujimoto config`, UI-free like `session_query.py`.
 `KEYS` is the registry (`KeySpec(name, description, scopes, parse)`): `model`
-(global+project), `quick_terminal` (global), `claude_args`/`on_error`
+(global+project), `quick_terminal` (global), `page_step` (global), `claude_args`/`on_error`
 (project), and `copy`/`link`/`init` (project, `parse=None`: listed but
 "edit .fujimoto.yaml"). `build_report()` reads both files (an invalid one is
 reported in `FileState.error`, not raised) and the `ENV_VARS` list;

@@ -15,7 +15,7 @@ the [README](../README.md); setup, code style and releasing in
 | [docs/dev/testing.md](dev/testing.md) | Testing | pytest, coverage, Textual pilot, `run_test`, `XDG_CONFIG_HOME`, nox matrix, textual pins, CI |
 | [docs/dev/diagnostic-logging.md](dev/diagnostic-logging.md) | Diagnostic logging | `--debug`, `--debug-redacted`, instrumenting features, `debug.log`, `log_once`, `rv`, `rp`, redaction, secrets, leak check |
 | [docs/dev/gotchas.md](dev/gotchas.md) | Gotchas and learnings | widget ids `/`, `git worktree remove`, Claude log entry types, `last-prompt`, Shift+Enter, extended-keys, focus-events, `.venv`, redaction pitfalls, `if-shell` `;`, path encoding `.`→`-`, `kill_session`, markup vs `Content`, `asyncRewake`, hook timeout, last `--settings` wins, SSH agent approval, worker tokens, OSC title, `sys.__stdout__`, tmux socket path length |
-| [docs/dev/modules/cli.md](dev/modules/cli.md) | `cli.py` (TUI) | `SessionApp`, views, `PagingListView`, home screen sections, prompt line `p`, refresh `r`, session actions menu, fork flow, log viewer, log search `/` `n` `N`, raw fallback, `check_action`, footer, finish flow, open terminal, message log `b` |
+| [docs/dev/modules/cli.md](dev/modules/cli.md) | `cli.py` (TUI) | `SessionApp`, views, `PagingListView`, `page_step`, home screen sections, prompt line `p`, refresh `r`, session actions menu, fork flow, log viewer, log search `/` `n` `N`, raw fallback, `check_action`, footer, finish flow, open terminal, message log `b` |
 | [docs/dev/modules/config.md](dev/modules/config.md) | `config.py` | worktree root, paths, `slugify`, `meta.json`, parent session, claude args, `next_session_name` |
 | [docs/dev/modules/git.md](dev/modules/git.md) | `git.py` | git wrappers, `GitError`, project root, main worktree root, default branch, create/remove worktree, orphan, push, cherry-pick |
 | [docs/dev/modules/tmux.md](dev/modules/tmux.md) | `tmux.py` | sessions, `build_claude_command`, attach, loop pid, `loop_client`, restart, pending action, key table, `Ctrl-A`, quick terminal binding, focus-events, prefix |
@@ -31,6 +31,7 @@ the [README](../README.md); setup, code style and releasing in
 | [docs/dev/modules/global_config.md](dev/modules/global_config.md) | `global_config.py` | `~/.config/fujimoto/config.yaml`, `GlobalConfig`, `BroadcastConfig` |
 | [docs/dev/modules/config_command.md](dev/modules/config_command.md) | `config_command.py` | `fujimoto config`, key registry, list/get/set/unset |
 | [docs/dev/modules/yaml_edit.md](dev/modules/yaml_edit.md) | `yaml_edit.py` | edit one YAML key, keep comments, atomic write |
+| [docs/dev/modules/paging.md](dev/modules/paging.md) | `paging.py` | PageUp/PageDown step, `page_step`, `PageStep`, percent vs rows, half-page default |
 | [docs/dev/modules/settings.md](dev/modules/settings.md) | `settings.py` | TUI preferences, quick terminal, settings.json migration |
 | [docs/dev/modules/filelock.md](dev/modules/filelock.md) | `filelock.py` | `flock`, lock timeout, `atomic_write`, concurrent writers |
 | [docs/dev/modules/terminal.md](dev/modules/terminal.md) | `terminal.py` | native terminal window, iTerm2, Terminal.app, Linux emulators |

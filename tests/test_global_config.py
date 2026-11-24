@@ -48,6 +48,19 @@ class TestLoad:
         self._write("model: opus\nquick_terminal: true\n")
         assert load_global_config() == GlobalConfig(model="opus", quick_terminal=True)
 
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [("page_step: 25%\n", "25%"), ("page_step: 8\n", "8")],
+    )
+    def test_page_step(self, text: str, expected: str) -> None:
+        self._write(text)
+        assert load_global_config().page_step == expected
+
+    def test_invalid_page_step_raises(self) -> None:
+        self._write("page_step: 0%\n")
+        with pytest.raises(ConfigError, match="page_step"):
+            load_global_config()
+
     def test_unknown_key_raises(self) -> None:
         self._write("modle: opus\n")
         with pytest.raises(ConfigError, match="Invalid"):
