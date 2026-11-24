@@ -1,7 +1,7 @@
 [project]
 name = "fujimoto"
 dynamic = ["version"]
-description = "CLI for managing Claude Code sessions in git worktrees and repositories"
+description = "Mission control for every Claude Code session on your machine"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
