@@ -19,7 +19,11 @@ drill. You get back from lunch, open the wrong terminal twice, and finally
 find Claude still waiting for you to say yes.
 
 That's why I built Fujimoto. I can see which sessions are still working and
-which ones are waiting for me. If all I've got is an old Jira ticket number,
+which ones are waiting for me. My agents can see that too. I can ask,
+"Am I holding anything up?" and get an answer without interrupting any of
+the sessions.
+
+If all I've got is an old Jira ticket number,
 I'll run `fujimoto search PROJ-123 --all-projects` and read what we decided.
 It doesn't matter which repo I was in or whether the session is still
 running, as long as the transcript is still on disk.
