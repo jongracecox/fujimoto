@@ -479,3 +479,13 @@ class TestServe:
             assert mcp_server.serve(OTHER) == 0
         build.assert_called_once_with(OTHER)
         server.run.assert_called_once_with("stdio")
+
+
+def test_messaging_docs_explain_launch_time_trust() -> None:
+    """A rejection from a pre-key session must not read as a signing failure."""
+    import anyio
+
+    tools = {t.name: t for t in anyio.run(mcp_server.build_server(KEY).list_tools)}
+    for name in ("send_message", "broadcast"):
+        assert "launched" in (tools[name].description or "")
+    assert "not signed by a configured signer" in mcp_server.INSTRUCTIONS

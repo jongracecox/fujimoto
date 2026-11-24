@@ -55,6 +55,10 @@ and to steer them.
   wait=60) for its answer. Prefer it over broadcast.
 - Messages are signed as an agent: sessions see them as from this agent,
   never as typed by the user. Don't claim the user approved something.
+- A session trusts only signers that existed when it launched. A receipt
+  rejected as "not signed by a configured signer" means the session predates
+  this agent's key, not that signing failed: suggest stopping and resuming it
+  through fujimoto, or message a newer session.
 - start_session creates a worktree and session; stop_session ends one.
   Confirm with the user before stopping a session or broadcasting.
 """
@@ -592,7 +596,12 @@ def build_server(key: str | None = None, run: Runner = _run_cli) -> Any:
             """Send a signed message to one running session (tmux name, peer
             name or 4+ character id prefix); it acts on it at its next safe
             stopping point. Returns the message id and delivery receipts.
-            The session sees it as from this agent, not from the user."""
+            The session sees it as from this agent, not from the user.
+            A session trusts only the signers that existed when it
+            launched: a receipt rejected as "not signed by a configured
+            signer" means the session predates this agent's key. It must be
+            stopped and resumed through fujimoto (not /clear, not a
+            fujimoto restart), or pick a newer session."""
             return await call(
                 "send_message", lambda: commands.send_message(session, text, ttl, wait)
             )
@@ -607,7 +616,9 @@ def build_server(key: str | None = None, run: Runner = _run_cli) -> Any:
         ) -> dict[str, object]:
             """Send a signed message to every listening session in one
             project, or with all_projects to every session on the machine.
-            Prefer send_message; confirm the audience with the user first."""
+            Prefer send_message; confirm the audience with the user first.
+            Sessions launched before this agent's key was trusted reject
+            it (see send_message)."""
             return await call(
                 "broadcast",
                 lambda: commands.broadcast(text, project, all_projects, ttl, wait),
