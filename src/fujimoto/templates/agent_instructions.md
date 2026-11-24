@@ -137,6 +137,21 @@ fujimoto config set claude_args --project -- --verbose  # a value starting with 
   claude starts on whatever model was last chosen with `/model` in *any*
   session.
 
+### Updates: `fujimoto update`
+
+```sh
+fujimoto update                  # current and latest version, and how to upgrade
+fujimoto update check --json
+fujimoto update dismiss 1.4.0    # stop new sessions offering 1.4.0
+```
+
+When a newer release is out, a new session's system prompt says so and
+names the upgrade command for this install (`uv tool`, `pipx`, `pip`). Ask
+the user once: yes, not now, or don't ask again. Yes: run that command.
+Not now: do nothing; a later session asks again. Don't ask again: run
+`update dismiss` with the version, which silences that version only. The
+home screen's banner has its own dismissal.
+
 ### Start a conversation: `fujimoto chat`
 
 ```sh

@@ -4,7 +4,8 @@ import json
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from collections.abc import Iterator
+from unittest.mock import MagicMock, patch
 
 from rich.console import Console
 from rich.markup import MarkupError
@@ -66,7 +67,7 @@ from fujimoto.cli import (
     _tool_summary,
     main,
 )
-from fujimoto import launch_options, session_query, session_state
+from fujimoto import launch_options, session_query, session_state, version_check
 from fujimoto.session_state import StopKind
 from fujimoto.config import (
     ConfigError,
@@ -12367,3 +12368,174 @@ class TestDefaultModel:
                 await app._do_push_and_pr(session)  # type: ignore[arg-type]
         command = mock_pr_session.call_args.args[2]
         assert command.startswith("claude -p --model opus --allowedTools")
+
+
+class TestUpdateNotice:
+    """New sessions are asked to offer a newer fujimoto; resumes are not."""
+
+    def _run(self, target: LaunchTarget) -> MagicMock:
+        app1 = SessionApp.__new__(SessionApp)
+        app1._launch_target = target
+        app2 = SessionApp.__new__(SessionApp)
+        app2._launch_target = None
+        with (
+            patch("fujimoto.cli._check_prerequisites", return_value=[]),
+            patch("fujimoto.cli.SessionApp", side_effect=[app1, app2]),
+            patch.object(app1, "run"),
+            patch.object(app2, "run"),
+            patch("fujimoto.cli.launch_claude_in_tmux") as mock_launch,
+            patch("fujimoto.cli._apply_worktree_config", return_value=True),
+            patch("fujimoto.cli._build_system_prompt", return_value="test"),
+            patch("fujimoto.cli._session_terminal_title", return_value="t"),
+            patch("fujimoto.cli.get_version", return_value="1.0.0"),
+            patch(
+                "fujimoto.version_check.detect_install",
+                return_value=version_check.InstallInfo(
+                    version_check.InstallMethod.UV_TOOL, "uv tool upgrade fujimoto"
+                ),
+            ),
+        ):
+            main()
+        return mock_launch
+
+    def test_new_session_is_told(self) -> None:
+        version_check.save_state(version_check.CheckState(latest_version="1.1.0"))
+        launch = self._run(
+            LaunchTarget("proj", Path("/tmp/test"), None, "worktree", None)
+        )
+        prompt = launch.call_args.kwargs["system_prompt"]
+        assert prompt.startswith("test fujimoto 1.1.0 is available")
+        assert "`uv tool upgrade fujimoto`" in prompt
+        assert prompt.endswith(FUJIMOTO_CLI_PROMPT)
+
+    def test_nothing_newer_adds_nothing(self) -> None:
+        version_check.save_state(version_check.CheckState(latest_version="1.0.0"))
+        launch = self._run(
+            LaunchTarget("proj", Path("/tmp/test"), None, "worktree", None)
+        )
+        assert launch.call_args.kwargs["system_prompt"] == (
+            f"test {FUJIMOTO_CLI_PROMPT}"
+        )
+
+    def test_agent_dismissed_version_adds_nothing(self) -> None:
+        version_check.save_state(
+            version_check.CheckState(
+                latest_version="1.1.0", agent_dismissed_version="1.1.0"
+            )
+        )
+        launch = self._run(
+            LaunchTarget("proj", Path("/tmp/test"), None, "worktree", None)
+        )
+        assert "available" not in launch.call_args.kwargs["system_prompt"]
+
+    def test_resume_is_not_told(self) -> None:
+        version_check.save_state(version_check.CheckState(latest_version="1.1.0"))
+        launch = self._run(
+            LaunchTarget("proj", Path("/tmp/repo"), "proj/d-1", "direct", "sid")
+        )
+        assert launch.call_args.kwargs["system_prompt"] == FUJIMOTO_CLI_PROMPT
+
+
+class TestUpdateCommand:
+    @pytest.fixture(autouse=True)
+    def _pinned(self) -> Iterator[None]:
+        with (
+            patch("fujimoto.cli.get_version", return_value="1.0.0"),
+            patch(
+                "fujimoto.version_check.detect_install",
+                return_value=version_check.InstallInfo(
+                    version_check.InstallMethod.PIPX, "pipx upgrade fujimoto"
+                ),
+            ),
+        ):
+            yield
+
+    def _main(self, monkeypatch: pytest.MonkeyPatch, *argv: str) -> None:
+        monkeypatch.setattr("sys.argv", ["fujimoto", *argv])
+        with patch("fujimoto.cli._check_prerequisites") as prereqs:
+            main()
+        prereqs.assert_not_called()
+
+    def test_check_is_the_default(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with patch(
+            "fujimoto.version_check.fetch_latest_from_pypi", return_value="1.1.0"
+        ):
+            self._main(monkeypatch, "update")
+        assert capsys.readouterr().out == (
+            "current 1.0.0, latest 1.1.0 (installed with pipx)\n"
+            "Upgrade: pipx upgrade fujimoto\n"
+        )
+        assert version_check.load_state().latest_version == "1.1.0"
+
+    def test_check_json(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with patch(
+            "fujimoto.version_check.fetch_latest_from_pypi", return_value="1.0.0"
+        ):
+            self._main(monkeypatch, "update", "check", "--json")
+        data = json.loads(capsys.readouterr().out)
+        assert data["update_available"] is False
+        assert data["install_method"] == "pipx"
+        assert data["upgrade_command"] == "pipx upgrade fujimoto"
+
+    def test_check_offline_and_unknown(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with patch("fujimoto.version_check.fetch_latest_from_pypi", return_value=None):
+            self._main(monkeypatch, "update", "check")
+        assert capsys.readouterr().out == (
+            "current 1.0.0, latest unknown (installed with pipx)\n"
+        )
+
+    def test_check_editable_points_at_checkout(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        editable = version_check.InstallInfo(
+            version_check.InstallMethod.EDITABLE, None, "/src/fujimoto"
+        )
+        with (
+            patch("fujimoto.version_check.detect_install", return_value=editable),
+            patch(
+                "fujimoto.version_check.fetch_latest_from_pypi", return_value="2.0.0"
+            ),
+        ):
+            self._main(monkeypatch, "update", "check")
+        assert "Runs from /src/fujimoto" in capsys.readouterr().out
+
+    def test_dismiss_defaults_to_latest_known(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        version_check.save_state(version_check.CheckState(latest_version="1.1.0"))
+        self._main(monkeypatch, "update", "dismiss")
+        assert capsys.readouterr().out == "Dismissed 1.1.0 for new sessions.\n"
+        state = version_check.load_state()
+        assert state.agent_dismissed_version == "1.1.0"
+        assert state.dismissed_version is None  # the banner keeps its own
+
+    def test_dismiss_named_version_json(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._main(monkeypatch, "update", "dismiss", "1.2.0", "--json")
+        assert json.loads(capsys.readouterr().out) == {"dismissed_version": "1.2.0"}
+
+    def test_dismiss_without_known_version_fails(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with pytest.raises(SystemExit) as exc:
+            self._main(monkeypatch, "update", "dismiss")
+        assert exc.value.code == 1
+        assert "no newer version known" in capsys.readouterr().err
+
+    def test_dismiss_write_failure_is_reported(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with (
+            patch("fujimoto.version_check.agent_dismiss", side_effect=OSError("ro fs")),
+            pytest.raises(SystemExit) as exc,
+        ):
+            self._main(monkeypatch, "update", "dismiss", "1.2.0")
+        assert exc.value.code == 1
+        assert "could not save the dismissal: ro fs" in capsys.readouterr().err

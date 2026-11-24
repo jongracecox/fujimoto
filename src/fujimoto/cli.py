@@ -108,6 +108,7 @@ from fujimoto.project_config import (
 )
 from fujimoto.terminal import open_terminal
 from fujimoto.version import get_version
+from fujimoto import version_check
 from fujimoto.version_check import check_for_update, dismiss as dismiss_update_version
 from fujimoto.vscode import open_vscode
 from fujimoto.global_config import load_global_config
@@ -6421,6 +6422,29 @@ def _with_cli_prompt(prompt: str | None) -> str:
     return f"{prompt} {FUJIMOTO_CLI_PROMPT}" if prompt else FUJIMOTO_CLI_PROMPT
 
 
+def _update_notice() -> str | None:
+    """The upgrade offer for a new session's system prompt, if one is due.
+
+    Reads the cached PyPI check only; a launch never waits on the network.
+    """
+    current = get_version()
+    try:
+        latest = version_check.pending_agent_update(current)
+    except OSError as e:  # pragma: no cover - load_state already swallows these
+        debug.log_exception("launch.update_notice_failed", e)
+        return None
+    if latest is None:
+        return None
+    install = version_check.detect_install()
+    debug.log(
+        "launch.update_notice",
+        latest=latest,
+        current=current,
+        method=install.method.value,
+    )
+    return version_check.agent_update_notice(current, latest, install)
+
+
 def _parent_system_prompt(parent: str) -> str:
     """Tell a session which session started it, and how to reach that one.
 
@@ -6714,6 +6738,12 @@ def _start_launch(target: LaunchTarget, *, attach: bool = True) -> str | None:
         system_prompt = _build_system_prompt(
             session_type, project_name, working_dir, parent, files_dir=files_dir
         )
+        # Only new sessions: offering the upgrade again on every resume would
+        # ask the same question each time the user reattaches.
+        if not resume_id:
+            notice = _update_notice()
+            if notice:
+                system_prompt = f"{system_prompt} {notice}"
     # The appended system prompt does not survive into a resumed process, so
     # this is added on every launch, not only the first.
     system_prompt = _with_cli_prompt(system_prompt)
@@ -7532,6 +7562,89 @@ def _run_config_command(
     _finish_debug_log()
 
 
+def _run_update_command(args: argparse.Namespace) -> None:
+    """`fujimoto update [check|dismiss]`."""
+    action = args.update_action or "check"
+    current = get_version()
+    if action == "dismiss":
+        version = args.version or version_check.load_state().latest_version
+        if version is None:
+            _finish_debug_log()
+            print(
+                "fujimoto: no newer version known; run `fujimoto update check`",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            version_check.agent_dismiss(version)
+        except OSError as e:
+            _finish_debug_log()
+            print(f"fujimoto: could not save the dismissal: {e}", file=sys.stderr)
+            sys.exit(1)
+        if args.json:
+            print(json.dumps({"dismissed_version": version}))
+        else:
+            print(f"Dismissed {version} for new sessions.")
+        _finish_debug_log()
+        return
+    latest = version_check.refresh_latest()
+    install = version_check.detect_install()
+    available = latest is not None and version_check.is_newer(latest, current)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "current_version": current,
+                    "latest_version": latest,
+                    "update_available": available,
+                    "install_method": install.method.value,
+                    "upgrade_command": install.upgrade_command,
+                    "source": install.source,
+                }
+            )
+        )
+    else:
+        print(
+            f"current {current}, latest {latest or 'unknown'} "
+            f"(installed with {install.method.value})"
+        )
+        if available and install.upgrade_command:
+            print(f"Upgrade: {install.upgrade_command}")
+        elif available and install.source:
+            print(f"Runs from {install.source}: update that checkout.")
+    _finish_debug_log()
+
+
+def _add_update_commands(sub: argparse._SubParsersAction) -> None:
+    """`update [check|dismiss]`."""
+    update = sub.add_parser(
+        "update",
+        help="Check for a newer fujimoto, or stop sessions offering one",
+        description=(
+            "With no action, or `check`, asks PyPI for the latest release and "
+            "prints how this copy was installed and the command that upgrades "
+            "it. `dismiss` stops new sessions offering the upgrade to one "
+            "version (the latest known by default); a later release is offered "
+            "again. The home-screen banner has its own dismissal (`d`)."
+        ),
+    )
+    update.add_argument("--json", action="store_true", help="Print JSON")
+    actions = update.add_subparsers(dest="update_action")
+    check = actions.add_parser("check", help="Check PyPI for a newer release")
+    check.add_argument(
+        "--json", action="store_true", default=argparse.SUPPRESS, help="Print JSON"
+    )
+    dismiss = actions.add_parser(
+        "dismiss", help="Stop new sessions offering the upgrade to one version"
+    )
+    dismiss.add_argument(
+        "version", nargs="?", help="Version to dismiss (default: the latest known)"
+    )
+    dismiss.add_argument(
+        "--json", action="store_true", default=argparse.SUPPRESS, help="Print JSON"
+    )
+
+
 def _add_config_commands(sub: argparse._SubParsersAction) -> None:
     """`config [list|get|set|unset]`."""
     config = sub.add_parser(
@@ -8276,6 +8389,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_config_commands(sub)
     _add_broadcast_command(sub)
     _add_send_command(sub)
+    _add_update_commands(sub)
     new = sub.add_parser(
         "new",
         help="Create a worktree and launch Claude in it",
@@ -8425,6 +8539,9 @@ def main() -> None:
         return
     if args.command == "send":
         _run_send_command(args)
+        return
+    if args.command == "update":
+        _run_update_command(args)
         return
     if args.command == "agent-instructions":
         print(session_query.agent_instructions(), end="")

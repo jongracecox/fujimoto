@@ -1,6 +1,7 @@
 # Key design decisions
 
 - **TUI loop with tmux detach**: The TUI runs in a `while True` loop. After tmux detach (subprocess.run returns), the loop restarts and the TUI reappears. The loop breaks when the user quits without selecting a session.
+- **Two update dismissals, one version each**: the home-screen banner's `d` writes `dismissed_version`; an agent's `fujimoto update dismiss` writes `agent_dismissed_version`. They are separate so hiding the banner doesn't stop sessions asking at least once, and each covers a single version, so the next release is offered again rather than silenced for good. The session notice names the upgrade command fujimoto detects from its own environment (`uv-receipt.toml`, `pipx_metadata.json`, PEP 610 `direct_url.json`) rather than leaving the agent to probe for it. A `uv tool` built from a local path gets `uv tool install --force fujimoto`, because `uv tool upgrade` rebuilds from the original source and would never reach the PyPI release.
 - **Per-session tmux config**: Prefix defaults to `Ctrl-B` (tmux's standard default; configurable via `FUJIMOTO_TMUX_PREFIX`), status bar with shortcut hints — all set via `tmux set-option -t` so the user's global config is untouched. The attach flow is silent (no pre-attach banner) to reduce noise when launching sessions repeatedly.
 - **Global install via `uv tool` needs `--no-cache`**: `--force` alone reuses a
   cached build, and so, in practice, does `--force --reinstall` — uv's build
