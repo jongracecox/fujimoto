@@ -32,6 +32,7 @@ from pathlib import Path
 from fujimoto import debug
 from fujimoto.claude.log_parser import (
     INJECTED_PREFIXES,
+    queued_prompt,
     ClaudeLogError,
     ClaudeSession,
     get_claude_projects_dir,
@@ -516,7 +517,13 @@ def _message_text(entry: dict) -> str:
     ''
     >>> _message_text({"type": "progress"})
     ''
+    >>> _message_text({"type": "attachment", "attachment":
+    ...     {"type": "queued_command", "prompt": "typed mid-turn"}})
+    'typed mid-turn'
     """
+    queued = queued_prompt(entry)
+    if queued is not None:
+        return "" if _injected(queued) else queued
     if entry.get("type") not in ("user", "assistant") or entry.get("isMeta"):
         return ""
     message = entry.get("message")

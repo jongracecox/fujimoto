@@ -210,6 +210,27 @@ class TestLook:
         assert "#2  half done" in text
         assert f"Next: fujimoto log {TARGET[:8]} --after 4 --wait 60" in text
 
+    def test_delivered_mid_turn_as_a_queued_command(
+        self, agent: tuple[Path, list[Signer]], registry: dict
+    ) -> None:
+        """A busy session records the delivery as an attachment, not a user entry."""
+        p = _send(*agent)
+        _receipt(p)
+        _transcript(
+            _user("work"),
+            _assistant("working"),
+            {
+                "type": "attachment",
+                "attachment": {"type": "queued_command", "prompt": _preamble(p.id)},
+            },
+            _assistant("status: nearly done"),
+        )
+        registry["target"] = _live(status="idle")
+        report = follow.follow(p.id, wait=0)
+        assert report.reply.delivered_index == 2
+        assert [m.text for _, m in report.reply.messages] == ["status: nearly done"]
+        assert report.outcome == "replied"
+
     def test_reply_while_still_working_is_partial(
         self, agent: tuple[Path, list[Signer]]
     ) -> None:
