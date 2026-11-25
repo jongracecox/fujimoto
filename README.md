@@ -7,6 +7,7 @@
 [![GitHub last commit](https://img.shields.io/github/last-commit/jongracecox/fujimoto.svg)](https://github.com/jongracecox/fujimoto/commits/main)
 [![GitHub](https://img.shields.io/github/license/jongracecox/fujimoto.svg)](https://github.com/jongracecox/fujimoto/blob/main/LICENSE)
 [![downloads](https://pepy.tech/badge/fujimoto)](https://pepy.tech/project/fujimoto)
+[![monthly downloads](https://img.shields.io/pypi/dm/fujimoto.svg)](https://pypistats.org/packages/fujimoto)
 [![tests](https://github.com/jongracecox/fujimoto/actions/workflows/tests.yml/badge.svg)](https://github.com/jongracecox/fujimoto/actions/workflows/tests.yml)
 ![coverage](https://raw.githubusercontent.com/jongracecox/fujimoto/badges/coverage.svg)
 [![GitHub stars](https://img.shields.io/github/stars/jongracecox/fujimoto.svg?style=social)](https://github.com/jongracecox/fujimoto/stargazers)
