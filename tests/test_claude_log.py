@@ -968,3 +968,45 @@ class TestReadRawTranscript:
         log = tmp_path / "s.jsonl"
         log.write_bytes(b'{"a": "\xff\xfe"}\n')
         assert len(read_raw_transcript(log)) == 1
+
+
+class TestQueuedCommands:
+    """Messages that arrive mid-turn are `attachment` entries, not `user` ones."""
+
+    def _queued(self, prompt: object, **extra: object) -> dict:
+        return {
+            "type": "attachment",
+            "timestamp": "2026-11-24T17:28:19Z",
+            "attachment": {"type": "queued_command", "prompt": prompt, **extra},
+        }
+
+    def test_read_as_user_messages_in_order(self, tmp_path: Path) -> None:
+        log = tmp_path / "s.jsonl"
+        entries = [
+            {"type": "user", "message": {"content": "start"}},
+            self._queued("typed mid-turn", commandMode="prompt"),
+            {"type": "attachment", "attachment": {"type": "date", "prompt": "x"}},
+            self._queued("<task-notification>hook</task-notification>"),
+            self._queued("   "),  # empty: skipped
+            self._queued(["not", "text"]),  # unknown shape: skipped
+            {**self._queued("sub-agent"), "isSidechain": True},
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "ok"}]},
+            },
+        ]
+        log.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        got = [(m.role, m.text) for m in read_transcript(log)]
+        assert got == [
+            ("user", "start"),
+            ("user", "typed mid-turn"),
+            ("user", "<task-notification>hook</task-notification>"),
+            ("assistant", "ok"),
+        ]
+        assert read_transcript(log)[1].timestamp.year == 2026
+
+    def test_search_finds_mid_turn_text_but_not_injected(self) -> None:
+        from fujimoto.claude.search import _message_text
+
+        assert _message_text(self._queued("squash commits")) == "squash commits"
+        assert _message_text(self._queued("<system-reminder>x")) == ""

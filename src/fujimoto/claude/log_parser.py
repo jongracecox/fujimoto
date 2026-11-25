@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
+from typing import cast
 
 from fujimoto import debug
 
@@ -26,6 +27,42 @@ INJECTED_PREFIXES = (
     "<local-command-stderr>",
     "<local-command-caveat>",
 )
+
+
+def queued_prompt(entry: object) -> str | None:
+    """The text of a message that arrived while Claude was mid-turn, or None.
+
+    Claude Code doesn't write those as `user` entries: a prompt the user
+    types during a turn, and a hook's asyncRewake feedback (how a fujimoto
+    message reaches a busy session), are recorded as `type: "attachment"`
+    with `attachment.type == "queued_command"` and the text in
+    `attachment.prompt`. Nothing else records them.
+
+    >>> queued_prompt({"type": "attachment", "attachment":
+    ...     {"type": "queued_command", "prompt": " hi "}})
+    'hi'
+    >>> queued_prompt({"type": "attachment", "attachment": {"type": "date"}}) is None
+    True
+    >>> queued_prompt({"type": "user", "message": {"content": "hi"}}) is None
+    True
+    """
+    if not isinstance(entry, dict):
+        return None
+    fields = cast("dict[str, object]", entry)
+    if fields.get("type") != "attachment":
+        return None
+    if fields.get("isSidechain") or fields.get("isMeta"):
+        return None
+    att = fields.get("attachment")
+    if not isinstance(att, dict):
+        return None
+    attachment = cast("dict[str, object]", att)
+    if attachment.get("type") != "queued_command":
+        return None
+    prompt = attachment.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None
+    return prompt.strip()
 
 
 class EntryType(StrEnum):
@@ -712,6 +749,14 @@ def read_transcript(jsonl_path: Path) -> list[TranscriptMessage]:
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
+            continue
+
+        queued = queued_prompt(entry)
+        if queued is not None:
+            # A mid-turn prompt or hook message: a user message like any
+            # other (`log` re-roles injected text by its prefix).
+            ts = _parse_timestamp(entry.get("timestamp", ""))
+            messages.append(TranscriptMessage("user", queued, ts))
             continue
 
         entry_type = EntryType.from_raw(entry.get("type", ""))
