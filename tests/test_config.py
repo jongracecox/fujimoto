@@ -10,6 +10,7 @@ from fujimoto.config import (
     ConfigError,
     build_worktree_path,
     config_once_applied,
+    fujimoto_executable,
     get_git_projects_root,
     get_next_adhoc_session_name,
     get_project_worktrees_dir,
@@ -477,3 +478,23 @@ class TestChatScratchDir:
 
         with patch("fujimoto.config.Path.home", return_value=tmp_path):
             assert not get_chat_scratch_dir("proj", create=False).exists()
+
+
+class TestFujimotoExecutable:
+    def test_prefers_the_running_script(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        program = tmp_path / "fujimoto"
+        program.write_text("")
+        monkeypatch.setattr("sys.argv", [str(program)])
+        assert fujimoto_executable() == str(program)
+
+    def test_falls_back_to_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("sys.argv", ["not-a-file-fujimoto"])
+        with patch("fujimoto.config.shutil.which", return_value="/bin/fujimoto"):
+            assert fujimoto_executable() == "/bin/fujimoto"
+
+    def test_none_when_not_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("sys.argv", ["not-a-file-fujimoto"])
+        with patch("fujimoto.config.shutil.which", return_value=None):
+            assert fujimoto_executable() is None

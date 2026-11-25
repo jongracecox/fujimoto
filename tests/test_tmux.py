@@ -4,7 +4,7 @@ import shlex
 import subprocess
 
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
@@ -211,8 +211,8 @@ class TestCreateSession:
             create_session("proj/test", tmp_path)
 
             calls = mock_run.call_args_list
-            # First call: new-session with claude as the session command
-            assert calls[0] == call(
+            # After clearing cmux's pane identity: new-session running claude
+            assert calls[1] == call(
                 [
                     "tmux",
                     "new-session",
@@ -224,6 +224,7 @@ class TestCreateSession:
                     "claude",
                 ],
                 check=True,
+                env=ANY,
             )
 
     def test_creates_session_with_system_prompt(self, tmp_path: Path) -> None:
@@ -233,7 +234,7 @@ class TestCreateSession:
             create_session("proj/test", tmp_path, system_prompt="You are in a worktree")
 
             calls = mock_run.call_args_list
-            assert calls[0] == call(
+            assert calls[1] == call(
                 [
                     "tmux",
                     "new-session",
@@ -245,6 +246,7 @@ class TestCreateSession:
                     "claude --append-system-prompt 'You are in a worktree'",
                 ],
                 check=True,
+                env=ANY,
             )
 
 
@@ -260,7 +262,7 @@ class TestCreateSessionFork:
                 resume_session_id="abc",
                 fork_session=True,
             )
-            assert mock_run.call_args_list[0] == call(
+            assert mock_run.call_args_list[1] == call(
                 [
                     "tmux",
                     "new-session",
@@ -273,6 +275,7 @@ class TestCreateSessionFork:
                     "--append-system-prompt 'you are a fork'",
                 ],
                 check=True,
+                env=ANY,
             )
 
 
@@ -583,7 +586,7 @@ class TestCreateSessionWithCommand:
             create_session_with_command("proj/pr-test", tmp_path, "echo hello")
 
             calls = mock_run.call_args_list
-            assert calls[0] == call(
+            assert calls[1] == call(
                 [
                     "tmux",
                     "new-session",
@@ -595,6 +598,7 @@ class TestCreateSessionWithCommand:
                     "echo hello",
                 ],
                 check=True,
+                env=ANY,
             )
 
 
@@ -648,6 +652,104 @@ class TestAttachSession:
         ):
             attach_session("proj/test")
         assert not any("-u" in c.args[0] for c in mock_run.call_args_list)
+
+
+class TestAttachSessionCmuxBinding:
+    def _attach(self, bound: bool) -> tuple[MagicMock, MagicMock, list[str]]:
+        order: list[str] = []
+
+        def run(cmd: list[str], **kw: object) -> MagicMock:
+            order.append(cmd[1])
+            return _proc()
+
+        with (
+            patch("fujimoto.tmux._refresh_session_config"),
+            patch("fujimoto.tmux.subprocess.run", side_effect=run),
+            patch(
+                "fujimoto.tmux.cmux.set_resume_binding",
+                side_effect=lambda n: order.append("bind") or bound,
+            ) as set_binding,
+            patch(
+                "fujimoto.tmux.cmux.clear_resume_binding",
+                side_effect=lambda n: order.append("unbind"),
+            ) as clear_binding,
+        ):
+            attach_session("proj/test")
+        return set_binding, clear_binding, order
+
+    def test_binds_the_pane_while_attached(self) -> None:
+        set_binding, clear_binding, order = self._attach(bound=True)
+        set_binding.assert_called_once_with("proj/test")
+        clear_binding.assert_called_once_with("proj/test")
+        assert order.index("bind") < order.index("attach-session")
+        assert order.index("unbind") > order.index("attach-session")
+
+    def test_clears_nothing_it_did_not_set(self) -> None:
+        _, clear_binding, _ = self._attach(bound=False)
+        clear_binding.assert_not_called()
+
+
+class TestCmuxSurfaceScope:
+    def test_new_server_never_sees_the_pane_identity(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CMUX_SURFACE_ID", "SURFACE-1")
+        monkeypatch.setenv("CMUX_PANEL_ID", "PANEL-1")
+        monkeypatch.setenv("CMUX_WORKSPACE_ID", "WS-1")
+        with patch(
+            "fujimoto.tmux.subprocess.run", return_value=MagicMock(returncode=0)
+        ) as mock_run:
+            create_session("proj/test", tmp_path)
+        new_session = next(
+            c for c in mock_run.call_args_list if c.args[0][1] == "new-session"
+        )
+        env = new_session.kwargs["env"]
+        assert "CMUX_SURFACE_ID" not in env
+        assert "CMUX_PANEL_ID" not in env
+        assert env["CMUX_WORKSPACE_ID"] == "WS-1"  # workspace scope is fine
+
+    @pytest.mark.parametrize("command", [None, "echo hi"])
+    def test_running_server_is_cleaned_first(
+        self, tmp_path: Path, command: str | None
+    ) -> None:
+        with patch(
+            "fujimoto.tmux.subprocess.run", return_value=MagicMock(returncode=0)
+        ) as mock_run:
+            if command is None:
+                create_session("proj/test", tmp_path)
+            else:
+                create_session_with_command("proj/test", tmp_path, command)
+        assert mock_run.call_args_list[0].args[0] == [
+            "tmux",
+            "set-environment",
+            "-gu",
+            "CMUX_SURFACE_ID",
+            ";",
+            "set-environment",
+            "-gu",
+            "CMUX_PANEL_ID",
+            ";",
+            "set-environment",
+            "-gu",
+            "CMUX_HISTORY_FILE",
+        ]
+        assert mock_run.call_args_list[1].args[0][1] == "new-session"
+
+    def test_no_server_is_not_an_error(self, tmp_path: Path) -> None:
+        from fujimoto import debug
+
+        debug.enable(redact=False, log_dir=tmp_path)
+        try:
+            with patch(
+                "fujimoto.tmux.subprocess.run",
+                return_value=MagicMock(returncode=1, stderr="no server running"),
+            ):
+                tmux._forget_surface_scope()  # no raise
+        finally:
+            debug.disable()
+        assert (
+            "tmux.forget_surface_scope rc=1" in next(tmp_path.glob("*.log")).read_text()
+        )
 
 
 class TestRefreshSessionConfig:
@@ -992,9 +1094,10 @@ class TestEnsureFocusEvents:
                 create_session_with_command("proj/test", tmp_path, command)
 
         calls = [c[0][0] for c in mock_run.call_args_list]
-        assert calls[0][1] == "new-session"
-        assert calls[1] == ["tmux", "show-options", "-sv", "focus-events"]
-        assert calls[2] == ["tmux", "set-option", "-s", "focus-events", "on"]
+        assert calls[0][1] == "set-environment"  # _forget_surface_scope
+        assert calls[1][1] == "new-session"
+        assert calls[2] == ["tmux", "show-options", "-sv", "focus-events"]
+        assert calls[3] == ["tmux", "set-option", "-s", "focus-events", "on"]
 
 
 class TestSetTerminalTitle:

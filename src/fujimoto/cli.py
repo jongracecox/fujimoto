@@ -8,7 +8,6 @@ import os
 import re
 import secrets
 import shlex
-import shutil
 import subprocess
 import sys
 import textwrap
@@ -66,6 +65,7 @@ from fujimoto.config import (
     ConfigError,
     build_worktree_path,
     config_once_applied,
+    fujimoto_executable,
     get_next_adhoc_session_name,
     DEFAULT_CHAT_TITLE,
     DEFAULT_SESSION_TITLE,
@@ -7790,8 +7790,7 @@ def _restart_fujimoto(tmux_name: str) -> None:
     session in the same window, now on whatever version is installed. Returns
     only if the exec failed, leaving the old process to carry on.
     """
-    program = sys.argv[0] if Path(sys.argv[0]).is_file() else None
-    program = program or shutil.which("fujimoto")
+    program = fujimoto_executable()
     flags = [a for a in sys.argv[1:] if a in ("--debug", "--debug-redacted")]
     debug.log("restart.exec", session=debug.rv(tmux_name), found=program is not None)
     if program is None:

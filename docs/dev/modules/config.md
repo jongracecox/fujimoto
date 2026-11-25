@@ -2,6 +2,7 @@
 
 **`config.py`** — Pure functions, no side effects except directory creation:
 - `get_worktree_root(project_root=None, *, create=True)` — returns `FUJIMOTO_WORKTREE_ROOT` if set, else falls back to `<project_root>/.fujimoto/worktrees/` (ensures `.fujimoto/.gitignore` exists). Raises `ConfigError` only if both are missing.
+- `fujimoto_executable()` — `sys.argv[0]` when it is a file, else `fujimoto` on `PATH`, else `None`. It's the path that starts this fujimoto again, shared by restart (`_restart_fujimoto`) and the cmux restore binding (`cmux.resume_command`).
 - `get_git_projects_root()` — reads `FUJIMOTO_GIT_ROOT`, returns `None` if unset
 - `list_projects()` — scans git root for directories containing `.git`
 - `slugify(title)` — lowercase, replace non-alphanumeric with hyphens, strip/collapse

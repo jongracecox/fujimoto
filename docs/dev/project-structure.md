@@ -9,6 +9,7 @@ src/fujimoto/
 ├── terminal.py   # Open native terminal windows (iTerm2 with Terminal.app fallback)
 ├── vscode.py     # Open directories in VS Code via the `code` CLI
 ├── tmux.py       # tmux session lifecycle (create, attach, kill, list, install)
+├── cmux.py       # cmux terminal: keep pane identity out of tmux, restore binding
 ├── version.py    # importlib.metadata wrapper for the running fujimoto version
 ├── version_check.py  # daily PyPI update check, dismissals, install detection, agent notice
 ├── paging.py     # PageUp/PageDown step (`page_step`) for TUI lists

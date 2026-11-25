@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import sys
 from collections.abc import Collection
 from datetime import date
 from pathlib import Path
@@ -12,6 +14,15 @@ from fujimoto import debug
 
 class ConfigError(Exception):
     pass
+
+
+def fujimoto_executable() -> str | None:
+    """The path that starts this fujimoto again: `argv[0]`, else `PATH`.
+
+    Used to re-execute it (restart) and to tell cmux how to restore a pane.
+    """
+    program = sys.argv[0] if Path(sys.argv[0]).is_file() else None
+    return program or shutil.which("fujimoto")
 
 
 def get_git_projects_root() -> Path | None:
